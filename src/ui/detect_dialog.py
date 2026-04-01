@@ -1,0 +1,107 @@
+import logging
+from typing import List, Optional
+
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar,
+    QPushButton, QDoubleSpinBox, QFormLayout,
+)
+from PySide6.QtCore import Signal
+
+from core.video_source import VideoSource
+from core.scene_detector import SceneDetector, DEFAULT_THRESHOLD
+from core.clip import Clip
+
+logger = logging.getLogger(__name__)
+
+
+class DetectDialog(QDialog):
+    """Dialog for running cut detection on an already-imported video source."""
+
+    detection_complete = Signal(str, list)  # source_id, List[Clip]
+
+    def __init__(self, source: VideoSource, parent=None):
+        super().__init__(parent)
+        self._source = source
+        self.setWindowTitle("Detect Cuts")
+        self.setMinimumWidth(450)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+
+        name = source.file_path.split('/')[-1].split(chr(92))[-1]
+        layout.addWidget(QLabel(
+            f"{name}\n"
+            f"{source.width}x{source.height}, {source.fps:.2f} fps, "
+            f"{source.total_frames} frames"
+        ))
+
+        # Threshold setting
+        form = QFormLayout()
+        self._threshold_spin = QDoubleSpinBox()
+        self._threshold_spin.setRange(0.05, 0.95)
+        self._threshold_spin.setValue(DEFAULT_THRESHOLD)
+        self._threshold_spin.setSingleStep(0.05)
+        self._threshold_spin.setDecimals(2)
+        self._threshold_spin.setToolTip(
+            "TransNetV2 confidence threshold (0-1). "
+            "Higher = fewer cuts (only high-confidence). Lower = more sensitive."
+        )
+        form.addRow("Cut Detection Sensitivity:", self._threshold_spin)
+        layout.addLayout(form)
+
+        # Progress bar
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        layout.addWidget(self._progress)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self._start_btn = QPushButton("Detect")
+        self._start_btn.clicked.connect(self._start_detection)
+        btn_layout.addWidget(self._start_btn)
+        btn_layout.addStretch()
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self._cancel)
+        btn_layout.addWidget(self._cancel_btn)
+        layout.addLayout(btn_layout)
+
+        self._detector: Optional[SceneDetector] = None
+
+    def _start_detection(self):
+        self._start_btn.setEnabled(False)
+        self._threshold_spin.setEnabled(False)
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+
+        threshold = self._threshold_spin.value()
+        self._detector = SceneDetector(self._source, threshold=threshold)
+        self._detector.progress.connect(self._on_progress)
+        self._detector.finished.connect(self._on_finished)
+        self._detector.error.connect(self._on_error)
+        self._detector.start()
+
+    def _on_progress(self, pct: int):
+        self._progress.setValue(pct)
+
+    def _on_finished(self, clips: List[Clip]):
+        self._progress.setValue(100)
+        self.detection_complete.emit(self._source.id, clips)
+        self.accept()
+
+    def _on_error(self, msg: str):
+        self._start_btn.setEnabled(True)
+        self._threshold_spin.setEnabled(True)
+        self._progress.setVisible(False)
+        logger.error("Detection failed: %s", msg)
+
+    def _cancel(self):
+        if self._detector and self._detector.isRunning():
+            self._detector.cancel()
+            self._detector.wait(3000)
+        self.reject()
+
+    def closeEvent(self, event):
+        self._cancel()
+        super().closeEvent(event)

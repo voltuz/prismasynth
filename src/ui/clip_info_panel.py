@@ -1,0 +1,87 @@
+from typing import Optional, Dict
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QLabel, QFormLayout, QGroupBox, QSizePolicy,
+)
+from PySide6.QtCore import Qt
+
+from core.clip import Clip
+from core.video_source import VideoSource
+
+
+class ClipInfoPanel(QWidget):
+    """Panel showing info about the currently selected clip."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(250)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self._title = QLabel("No clip selected")
+        self._title.setStyleSheet("font-weight: bold; font-size: 13px; color: #ddd;")
+        layout.addWidget(self._title)
+
+        self._group = QGroupBox("Clip Details")
+        form = QFormLayout()
+        self._source_label = QLabel("-")
+        self._in_label = QLabel("-")
+        self._out_label = QLabel("-")
+        self._duration_label = QLabel("-")
+        self._resolution_label = QLabel("-")
+        self._fps_label = QLabel("-")
+
+        for lbl in [self._source_label, self._in_label, self._out_label,
+                     self._duration_label, self._resolution_label, self._fps_label]:
+            lbl.setStyleSheet("color: #ccc;")
+
+        form.addRow("Source:", self._source_label)
+        form.addRow("In:", self._in_label)
+        form.addRow("Out:", self._out_label)
+        form.addRow("Duration:", self._duration_label)
+        form.addRow("Resolution:", self._resolution_label)
+        form.addRow("FPS:", self._fps_label)
+        self._group.setLayout(form)
+        layout.addWidget(self._group)
+
+        layout.addStretch()
+
+    def update_clip(self, clip: Optional[Clip], sources: Dict[str, VideoSource]):
+        if clip is None:
+            self._title.setText("No clip selected")
+            for lbl in [self._source_label, self._in_label, self._out_label,
+                         self._duration_label, self._resolution_label, self._fps_label]:
+                lbl.setText("-")
+            return
+
+        if clip.is_gap:
+            self._title.setText("Gap")
+            self._source_label.setText("-")
+            self._in_label.setText("-")
+            self._out_label.setText("-")
+            self._duration_label.setText(f"{clip.duration_frames} frames")
+            self._resolution_label.setText("-")
+            self._fps_label.setText("-")
+            return
+
+        source = sources.get(clip.source_id)
+        source_name = source.file_path.split("\\")[-1].split("/")[-1] if source else "Unknown"
+        fps = source.fps if source else 24.0
+
+        self._title.setText(f"Clip {clip.id[:8]}")
+        self._source_label.setText(source_name)
+        self._in_label.setText(str(clip.source_in))
+        self._out_label.setText(str(clip.source_out))
+
+        dur_frames = clip.duration_frames
+        dur_secs = dur_frames / fps if fps > 0 else 0
+        self._duration_label.setText(f"{dur_frames} frames ({dur_secs:.2f}s)")
+
+        if source:
+            self._resolution_label.setText(f"{source.width}x{source.height}")
+            self._fps_label.setText(f"{source.fps:.3f}")
+        else:
+            self._resolution_label.setText("-")
+            self._fps_label.setText("-")

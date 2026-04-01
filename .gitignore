@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# DLLs (downloaded, not committed)
+src/libmpv-2.dll
+
+# Cache & temp
+*.proxy
+*.jproxy
+*.jproxy.tmp
+*.scrub.mp4
+*.psynth.bak
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude
+.claude/
