@@ -268,8 +268,6 @@ class VideoReader:
                 self._container = None
                 self._stream = None
 
-    def __del__(self):
-        self.close()
 
 
 class VideoReaderPool:

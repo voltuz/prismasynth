@@ -227,7 +227,10 @@ class ThumbnailCache(QObject):
     def _ndarray_to_qimage(arr: np.ndarray) -> QImage:
         h, w, ch = arr.shape
         bytes_per_line = ch * w
-        return QImage(bytes(arr.data), w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        # .copy() so QImage owns its pixel data — without this, the backing
+        # bytes object can be GC'd in the background thread before the main
+        # thread uses the QImage, causing a use-after-free crash.
+        return QImage(bytes(arr.data), w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
 
     def stop(self):
         self._stopped = True

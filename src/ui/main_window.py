@@ -16,7 +16,6 @@ from core.video_source import VideoSource
 from core.video_reader import VideoReaderPool
 from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
-from core.playback_engine import PlaybackEngine
 from core.proxy_cache import ProxyManager, ProxyFile, HQProxyGenerator
 from core.project import save_project, load_project
 from utils.paths import get_config_dir
@@ -146,6 +145,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PrismaSynth")
         self.setMinimumSize(1024, 600)
         self.resize(1400, 800)
+        self.setAcceptDrops(True)
 
         # Core state
         self._timeline = TimelineModel()
@@ -158,6 +158,7 @@ class MainWindow(QMainWindow):
         self._last_clicked_clip_id: Optional[str] = None
         self._thumbnail_cache: Optional[ThumbnailCache] = None
         self._selection_follows_playhead = True
+        self._playback_updating = False
 
         # Project state
         self._project_path: Optional[str] = None
@@ -176,12 +177,13 @@ class MainWindow(QMainWindow):
         self._thumb_resume_timer.setInterval(500)
         self._thumb_resume_timer.timeout.connect(self._resume_thumbnails)
 
-        # Playback engine (background prefetch thread + display timer)
-        self._playback = PlaybackEngine(
-            self._timeline, self._sources, self._reader_pool
-        )
-        self._playback.frame_ready.connect(self._on_playback_frame)
-        self._playback.playback_finished.connect(self._on_playback_done)
+        # Playback — mpv plays natively, timer syncs the timeline playhead
+        self._playback_timer = QTimer()
+        self._playback_timer.setInterval(16)  # ~60Hz playhead sync
+        self._playback_timer.timeout.connect(self._on_playback_tick)
+        self._playback_source = None
+        self._playback_clip = None
+        self._playback_clip_timeline_start = 0
 
         # Apply dark theme
         self.setStyleSheet(DARK_STYLE)
@@ -308,6 +310,11 @@ class MainWindow(QMainWindow):
         detect_action.triggered.connect(self._on_detect_cuts)
         file_menu.addAction(detect_action)
 
+        play_action = QAction("Play/Pause", self)
+        play_action.setShortcut("Space")
+        play_action.triggered.connect(self._toggle_play)
+        file_menu.addAction(play_action)
+
         edit_menu = menu.addMenu("Edit")
 
         split_action = QAction("Split at Playhead", self)
@@ -316,9 +323,26 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(split_action)
 
         delete_action = QAction("Delete Selected", self)
-        delete_action.setShortcut("Delete")
+        delete_action.setShortcut("Backspace")
         delete_action.triggered.connect(self._on_delete)
         edit_menu.addAction(delete_action)
+
+        ripple_delete_action = QAction("Ripple Delete Selected", self)
+        ripple_delete_action.setShortcut("Delete")
+        ripple_delete_action.triggered.connect(self._on_ripple_delete)
+        edit_menu.addAction(ripple_delete_action)
+
+        edit_menu.addSeparator()
+
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        undo_action.triggered.connect(self._timeline.undo)
+        edit_menu.addAction(undo_action)
+
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence("Ctrl+Shift+Z"))
+        redo_action.triggered.connect(self._timeline.redo)
+        edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
 
@@ -334,10 +358,47 @@ class MainWindow(QMainWindow):
 
     # --- Import ---
 
+    _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.mxf'}
+
     def _on_import(self):
         dialog = ImportDialog(self)
         dialog.import_complete.connect(self._on_import_complete)
         dialog.exec()
+
+    def _import_file(self, file_path: str):
+        """Import a video file directly (used by drag-and-drop)."""
+        from utils.ffprobe import probe_video
+        info = probe_video(file_path)
+        if info is None:
+            logger.warning("Could not probe dropped file: %s", file_path)
+            return
+        source = VideoSource(
+            file_path=file_path,
+            total_frames=info.total_frames,
+            fps=info.fps,
+            width=info.width,
+            height=info.height,
+            codec=info.codec,
+        )
+        clip = Clip(source_id=source.id, source_in=0, source_out=source.total_frames - 1)
+        self._on_import_complete(source, [clip])
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = os.path.splitext(url.toLocalFile())[1].lower()
+                    if ext in self._VIDEO_EXTENSIONS:
+                        event.acceptProposedAction()
+                        return
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                ext = os.path.splitext(path)[1].lower()
+                if ext in self._VIDEO_EXTENSIONS:
+                    self._import_file(path)
 
     def _on_import_complete(self, source: VideoSource, clips):
         self._sources[source.id] = source
@@ -380,10 +441,8 @@ class MainWindow(QMainWindow):
 
     def _on_detection_complete(self, source_id: str, clips):
         """Replace all clips from this source with the detected scene clips."""
-        # Remove existing clips for this source
-        old_ids = {c.id for c in self._timeline.clips if c.source_id == source_id}
-        if old_ids:
-            self._timeline.remove_clips(old_ids)
+        # Remove existing clips for this source entirely (not gap-replace)
+        self._timeline.ripple_delete_by_source(source_id)
         # Add new scene clips
         self._timeline.add_clips(clips)
 
@@ -424,8 +483,16 @@ class MainWindow(QMainWindow):
     # --- Playhead ---
 
     def _on_playhead_changed(self, frame: int):
-        # During playback, _on_playback_frame handles everything — skip here
-        if self._playback.is_playing:
+        # Playback-driven update — just sync UI, don't touch mpv
+        if self._playback_updating:
+            self._status_frame.setText(f"Frame {frame}")
+            return
+
+        # User moved the playhead — restart playback from new position if playing
+        if self._preview.is_playing:
+            self._stop_playback()
+            self._timeline_widget.strip._playhead_frame = frame
+            self._start_playback()
             return
 
         self._status_frame.setText(f"Frame {frame}")
@@ -443,17 +510,15 @@ class MainWindow(QMainWindow):
 
         # Seek mpv to the correct source frame (GPU-accelerated)
         result = self._timeline.get_clip_at_position(frame)
-        if result is None:
+        if result is None or result[0].is_gap:
+            self._preview.show_black()
             return
         clip, offset = result
-        if clip.is_gap:
-            self._preview.clear_frame()
-        else:
-            source = self._sources.get(clip.source_id)
-            if source:
-                source_frame = clip.source_in + offset
-                self._preview.load_source(source.file_path)
-                self._preview.seek_to_frame(source_frame, source.fps)
+        source = self._sources.get(clip.source_id)
+        if source:
+            source_frame = clip.source_in + offset
+            self._preview.load_source(source.file_path)
+            self._preview.seek_to_frame(source_frame, source.fps)
 
     def _resume_thumbnails(self):
         if self._thumbnail_cache:
@@ -505,17 +570,23 @@ class MainWindow(QMainWindow):
             self._start_thumbnail_cache()
 
     def _on_delete(self):
-        selected = self._timeline.selected_ids
-        if not selected:
+        """Delete selected clips, replacing with gaps (Backspace)."""
+        if not self._timeline.selected_ids:
             return
         self._timeline.delete_selected()
-        # Refresh preview — playhead may now be on a gap
+        self._refresh_preview_after_edit()
+
+    def _on_ripple_delete(self):
+        """Ripple delete selected clips — collapse the space (Delete)."""
+        if not self._timeline.selected_ids:
+            return
+        self._timeline.ripple_delete_selected()
+        self._refresh_preview_after_edit()
+
+    def _refresh_preview_after_edit(self):
+        """Refresh preview after a timeline edit (delete, ripple delete, etc.)."""
         frame = self._timeline_widget.strip.playhead_frame
-        result = self._timeline.get_clip_at_position(frame)
-        if result is None or result[0].is_gap:
-            self._preview.clear_frame()
-        else:
-            self._scrub_decoder.request_frame(frame)
+        self._on_playhead_changed(frame)
 
     def _on_select_to_gap(self):
         frame = self._timeline_widget.strip.playhead_frame
@@ -524,7 +595,7 @@ class MainWindow(QMainWindow):
     # --- Playback ---
 
     def _toggle_play(self):
-        if self._playback.is_playing:
+        if self._preview.is_playing:
             self._stop_playback()
         else:
             self._start_playback()
@@ -532,39 +603,100 @@ class MainWindow(QMainWindow):
     def _start_playback(self):
         if self._timeline.clip_count == 0:
             return
-        fps = 24.0
-        if self._sources:
-            fps = next(iter(self._sources.values())).fps
-        start = self._timeline_widget.strip.playhead_frame
+        # Ensure mpv has the right source loaded at the playhead position
+        frame = self._timeline_widget.strip.playhead_frame
+        result = self._timeline.get_clip_at_position(frame)
+        if result is None or result[0].is_gap:
+            return
+        clip, offset = result
+        source = self._sources.get(clip.source_id)
+        if not source:
+            return
+
+        self._preview.load_source(source.file_path)
+        self._preview.seek_to_frame(clip.source_in + offset, source.fps)
+        self._preview.play()
         self._toolbar.set_playing(True)
-        self._playback.play(start, fps)
+
+        # Track mpv's playback position and update the timeline playhead
+        self._playback_source = source
+        self._playback_clip = clip
+        self._playback_clip_timeline_start = self._timeline.get_clip_timeline_start(clip.id)
+        self._playback_timer.start()
 
     def _stop_playback(self):
-        self._playback.stop()
+        self._playback_timer.stop()
+        self._preview.pause()
         self._toolbar.set_playing(False)
 
-    def _on_playback_frame(self, timeline_frame: int, frame_data):
-        """Called by the playback engine when a frame is ready to display."""
-        # Drive mpv to the current frame (GPU display)
-        result = self._timeline.get_clip_at_position(timeline_frame)
-        if result and not result[0].is_gap:
-            clip, offset = result
-            source = self._sources.get(clip.source_id)
-            if source:
-                self._preview.load_source(source.file_path)
-                self._preview.seek_to_frame(clip.source_in + offset, source.fps)
+    def _on_playback_tick(self):
+        """Sync timeline playhead with mpv's current position during native playback."""
+        if not self._preview.is_playing:
+            self._stop_playback()
+            return
+
+        time_pos = self._preview.get_time_pos()
+        if time_pos < 0:
+            return
+
+        fps = self._playback_source.fps
+        source_frame = int(time_pos * fps)
+
+        # Check if we've passed the end of the current clip
+        clip = self._playback_clip
+        if source_frame > clip.source_out:
+            # Move to next clip on the timeline
+            next_start = self._playback_clip_timeline_start + clip.duration_frames
+            result = self._timeline.get_clip_at_position(next_start)
+            if result is None:
+                self._stop_playback()
+                return
+            next_clip, _ = result
+            if next_clip.is_gap:
+                # Skip gap, find next real clip
+                gap_end = next_start + next_clip.duration_frames
+                result = self._timeline.get_clip_at_position(gap_end)
+                if result is None or result[0].is_gap:
+                    self._stop_playback()
+                    return
+                next_clip, _ = result
+                next_start = gap_end
+
+            next_source = self._sources.get(next_clip.source_id)
+            if not next_source:
+                self._stop_playback()
+                return
+
+            # Check if next clip is contiguous in the same source — if so, just
+            # update bookkeeping and let mpv keep playing without interruption
+            contiguous = (
+                next_source.file_path == self._playback_source.file_path
+                and next_clip.source_in == clip.source_out + 1
+            )
+
+            self._playback_clip = next_clip
+            self._playback_source = next_source
+            self._playback_clip_timeline_start = next_start
+
+            if not contiguous:
+                self._preview.load_source(next_source.file_path)
+                self._preview.seek_to_frame(next_clip.source_in, next_source.fps)
+                self._preview.play()
+            source_frame = max(source_frame, next_clip.source_in)
+
+        # Update timeline playhead (rebind clip after possible boundary advance)
+        clip = self._playback_clip
+        offset_in_clip = source_frame - clip.source_in
+        timeline_frame = self._playback_clip_timeline_start + offset_in_clip
+
+        self._playback_updating = True
         self._timeline_widget.set_playhead(timeline_frame)
+        self._playback_updating = False
         self._timeline_widget.strip.ensure_playhead_visible()
         self._status_frame.setText(f"Frame {timeline_frame}")
 
         if self._selection_follows_playhead:
-            result = self._timeline.get_clip_at_position(timeline_frame)
-            if result:
-                clip, _ = result
-                self._timeline.select_clip(clip.id)
-
-    def _on_playback_done(self):
-        self._toolbar.set_playing(False)
+            self._timeline.select_clip(self._playback_clip.id)
 
     # --- Export ---
 
@@ -620,7 +752,7 @@ class MainWindow(QMainWindow):
     def _on_new_project(self):
         if not self._confirm_discard():
             return
-        self._playback.stop()
+        self._stop_playback()
         self._hq_proxy_gen.stop()
         self._timeline.clear()
         self._reader_pool.close_all()
@@ -681,7 +813,7 @@ class MainWindow(QMainWindow):
             return
 
         # Clear current state
-        self._playback.stop()
+        self._stop_playback()
         self._hq_proxy_gen.stop()
         self._timeline.clear()
         self._reader_pool.close_all()
@@ -820,7 +952,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
-        self._playback.stop()
+        self._stop_playback()
         self._autosave_timer.stop()
         if self._thumbnail_cache:
             self._thumbnail_cache.stop()

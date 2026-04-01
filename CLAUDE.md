@@ -20,7 +20,7 @@ venv\Scripts\python src\main.py
 # Or: run.bat
 ```
 
-Requires FFmpeg + ffprobe on PATH. Python 3.11+.
+Requires FFmpeg + ffprobe on PATH, `libmpv-2.dll` in `src/` (from mpv.io builds). Python 3.11+.
 
 ## Architecture
 
@@ -35,61 +35,72 @@ Three-layer design: `src/ui/` (PySide6 widgets) → `src/core/` (business logic,
 - `VideoSource` — immutable metadata (path, fps, dimensions, codec) for an imported video file.
 - Project files (`.psynth`) are JSON containing sources + clips + playhead position.
 
-### Video Decode Stack
+### Preview & Scrubbing (mpv/libmpv)
 
-Three separate reader paths to avoid lock contention:
+The preview widget embeds mpv for GPU-accelerated decode and display. The entire pipeline stays on GPU: NVDEC decode → GPU buffer → GPU display. No frames touch CPU RAM during scrubbing.
+
+- `PreviewWidget` creates an mpv instance embedded in a QWidget via window handle (`wid`)
+- Configured with `hwdec=auto`, `hr_seek=yes`, `keep_open=yes`, `ao=null`
+- Timeline playhead changes → `mpv.command('seek', timestamp, 'absolute+exact')`
+- Source switching: `mpv.loadfile(path)` when crossing clip boundaries (with `wait_for_property('seekable')`)
+- Gaps: black overlay widget on top of mpv (no mpv state change — avoids stutter)
+- mpv initialized in `showEvent()` after widget's winId() is valid
+
+### Video Decode Stack (PyAV — for playback, export, thumbnails)
+
+PyAV with multi-threaded H.265 decode is still used for non-interactive paths. Three separate reader paths to avoid lock contention:
 
 | Reader | Purpose | Obtained via |
 |--------|---------|-------------|
-| Scrub reader | Preview during scrubbing | `reader_pool.get_reader()` |
+| Scrub reader | Thumbnails, background decode | `reader_pool.get_reader()` |
 | Playback reader | Sequential playback | `reader_pool.get_playback_reader()` |
 | Thumbnail readers | ffmpeg subprocess per frame | Not in reader pool |
 
-All readers use PyAV with multi-threaded H.265 decode. Frame numbers use `Fraction` arithmetic (not float) for PTS conversion to avoid drift on long videos.
+Frame numbers use `Fraction` arithmetic (not float) for PTS conversion to avoid drift on long videos. `_decode_forward_to` caches ALL intermediate frames during seeks (not just the target).
 
-### Scrubbing Performance (the critical path)
+### Proxy System
 
-Scrubbing uses a cascading fallback for instant response:
+Two proxy tiers exist for thumbnail extraction and legacy scrub fallback:
 
-1. **FrameCache** (LRU, 500 frames in RAM) — exact hit = 0ms
-2. **ProxyFile** (48x27 mmap binary, all frames) — 0.003ms per frame
-3. **Nearest cached frame** (tolerance ±60) — approximate, instant
-4. **Background full-res decode** (PyAV seek) — 150-200ms for 4K HEVC
+- **ProxyFile** (48x27 mmap binary) — generated during scene detection, stored at `%LOCALAPPDATA%/prismasynth/cache/proxies/`
+- **JpegProxyFile** (960x540 JPEG-indexed) — generated in background by `HQProxyGenerator`, stored next to video file as `.jproxy`. Format: fixed header + (N+1) uint64 offset table + concatenated JPEG blobs.
+- `ProxyManager` prefers `.jproxy` over `.proxy` when both exist
 
-The proxy file is generated automatically during scene detection (TransNetV2 already decodes every frame at 48x27). Stored at `%LOCALAPPDATA%/prismasynth/cache/proxies/`.
+Thumbnails (`ThumbnailCache`) extract from the JPEG proxy when available (sub-millisecond), falling back to ffmpeg `-ss` seeks. 96x54 JPEGs cached to disk.
 
-`ScrubDecoder` debounces requests (8ms), skips stale decodes, and pre-decodes ±15 frames around the playhead after each seek.
+### Import & Scene Detection (separate steps)
+
+1. **Import** (`ImportDialog`) — probes file via ffprobe, creates a single whole-file clip. No detection.
+2. **Detect Cuts** (`DetectDialog`) — runs SceneDetector on a source, replaces its clips via `ripple_delete_by_source()`.
+
+Scene detection: TransNetV2 (GPU, sliding 100-frame windows) with HSV frame differencing fallback. Cut frames shifted +1 so boundaries fall on the first frame of the new shot.
 
 ### Threading Model
 
 | Thread | What | Key constraint |
 |--------|------|---------------|
-| Main (Qt) | All UI, signal slots | QPixmap only here |
+| Main (Qt) | All UI, signal slots, mpv commands | QPixmap only here |
 | Playback prefetch | Sequential decode into ring buffer (60 frames) | Separate reader instance |
-| Scrub decode | Single background decode + pre-decode ring | Checks `_pending_frame` to abort stale work |
 | Thumbnail coordinator | Dispatches parallel ffmpeg `-ss` seeks (4 workers) | Pauses during scrubbing, yields between emissions |
 | Scene detection (QThread) | TransNetV2 inference + ffmpeg frame extraction | Stores subprocess ref for cancellation |
+| HQ proxy generator | Background ffmpeg decode + JPEG encode | Emits `finished` signal when done |
 | Export | FFmpeg pipe encoding | Uses playback reader (not scrub reader) |
 
 **Thread safety:** `threading.Lock` on VideoReader and FrameCache. Qt signals for cross-thread communication (auto-queued). ThumbnailCache emits `QImage` (thread-safe) not `QPixmap` (main-thread-only).
 
-### Scene Detection
-
-Primary: TransNetV2 (`transnetv2-pytorch`) — dilated 3D CNN, F1=96.2%, runs on CUDA. Frames extracted via ffmpeg subprocess at 48x27 with `-hwaccel cuda`. Inference in sliding 100-frame windows (step 50).
-
-Fallback: HSV frame differencing via PyAV + OpenCV (no GPU required).
-
 ### Gaps
 
-Deleting a clip leaves a gap (same-duration `Clip` with `source_id=None`). Adjacent gaps auto-merge. Deleting a gap collapses the space. Gaps are selectable, visible as dark dashed rectangles. Skipped during export and playback.
+Backspace deletes a clip, leaving a gap (same-duration `Clip` with `source_id=None`). Delete key ripple-deletes (collapses space). Adjacent gaps auto-merge. Gaps are selectable, visible as dark dashed rectangles. Skipped during export and playback. Preview shows black overlay on gaps.
 
-### Timeline Widget Pixel Math
+### Timeline Widget
 
-Clip positions computed from cumulative frame counts: `start_px = int(cumulative_frames * pixels_per_frame)`. This prevents the per-clip `int()` truncation drift that would desync the playhead from clip positions over hundreds of clips. The `_frame_to_pixel()` method is the single source of truth.
+Custom-painted strip (not Qt model/view). Clip positions computed from cumulative frame counts via `_frame_to_pixel()` to prevent truncation drift. Track height is draggable (30-200px). Thumbnails scale to fill track height at 16:9 aspect with 6px color border.
 
 ## Key Conventions
 
 - Keyboard shortcuts defined ONLY in `_setup_menus()` (not toolbar) to avoid Qt ambiguous shortcut conflicts.
 - `TimelineModel.add_clips(assign_colors=False)` when loading from project file to preserve saved colors.
-- `self._sources` dict is updated in-place (`clear()` + `update()`) never reassigned, because PlaybackEngine and ScrubDecoder hold references to it.
+- `self._sources` dict is updated in-place (`clear()` + `update()`) never reassigned, because PlaybackEngine and other objects hold references to it.
 - Exporter stored as `self._exporter` on MainWindow to prevent garbage collection during background export.
+- `_playback_updating` flag in MainWindow distinguishes playback-driven playhead updates from user scrubs (prevents playback from stopping itself).
+- Never show downsampled proxy frames in the preview — user requires full-quality scrubbing via mpv at all times.

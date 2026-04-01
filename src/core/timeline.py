@@ -1,6 +1,9 @@
+import copy
 from typing import List, Optional, Tuple
 from PySide6.QtCore import QObject, Signal
 from core.clip import Clip
+
+MAX_UNDO = 50
 
 
 class TimelineModel(QObject):
@@ -12,6 +15,47 @@ class TimelineModel(QObject):
         self._clips: List[Clip] = []
         self._selected_ids: set = set()
         self._color_counter: int = 0
+        self._undo_stack: list = []
+        self._redo_stack: list = []
+
+    # --- Undo / Redo ---
+
+    def _snapshot(self) -> tuple:
+        return (
+            [copy.copy(c) for c in self._clips],
+            set(self._selected_ids),
+            self._color_counter,
+        )
+
+    def _restore(self, snapshot: tuple):
+        clips, selected, color_counter = snapshot
+        self._clips = clips
+        self._selected_ids = selected
+        self._color_counter = color_counter
+        self.clips_changed.emit()
+        self.selection_changed.emit()
+
+    def _push_undo(self):
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
+
+    def clear_undo(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
 
     # --- Item access ---
 
@@ -78,6 +122,7 @@ class TimelineModel(QObject):
     # --- Mutations ---
 
     def add_clips(self, clips: List[Clip], assign_colors: bool = True):
+        self._push_undo()
         if assign_colors:
             for c in clips:
                 if not c.is_gap:
@@ -87,6 +132,7 @@ class TimelineModel(QObject):
         self.clips_changed.emit()
 
     def add_clip(self, clip: Clip, index: Optional[int] = None):
+        self._push_undo()
         if not clip.is_gap:
             clip.color_index = self._color_counter % 8
             self._color_counter += 1
@@ -98,6 +144,7 @@ class TimelineModel(QObject):
 
     def remove_clips(self, clip_ids: set):
         """Replace real clips with gaps, remove gaps outright. Merge adjacent gaps."""
+        self._push_undo()
         new_list = []
         for c in self._clips:
             if c.id in clip_ids:
@@ -135,6 +182,7 @@ class TimelineModel(QObject):
     def split_clip_at(self, clip_id: str, timeline_frame: int) -> bool:
         """Split a clip at the given timeline frame position.
         Only works on real clips, not gaps. Returns True if split was performed."""
+        self._push_undo()
         result = self.get_clip_at_position(timeline_frame)
         if result is None:
             return False
@@ -177,6 +225,7 @@ class TimelineModel(QObject):
         self._clips.clear()
         self._selected_ids.clear()
         self._color_counter = 0
+        self.clear_undo()
         self.clips_changed.emit()
         self.selection_changed.emit()
 
@@ -219,7 +268,8 @@ class TimelineModel(QObject):
         self.selection_changed.emit()
 
     def select_to_gap_left(self, timeline_frame: int):
-        """Select all real clips between the playhead and the first gap to the left."""
+        """Select all real clips between the playhead and the first gap to the left.
+        If the playhead is on a gap, starts from the clip just before it."""
         result = self.get_clip_at_position(timeline_frame)
         if result is None:
             return
@@ -227,6 +277,12 @@ class TimelineModel(QObject):
         idx = self.get_clip_index(clip.id)
         if idx < 0:
             return
+
+        # If on a gap, skip to the clip before it
+        if clip.is_gap:
+            idx -= 1
+            if idx < 0:
+                return
 
         # Walk left from idx, collecting real clips until we hit a gap
         selected = set()
@@ -238,6 +294,11 @@ class TimelineModel(QObject):
         self._selected_ids = selected
         self.selection_changed.emit()
 
+    def set_selection(self, ids: set):
+        """Replace selection with the given set of clip IDs."""
+        self._selected_ids = set(ids)
+        self.selection_changed.emit()
+
     def select_all(self):
         self._selected_ids = {c.id for c in self._clips}
         self.selection_changed.emit()
@@ -246,5 +307,26 @@ class TimelineModel(QObject):
         return [c for c in self._clips if c.id in self._selected_ids]
 
     def delete_selected(self):
+        """Delete selected clips, replacing them with gaps (non-ripple)."""
         if self._selected_ids:
             self.remove_clips(set(self._selected_ids))
+
+    def ripple_delete_selected(self):
+        """Ripple delete selected clips — removes them and collapses the space."""
+        if not self._selected_ids:
+            return
+        self._push_undo()
+        self._clips = [c for c in self._clips if c.id not in self._selected_ids]
+        self._merge_adjacent_gaps()
+        self._selected_ids.clear()
+        self.clips_changed.emit()
+        self.selection_changed.emit()
+
+    def ripple_delete_by_source(self, source_id: str):
+        """Remove all clips belonging to a source. Gaps are preserved. Used when re-detecting cuts."""
+        self._push_undo()
+        self._clips = [c for c in self._clips if c.source_id != source_id]
+        self._merge_adjacent_gaps()
+        self._selected_ids.clear()
+        self.clips_changed.emit()
+        self.selection_changed.emit()

@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
@@ -32,7 +33,7 @@ class DetectDialog(QDialog):
         layout.addWidget(QLabel(
             f"{name}\n"
             f"{source.width}x{source.height}, {source.fps:.2f} fps, "
-            f"{source.total_frames} frames"
+            f"{source.total_frames:,} frames"
         ))
 
         # Threshold setting
@@ -56,6 +57,12 @@ class DetectDialog(QDialog):
         self._progress.setVisible(False)
         layout.addWidget(self._progress)
 
+        # Detail label: frame counter + ETA
+        self._detail_label = QLabel("")
+        self._detail_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._detail_label.setVisible(False)
+        layout.addWidget(self._detail_label)
+
         # Buttons
         btn_layout = QHBoxLayout()
         self._start_btn = QPushButton("Detect")
@@ -68,16 +75,24 @@ class DetectDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self._detector: Optional[SceneDetector] = None
+        self._start_time: float = 0
+        self._phase_start_time: float = 0
 
     def _start_detection(self):
         self._start_btn.setEnabled(False)
         self._threshold_spin.setEnabled(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
+        self._detail_label.setVisible(True)
+        self._detail_label.setText("Starting...")
+        self._start_time = time.monotonic()
+        self._phase_start_time = self._start_time
 
         threshold = self._threshold_spin.value()
         self._detector = SceneDetector(self._source, threshold=threshold)
         self._detector.progress.connect(self._on_progress)
+        self._detector.detail_progress.connect(self._on_detail_progress)
+        self._detector.phase_changed.connect(self._on_phase_changed)
         self._detector.finished.connect(self._on_finished)
         self._detector.error.connect(self._on_error)
         self._detector.start()
@@ -85,8 +100,32 @@ class DetectDialog(QDialog):
     def _on_progress(self, pct: int):
         self._progress.setValue(pct)
 
+    def _on_phase_changed(self, phase: str):
+        """Reset the phase timer when switching stages (decode → inference)."""
+        self._phase_start_time = time.monotonic()
+        self._detail_label.setText(f"{phase}...")
+
+    def _on_detail_progress(self, frames_done: int, total_frames: int, phase: str):
+        elapsed = time.monotonic() - self._phase_start_time
+        eta_str = ""
+        if frames_done > 0 and elapsed > 1.0:
+            rate = frames_done / elapsed
+            remaining = (total_frames - frames_done) / rate
+            if remaining >= 60:
+                eta_str = f"  ~{int(remaining) // 60}m {int(remaining) % 60:02d}s left"
+            else:
+                eta_str = f"  ~{int(remaining)}s left"
+
+        self._detail_label.setText(
+            f"{phase}: {frames_done:,} / {total_frames:,} frames{eta_str}"
+        )
+
     def _on_finished(self, clips: List[Clip]):
+        elapsed = time.monotonic() - self._start_time
         self._progress.setValue(100)
+        self._detail_label.setText(
+            f"Done — {len(clips)} cuts found in {int(elapsed)}s"
+        )
         self.detection_complete.emit(self._source.id, clips)
         self.accept()
 
@@ -94,12 +133,17 @@ class DetectDialog(QDialog):
         self._start_btn.setEnabled(True)
         self._threshold_spin.setEnabled(True)
         self._progress.setVisible(False)
+        self._detail_label.setText(f"Error: {msg}")
         logger.error("Detection failed: %s", msg)
 
     def _cancel(self):
         if self._detector and self._detector.isRunning():
             self._detector.cancel()
-            self._detector.wait(3000)
+            # Wait longer — GPU inference windows can take a moment to finish
+            if not self._detector.wait(5000):
+                logger.warning("Detection thread did not stop in 5s, terminating")
+                self._detector.terminate()
+                self._detector.wait(2000)
         self.reject()
 
     def closeEvent(self, event):

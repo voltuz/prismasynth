@@ -26,6 +26,11 @@ class PreviewWidget(QWidget):
         self.setStyleSheet("background-color: #1a1a1a;")
         self.setMinimumSize(320, 180)
 
+        # Black overlay for gaps — sits on top of mpv, hidden by default
+        self._black_overlay = QWidget(self)
+        self._black_overlay.setStyleSheet("background-color: #1a1a1a;")
+        self._black_overlay.hide()
+
         # Container widget for mpv to render into
         self._container = QWidget(self)
         layout = QVBoxLayout(self)
@@ -67,16 +72,46 @@ class PreviewWidget(QWidget):
         if self._current_source == file_path:
             return
         self._player.pause = True
-        self._player.loadfile(file_path)
-        self._player.wait_for_property('seekable')
+        self._player.loadfile(file_path, 'replace')
+        # Wait for file to become seekable before allowing seeks
+        try:
+            self._player.wait_for_property('seekable')
+        except Exception:
+            pass
         self._current_source = file_path
+        self._showing_black = False
         logger.debug("Loaded source: %s", file_path)
+
+    def get_time_pos(self) -> float:
+        """Get mpv's current playback position in seconds, or -1."""
+        if self._ready and self._player:
+            try:
+                t = self._player.time_pos
+                return t if t is not None else -1.0
+            except Exception:
+                pass
+        return -1.0
+
+    def show_black(self):
+        """Show black screen for gaps. No mpv state change — just overlay."""
+        self._black_overlay.setGeometry(self._container.geometry())
+        self._black_overlay.raise_()
+        self._black_overlay.show()
 
     def seek_to_time(self, timestamp: float):
         """Seek to an exact timestamp (seconds). GPU-accelerated."""
         if not self._ready or self._current_source is None:
             return
+        self._ensure_video_visible()
+        # If coming from a gap, keep overlay until seek lands to avoid stale frame flash
+        hiding_overlay = self._black_overlay.isVisible()
         self._player.command('seek', str(timestamp), 'absolute+exact')
+        if hiding_overlay:
+            # Use a short timer to hide overlay after mpv has had time to render
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(50, self._black_overlay.hide)
+        else:
+            self._black_overlay.hide()
 
     def seek_to_frame(self, frame_number: int, fps: float):
         """Seek to an exact frame number."""
@@ -106,10 +141,21 @@ class PreviewWidget(QWidget):
         pass
 
     def clear_frame(self):
-        """Show black (gap on timeline)."""
-        if self._ready:
-            self._player.command('stop')
-            self._current_source = None
+        """Show black (gap on timeline). Keeps the source loaded for fast resume."""
+        if self._ready and self._current_source:
+            self._player.vid = 'no'
+            self._showing_black = True
+
+    def _ensure_video_visible(self):
+        """Re-enable video track if it was hidden for a gap."""
+        if getattr(self, '_showing_black', False):
+            self._player.vid = 'auto'
+            self._showing_black = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._black_overlay.isVisible():
+            self._black_overlay.setGeometry(self._container.geometry())
 
     def cleanup(self):
         """Clean up mpv player."""

@@ -90,6 +90,27 @@ class Exporter(QObject):
 
         self.status.emit(f"Encoding to {output_path}...")
 
+        # Build concat list of clip segments for ffmpeg
+        clips = self._timeline.clips
+        segments = []
+        for clip in clips:
+            if clip.is_gap:
+                continue
+            source = self._sources.get(clip.source_id)
+            if source is None:
+                continue
+            segments.append((source.file_path, clip.source_in, clip.duration_frames, source.fps))
+
+        if not segments:
+            self.status.emit("Nothing to export")
+            return
+
+        # Export each segment via ffmpeg with proper HDR→SDR tone mapping
+        # Use a concat approach: encode each segment to a temp file, then concat
+        # Or simpler: pipe raw frames with tone mapping via ffmpeg per-segment
+        total_frames = sum(s[2] for s in segments)
+        frame_count = 0
+
         cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo",
@@ -104,15 +125,55 @@ class Exporter(QObject):
 
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
+            stderr=subprocess.DEVNULL
         )
 
         try:
-            for frame_data in self._iter_frames(width, height):
+            for source_path, source_in, duration, src_fps in segments:
                 if self._cancelled:
-                    proc.kill()
-                    return
-                proc.stdin.write(frame_data.tobytes())
+                    break
+                # Decode each segment with ffmpeg (handles HDR/DV tone mapping correctly)
+                ss = source_in / src_fps if src_fps > 0 else 0
+                dur = duration / src_fps if src_fps > 0 else 0
+                decode_cmd = [
+                    "ffmpeg", "-v", "quiet",
+                    "-hwaccel", "cuda",
+                    "-ss", f"{ss:.4f}",
+                    "-i", source_path,
+                    "-t", f"{dur:.4f}",
+                    "-vf", (
+                        f"zscale=t=linear:npl=100,format=gbrpf32le,"
+                        f"zscale=p=bt709,tonemap=hable:desat=0,"
+                        f"zscale=t=bt709:m=bt709:r=tv,"
+                        f"format=yuv420p,scale={width}:{height}:flags=lanczos,"
+                        f"format=rgb24"
+                    ),
+                    "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "pipe:1",
+                ]
+                decode_proc = subprocess.Popen(
+                    decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                frame_size = width * height * 3
+                frames_read = 0
+                buf = bytearray()
+                while frames_read < duration and not self._cancelled:
+                    raw = decode_proc.stdout.read(frame_size * 10)
+                    if not raw:
+                        break
+                    buf.extend(raw)
+                    while len(buf) >= frame_size and frames_read < duration:
+                        proc.stdin.write(bytes(buf[:frame_size]))
+                        del buf[:frame_size]
+                        frames_read += 1
+                        frame_count += 1
+                        if frame_count % max(1, total_frames // 200) == 0:
+                            self.progress.emit(min(99, int(frame_count / total_frames * 100)))
+
+                decode_proc.stdout.close()
+                decode_proc.kill()
+                decode_proc.wait()
+
         except BrokenPipeError:
             pass
         finally:
@@ -121,8 +182,7 @@ class Exporter(QObject):
             proc.wait()
 
         if proc.returncode != 0 and not self._cancelled:
-            stderr = proc.stderr.read().decode(errors="replace")
-            logger.error("FFmpeg error: %s", stderr[-500:])
+            logger.error("FFmpeg exited with code %d", proc.returncode)
             self.status.emit(f"FFmpeg error (code {proc.returncode})")
         else:
             self.status.emit(f"Video saved to {output_path}")
@@ -138,7 +198,7 @@ class Exporter(QObject):
         self.status.emit(f"Exporting frames to {output_dir}...")
 
         frame_index = 0
-        for frame_data in self._iter_frames(width, height):
+        for frame_data in self._iter_frames_ffmpeg(width, height):
             if self._cancelled:
                 return
             frame_index += 1
@@ -154,6 +214,62 @@ class Exporter(QObject):
                 cv2.imwrite(filename, bgr)
 
         self.status.emit(f"Exported {frame_index} frames to {output_dir}")
+
+    def _iter_frames_ffmpeg(self, width: int, height: int):
+        """Iterate frames using ffmpeg decode with HDR→SDR tone mapping."""
+        clips = self._timeline.clips
+        total = sum(c.duration_frames for c in clips if not c.is_gap)
+        frame_count = 0
+        frame_size = width * height * 3
+
+        for clip in clips:
+            if self._cancelled:
+                return
+            if clip.is_gap:
+                continue
+            source = self._sources.get(clip.source_id)
+            if source is None:
+                continue
+
+            ss = clip.source_in / source.fps if source.fps > 0 else 0
+            dur = clip.duration_frames / source.fps if source.fps > 0 else 0
+
+            decode_cmd = [
+                "ffmpeg", "-v", "quiet",
+                "-hwaccel", "cuda",
+                "-ss", f"{ss:.4f}",
+                "-i", source.file_path,
+                "-t", f"{dur:.4f}",
+                "-vf", (
+                    f"zscale=t=linear:npl=100,format=gbrpf32le,"
+                    f"zscale=p=bt709,tonemap=hable:desat=0,"
+                    f"zscale=t=bt709:m=bt709:r=tv,"
+                    f"format=yuv420p,scale={width}:{height}:flags=lanczos,"
+                    f"format=rgb24"
+                ),
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "pipe:1",
+            ]
+            proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            buf = bytearray()
+            frames_read = 0
+            while frames_read < clip.duration_frames and not self._cancelled:
+                raw = proc.stdout.read(frame_size * 10)
+                if not raw:
+                    break
+                buf.extend(raw)
+                while len(buf) >= frame_size and frames_read < clip.duration_frames:
+                    frame = np.frombuffer(bytes(buf[:frame_size]), np.uint8).reshape(height, width, 3)
+                    del buf[:frame_size]
+                    yield frame
+                    frames_read += 1
+                    frame_count += 1
+                    if total > 0 and frame_count % max(1, total // 200) == 0:
+                        self.progress.emit(min(99, int(frame_count / total * 100)))
+
+            proc.stdout.close()
+            proc.kill()
+            proc.wait()
 
     @staticmethod
     def _save_exr(frame_rgb: np.ndarray, path: str):

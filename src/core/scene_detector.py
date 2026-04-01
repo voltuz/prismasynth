@@ -10,7 +10,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core.clip import Clip
 from core.video_source import VideoSource
-from core.proxy_cache import ProxyFile
+from core.proxy_cache import ProxyFile, JpegProxyFile, _jproxy_path
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +24,22 @@ TNET_WINDOW = 100
 TNET_STEP = 50
 TNET_PAD = 25
 
-def _build_ffmpeg_cmd(file_path: str, width: int, height: int) -> List[str]:
-    """Build ffmpeg decode command with GPU-accelerated decode + CPU scale.
-    Uses -hwaccel cuda for NVDEC decode (fast), vf scale for exact output size."""
-    return [
-        "ffmpeg", "-v", "quiet",
-        "-hwaccel", "cuda",
-        "-i", file_path,
-        "-vf", f"scale={width}:{height}:flags=fast_bilinear",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "pipe:1",
-    ]
+# Parallel decode
+N_DECODE_SEGMENTS = 4
+
+
+def _build_ffmpeg_cmd(file_path: str, width: int, height: int,
+                      ss: float = None, duration: float = None) -> List[str]:
+    """Build ffmpeg decode command with GPU-accelerated decode + CPU scale."""
+    cmd = ["ffmpeg", "-v", "quiet", "-hwaccel", "cuda"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.4f}"]
+    cmd += ["-i", file_path]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.4f}"]
+    cmd += ["-vf", f"scale={width}:{height}:flags=fast_bilinear",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    return cmd
 
 
 def _build_ffmpeg_cmd_cpu(file_path: str, width: int, height: int) -> List[str]:
@@ -50,10 +55,11 @@ def _build_ffmpeg_cmd_cpu(file_path: str, width: int, height: int) -> List[str]:
 
 class SceneDetector(QThread):
     """Detects shot boundaries using TransNetV2 (GPU-accelerated neural network).
-    Uses NVDEC GPU decoding when available for fast frame extraction.
-    Falls back to HSV frame differencing if TransNetV2 is unavailable."""
+    Uses parallel NVDEC decoding for speed. Falls back to HSV if TransNetV2 unavailable."""
 
-    progress = Signal(int)
+    progress = Signal(int)            # percent (0-100)
+    detail_progress = Signal(int, int, str)  # frames_done, total_frames, phase
+    phase_changed = Signal(str)       # emitted when switching stages
     finished = Signal(list)
     error = Signal(str)
 
@@ -63,13 +69,15 @@ class SceneDetector(QThread):
         self._source = source
         self._threshold = threshold
         self._cancelled = False
-        self._proc = None  # ffmpeg subprocess reference for cleanup
+        self._procs: list = []
 
     def cancel(self):
         self._cancelled = True
-        if self._proc is not None:
+        # Kill all ffmpeg subprocesses immediately
+        procs = list(self._procs)
+        for proc in procs:
             try:
-                self._proc.kill()
+                proc.kill()
             except Exception:
                 pass
 
@@ -87,11 +95,9 @@ class SceneDetector(QThread):
             logger.exception("Scene detection failed")
             self.error.emit(str(e))
 
-    # --- TransNetV2 (streaming pipeline with GPU decode) ---
+    # --- TransNetV2 ---
 
     def _detect_with_transnet(self) -> Optional[List[int]]:
-        """Streaming TransNetV2: GPU-decode with ffmpeg in a background thread,
-        run GPU inference on windows as frames arrive."""
         try:
             import torch
             from transnetv2_pytorch import TransNetV2
@@ -106,88 +112,49 @@ class SceneDetector(QThread):
             return None
 
         total = self._source.total_frames
-        frame_size = TNET_WIDTH * TNET_HEIGHT * 3
+        pad_end = TNET_PAD + TNET_STEP - (total % TNET_STEP if total % TNET_STEP != 0 else TNET_STEP)
 
-        # Try GPU-accelerated decode, fall back to CPU
-        cmd = _build_ffmpeg_cmd(self._source.file_path, TNET_WIDTH, TNET_HEIGHT)
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self._proc = proc
+        # Pre-allocate padded array — all decode paths write directly into it
+        padded = np.empty((TNET_PAD + total + pad_end, TNET_HEIGHT, TNET_WIDTH, 3), dtype=np.uint8)
 
-        # Quick check: if GPU decode fails, retry with CPU
-        test_data = proc.stdout.read(frame_size * 2)
-        if len(test_data) < frame_size and proc.poll() is not None:
-            logger.info("GPU decode unavailable, using CPU")
-            cmd = _build_ffmpeg_cmd_cpu(self._source.file_path, TNET_WIDTH, TNET_HEIGHT)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self._proc = proc
-            test_data = b""
+        # Decode frames — try proxy first, then parallel ffmpeg
+        n_frames = self._decode_from_proxy(padded, total)
+        if n_frames == 0:
+            n_frames = self._decode_parallel(padded, total)
+        if n_frames == 0:
+            n_frames = self._decode_single(padded, total)
 
-        # Read all frames in a background thread
-        all_frames = []
-        read_done = threading.Event()
+        if self._cancelled or n_frames == 0:
+            return [] if self._cancelled else None
 
-        def reader_thread():
-            buf = bytearray(test_data)  # include any test data already read
-            chunk_bytes = frame_size * 500
-            try:
-                while True:
-                    raw = proc.stdout.read(chunk_bytes)
-                    if not raw:
-                        break
-                    buf.extend(raw)
-                    while len(buf) >= frame_size:
-                        all_frames.append(
-                            np.frombuffer(bytes(buf[:frame_size]), dtype=np.uint8)
-                            .reshape(TNET_HEIGHT, TNET_WIDTH, 3)
-                        )
-                        del buf[:frame_size]
-                        # Report decode progress
-                        n = len(all_frames)
-                        if n % max(1, total // 50) == 0:
-                            self.progress.emit(min(55, int(n / total * 55)))
-            finally:
-                proc.stdout.close()
-                read_done.set()
-
-        t = threading.Thread(target=reader_thread, daemon=True)
-        t.start()
-
-        # Wait for decode to finish
-        t.join()
-        proc.wait()
+        # Pad edges
+        padded[:TNET_PAD] = padded[TNET_PAD]
+        padded[TNET_PAD + n_frames:] = padded[TNET_PAD + n_frames - 1]
 
         if self._cancelled:
             return []
 
-        n_frames = len(all_frames)
-        if n_frames == 0:
-            logger.warning("No frames decoded")
-            return None
+        # Save legacy proxy for scrub fallback
+        frames_list = [padded[TNET_PAD + i] for i in range(n_frames)]
+        ProxyFile.save_frames(self._source, frames_list)
+        del frames_list
+
+        if self._cancelled:
+            return []
 
         logger.info("Decoded %d frames, running inference", n_frames)
-        self.progress.emit(55)
+        self.progress.emit(100)
+        self.phase_changed.emit("Analyzing")
+        self.progress.emit(0)
 
-        # Build padded tensor
-        first_frame = all_frames[0]
-        last_frame = all_frames[-1]
-        pad_end = TNET_PAD + TNET_STEP - (n_frames % TNET_STEP if n_frames % TNET_STEP != 0 else TNET_STEP)
-
-        padded = np.empty((TNET_PAD + n_frames + pad_end, TNET_HEIGHT, TNET_WIDTH, 3), dtype=np.uint8)
-        padded[:TNET_PAD] = first_frame
-        for i, f in enumerate(all_frames):
-            padded[TNET_PAD + i] = f
-        padded[TNET_PAD + n_frames:] = last_frame
-
-        # Save all decoded frames as a scrub proxy file (mmap for instant access)
-        ProxyFile.save_frames(self._source, all_frames)
-        all_frames.clear()
-
-        self.progress.emit(60)
-
-        padded_tensor = torch.from_numpy(np.array(padded, copy=True)).to(model.device)
+        # Transfer to GPU and run inference
+        padded_tensor = torch.from_numpy(padded).to(model.device)
         del padded
 
-        # Run inference in windows
+        if self._cancelled:
+            del padded_tensor
+            return []
+
         predictions = []
         ptr = 0
         total_windows = max(1, (len(padded_tensor) - TNET_WINDOW) // TNET_STEP + 1)
@@ -203,9 +170,11 @@ class SceneDetector(QThread):
                 ptr += TNET_STEP
                 window_idx += 1
 
-                if window_idx % max(1, total_windows // 30) == 0:
-                    pct = 60 + int(window_idx / total_windows * 38)
-                    self.progress.emit(min(98, pct))
+                if window_idx % max(1, total_windows // 100) == 0:
+                    pct = int(window_idx / total_windows * 100)
+                    self.progress.emit(min(99, pct))
+                    frames_done = min(n_frames, window_idx * TNET_STEP)
+                    self.detail_progress.emit(frames_done, n_frames, "Analyzing")
 
         all_preds = torch.cat(predictions, 0)[:n_frames].numpy()
         cut_frames = np.where(all_preds > self._threshold)[0].tolist()
@@ -214,6 +183,161 @@ class SceneDetector(QThread):
         logger.info("TransNetV2 detected %d cuts in %s (threshold=%.2f)",
                      len(cut_frames), self._source.file_path, self._threshold)
         return cut_frames
+
+    # --- Decode: from JPEG proxy (fastest, ~628 fps) ---
+
+    def _decode_from_proxy(self, padded: np.ndarray, total: int) -> int:
+        """Read frames from existing .jproxy file. ~2.5x faster than ffmpeg."""
+        jpath = _jproxy_path(self._source)
+        if not jpath.exists():
+            return 0
+
+        proxy = JpegProxyFile(self._source)
+        if not proxy.open():
+            return 0
+
+        if proxy.n_frames < total * 0.9:
+            proxy.close()
+            return 0
+
+        logger.info("Using existing jproxy for decode (%d frames)", proxy.n_frames)
+        n = min(proxy.n_frames, total)
+
+        for i in range(n):
+            if self._cancelled:
+                proxy.close()
+                return 0
+            frame = proxy.get_frame(i)
+            if frame is None:
+                proxy.close()
+                return i
+            padded[TNET_PAD + i] = cv2.resize(frame, (TNET_WIDTH, TNET_HEIGHT),
+                                               interpolation=cv2.INTER_AREA)
+            if i % max(1, n // 200) == 0:
+                self.progress.emit(min(100, int(i / n * 100)))
+                self.detail_progress.emit(i, n, "Decoding (proxy)")
+
+        proxy.close()
+        return n
+
+    # --- Decode: parallel ffmpeg segments (~396 fps) ---
+
+    def _decode_parallel(self, padded: np.ndarray, total: int) -> int:
+        """Decode using N parallel ffmpeg/NVDEC processes."""
+        fps = self._source.fps if self._source.fps > 0 else 24.0
+        frame_size = TNET_WIDTH * TNET_HEIGHT * 3
+        n_seg = N_DECODE_SEGMENTS
+        frames_per_seg = total // n_seg
+
+        seg_counts = [0] * n_seg
+        seg_errors = [None] * n_seg
+        progress_lock = threading.Lock()
+        total_decoded = [0]
+
+        def decode_segment(seg_idx, start_frame, max_frames):
+            ss = start_frame / fps
+            dur = (max_frames + 100) / fps
+            cmd = _build_ffmpeg_cmd(self._source.file_path, TNET_WIDTH, TNET_HEIGHT,
+                                    ss=ss, duration=dur)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._procs.append(proc)
+
+            buf = bytearray()
+            count = 0
+            offset = TNET_PAD + start_frame
+            try:
+                while count < max_frames and not self._cancelled:
+                    raw = proc.stdout.read(frame_size * 500)
+                    if not raw:
+                        break
+                    buf.extend(raw)
+                    while len(buf) >= frame_size and count < max_frames:
+                        padded[offset + count] = (
+                            np.frombuffer(bytes(buf[:frame_size]), np.uint8)
+                            .reshape(TNET_HEIGHT, TNET_WIDTH, 3)
+                        )
+                        del buf[:frame_size]
+                        count += 1
+
+                        with progress_lock:
+                            total_decoded[0] += 1
+                            n = total_decoded[0]
+                        if n % max(1, total // 200) == 0:
+                            self.progress.emit(min(100, int(n / total * 100)))
+                            self.detail_progress.emit(n, total, "Decoding")
+            except Exception as e:
+                seg_errors[seg_idx] = e
+            finally:
+                try:
+                    proc.stdout.close()
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+            seg_counts[seg_idx] = count
+
+        # Test if GPU decode works with a quick probe
+        test_cmd = _build_ffmpeg_cmd(self._source.file_path, TNET_WIDTH, TNET_HEIGHT)
+        test_proc = subprocess.Popen(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        test_data = test_proc.stdout.read(frame_size * 2)
+        test_proc.stdout.close()
+        test_proc.kill()
+        test_proc.wait()
+        if len(test_data) < frame_size:
+            logger.info("GPU decode unavailable for parallel, falling back to single")
+            return 0
+
+        threads = []
+        for i in range(n_seg):
+            start = i * frames_per_seg
+            count = frames_per_seg if i < n_seg - 1 else total - start
+            t = threading.Thread(target=decode_segment, args=(i, start, count))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        n_frames = sum(seg_counts)
+        errors = [e for e in seg_errors if e is not None]
+        if errors:
+            logger.warning("Segment decode errors: %s", errors)
+
+        return n_frames
+
+    # --- Decode: single ffmpeg (fallback, ~262 fps) ---
+
+    def _decode_single(self, padded: np.ndarray, total: int) -> int:
+        """Single ffmpeg process decode — CPU fallback."""
+        frame_size = TNET_WIDTH * TNET_HEIGHT * 3
+        cmd = _build_ffmpeg_cmd_cpu(self._source.file_path, TNET_WIDTH, TNET_HEIGHT)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._procs.append(proc)
+
+        buf = bytearray()
+        count = 0
+        try:
+            while count < total and not self._cancelled:
+                raw = proc.stdout.read(frame_size * 500)
+                if not raw:
+                    break
+                buf.extend(raw)
+                while len(buf) >= frame_size and count < total:
+                    padded[TNET_PAD + count] = (
+                        np.frombuffer(bytes(buf[:frame_size]), np.uint8)
+                        .reshape(TNET_HEIGHT, TNET_WIDTH, 3)
+                    )
+                    del buf[:frame_size]
+                    count += 1
+                    if count % max(1, total // 200) == 0:
+                        self.progress.emit(min(100, int(count / total * 100)))
+                        self.detail_progress.emit(count, total, "Decoding")
+        finally:
+            proc.stdout.close()
+            proc.kill()
+            proc.wait()
+
+        return count
 
     # --- HSV fallback ---
 

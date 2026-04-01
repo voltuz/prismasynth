@@ -101,10 +101,15 @@ class ProxyFile:
         """Save a list of RGB24 numpy arrays (48x27) as a proxy file."""
         path = _proxy_path(source)
         path.parent.mkdir(parents=True, exist_ok=True)
-        arr = np.array(frames, dtype=np.uint8)
-        arr.tofile(str(path))
-        logger.info("Saved proxy: %s (%d frames, %.0f MB)",
-                     path, len(frames), path.stat().st_size / 1e6)
+        try:
+            with open(path, "wb") as f:
+                for frame in frames:
+                    f.write(frame.tobytes())
+            logger.info("Saved proxy: %s (%d frames, %.0f MB)",
+                         path, len(frames), path.stat().st_size / 1e6)
+        except OSError:
+            # File may be mmap'd by ProxyManager — skip, existing proxy still works
+            logger.warning("Proxy file locked (mmap'd), skipping save for %s", path)
 
 
 def _jproxy_path(source: VideoSource) -> Path:
@@ -332,6 +337,7 @@ class HQProxyGenerator(QObject):
 
     def generate(self, source: VideoSource):
         """Start background HQ proxy generation for a source."""
+        self._cancelled = False
         jpath = _jproxy_path(source)
         if jpath.exists() and jpath.stat().st_size > JPROXY_HEADER_SIZE:
             logger.info("HQ proxy already exists for %s", source.file_path)

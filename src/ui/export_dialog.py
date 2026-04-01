@@ -1,7 +1,7 @@
 import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
-    QPushButton, QComboBox, QSpinBox, QFileDialog,
+    QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QFileDialog,
     QProgressBar, QGroupBox, QLineEdit, QTabWidget, QWidget,
 )
 from PySide6.QtCore import Signal
@@ -78,9 +78,10 @@ class ExportDialog(QDialog):
         res_layout.addWidget(self._vid_height)
         vform.addRow("Resolution:", res_layout)
 
-        self._vid_fps = QSpinBox()
+        self._vid_fps = QDoubleSpinBox()
         self._vid_fps.setRange(1, 120)
-        self._vid_fps.setValue(int(default_fps))
+        self._vid_fps.setDecimals(3)
+        self._vid_fps.setValue(default_fps)
         vform.addRow("FPS:", self._vid_fps)
 
         self._vid_output = QLineEdit()
