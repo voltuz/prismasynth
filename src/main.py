@@ -1,6 +1,7 @@
 import sys
 import os
 import logging
+import traceback
 
 # Add src to path so imports work as packages
 _src_dir = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +14,20 @@ from PySide6.QtCore import Qt
 
 from ui.main_window import MainWindow
 
+_CRASH_LOG = os.path.join(_src_dir, "crash.log")
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """Write unhandled exceptions to crash.log so they survive .bat launches."""
+    text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+            from datetime import datetime
+            f.write(f"\n--- {datetime.now().isoformat()} ---\n{text}\n")
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
 
 def setup_logging():
     logging.basicConfig(
@@ -23,6 +38,7 @@ def setup_logging():
 
 
 def main():
+    sys.excepthook = _excepthook
     setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("PrismaSynth")

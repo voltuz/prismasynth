@@ -9,6 +9,7 @@ MAX_UNDO = 50
 class TimelineModel(QObject):
     clips_changed = Signal()
     selection_changed = Signal()
+    in_out_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -17,6 +18,8 @@ class TimelineModel(QObject):
         self._color_counter: int = 0
         self._undo_stack: list = []
         self._redo_stack: list = []
+        self._in_point: Optional[int] = None
+        self._out_point: Optional[int] = None
 
     # --- Undo / Redo ---
 
@@ -179,10 +182,10 @@ class TimelineModel(QObject):
                 merged.append(c)
         self._clips = merged
 
-    def split_clip_at(self, clip_id: str, timeline_frame: int) -> bool:
+    def split_clip_at(self, clip_id: str, timeline_frame: int,
+                      select_left_only: bool = False) -> bool:
         """Split a clip at the given timeline frame position.
         Only works on real clips, not gaps. Returns True if split was performed."""
-        self._push_undo()
         result = self.get_clip_at_position(timeline_frame)
         if result is None:
             return False
@@ -191,11 +194,11 @@ class TimelineModel(QObject):
             return False
         if offset <= 0 or offset >= clip.duration_frames - 1:
             return False
-
         idx = self.get_clip_index(clip_id)
         if idx < 0:
             return False
 
+        self._push_undo()
         clip_a = Clip(
             source_id=clip.source_id,
             source_in=clip.source_in,
@@ -215,7 +218,8 @@ class TimelineModel(QObject):
         if clip_id in self._selected_ids:
             self._selected_ids.discard(clip_id)
             self._selected_ids.add(clip_a.id)
-            self._selected_ids.add(clip_b.id)
+            if not select_left_only:
+                self._selected_ids.add(clip_b.id)
 
         self.clips_changed.emit()
         self.selection_changed.emit()
@@ -225,9 +229,51 @@ class TimelineModel(QObject):
         self._clips.clear()
         self._selected_ids.clear()
         self._color_counter = 0
+        self._in_point = None
+        self._out_point = None
         self.clear_undo()
         self.clips_changed.emit()
         self.selection_changed.emit()
+        self.in_out_changed.emit()
+
+    # --- In/Out Points ---
+
+    @property
+    def in_point(self) -> Optional[int]:
+        return self._in_point
+
+    @property
+    def out_point(self) -> Optional[int]:
+        return self._out_point
+
+    def set_in_point(self, frame: Optional[int]):
+        self._in_point = frame
+        if self._in_point is not None and self._out_point is not None:
+            if self._in_point >= self._out_point:
+                self._out_point = None
+        self.in_out_changed.emit()
+
+    def set_out_point(self, frame: Optional[int]):
+        self._out_point = frame
+        if self._in_point is not None and self._out_point is not None:
+            if self._out_point <= self._in_point:
+                self._in_point = None
+        self.in_out_changed.emit()
+
+    def clear_in_out(self):
+        self._in_point = None
+        self._out_point = None
+        self.in_out_changed.emit()
+
+    def get_render_range(self) -> Tuple[int, int]:
+        total = self.get_total_duration_frames()
+        if total == 0:
+            return (0, 0)
+        start = self._in_point if self._in_point is not None else 0
+        end = self._out_point if self._out_point is not None else total - 1
+        start = min(start, total - 1)
+        end = min(end, total - 1)
+        return (start, end)
 
     # --- Selection ---
 

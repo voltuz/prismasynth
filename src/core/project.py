@@ -21,11 +21,16 @@ class ProjectData:
 
 
 def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
-                 selection_follows: bool = True):
+                 selection_follows: bool = True,
+                 in_point: Optional[int] = None, out_point: Optional[int] = None,
+                 scroll_offset: int = 0):
     data = {
         "version": PROJECT_VERSION,
         "playhead_position": playhead,
+        "scroll_offset": scroll_offset,
         "selection_follows_playhead": selection_follows,
+        "in_point": in_point,
+        "out_point": out_point,
         "sources": [],
         "clips": [],
     }
@@ -72,6 +77,9 @@ def load_project(filepath: str):
         "sources": sources,
         "clips": clips,
         "playhead_position": data.get("playhead_position", 0),
+        "scroll_offset": data.get("scroll_offset", 0),
         "selection_follows_playhead": data.get("selection_follows_playhead", True),
+        "in_point": data.get("in_point"),
+        "out_point": data.get("out_point"),
         "version": data.get("version", 1),
     }

@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QToolBar, QWidget
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtCore import Signal
 
 
@@ -13,6 +13,7 @@ class MainToolbar(QToolBar):
     selection_follows_toggled = Signal(bool)
     export_video_clicked = Signal()
     export_images_clicked = Signal()
+    mode_changed = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__("Main Toolbar", parent)
@@ -54,6 +55,24 @@ class MainToolbar(QToolBar):
 
         self.addSeparator()
 
+        self._mode_group = QActionGroup(self)
+        self._mode_group.setExclusive(True)
+
+        self._selection_mode_action = QAction("Selection", self)
+        self._selection_mode_action.setCheckable(True)
+        self._selection_mode_action.setChecked(True)
+        self._mode_group.addAction(self._selection_mode_action)
+        self.addAction(self._selection_mode_action)
+
+        self._cut_mode_action = QAction("Cut", self)
+        self._cut_mode_action.setCheckable(True)
+        self._mode_group.addAction(self._cut_mode_action)
+        self.addAction(self._cut_mode_action)
+
+        self._mode_group.triggered.connect(self._on_mode_action_triggered)
+
+        self.addSeparator()
+
         self._export_video_action = QAction("Export Video", self)
         self._export_video_action.triggered.connect(self.export_video_clicked.emit)
         self.addAction(self._export_video_action)
@@ -61,6 +80,21 @@ class MainToolbar(QToolBar):
         self._export_images_action = QAction("Export Images", self)
         self._export_images_action.triggered.connect(self.export_images_clicked.emit)
         self.addAction(self._export_images_action)
+
+    def _on_mode_action_triggered(self, action):
+        if action == self._selection_mode_action:
+            self.mode_changed.emit(0)
+        elif action == self._cut_mode_action:
+            self.mode_changed.emit(1)
+
+    def set_mode(self, mode: int):
+        """Update toolbar toggle state without emitting mode_changed."""
+        self._mode_group.blockSignals(True)
+        if mode == 0:
+            self._selection_mode_action.setChecked(True)
+        elif mode == 1:
+            self._cut_mode_action.setChecked(True)
+        self._mode_group.blockSignals(False)
 
     def set_playing(self, playing: bool):
         self._play_action.setText("Pause" if playing else "Play")

@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import numpy as np
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QSizePolicy
@@ -40,6 +41,10 @@ class PreviewWidget(QWidget):
         self._player: mpv.MPV = None
         self._current_source: str = None
         self._ready = False
+        self._is_playing = False  # cached to avoid querying mpv C property
+        self._showing_black = False
+        self._last_seek_time = 0.0
+        self._min_seek_interval = 0.033  # ~30fps max seek rate
 
     def init_player(self):
         """Initialize the mpv player. Must be called after the widget is shown
@@ -62,6 +67,7 @@ class PreviewWidget(QWidget):
             video_sync='display-resample',
         )
         self._player.pause = True
+        self._is_playing = False
         self._ready = True
         logger.info("mpv player initialized (hwdec=%s, wid=%s)", 'auto', wid)
 
@@ -71,7 +77,9 @@ class PreviewWidget(QWidget):
             self.init_player()
         if self._current_source == file_path:
             return
+        self._ensure_video_visible()
         self._player.pause = True
+        self._is_playing = False
         self._player.loadfile(file_path, 'replace')
         # Wait for file to become seekable before allowing seeks
         try:
@@ -99,15 +107,21 @@ class PreviewWidget(QWidget):
         self._black_overlay.show()
 
     def seek_to_time(self, timestamp: float):
-        """Seek to an exact timestamp (seconds). GPU-accelerated."""
+        """Seek to an exact timestamp (seconds). GPU-accelerated.
+        Throttled to ~30fps to prevent overwhelming mpv."""
         if not self._ready or self._current_source is None:
             return
+        now = time.monotonic()
+        if now - self._last_seek_time < self._min_seek_interval:
+            return
+        self._last_seek_time = now
         self._ensure_video_visible()
-        # If coming from a gap, keep overlay until seek lands to avoid stale frame flash
         hiding_overlay = self._black_overlay.isVisible()
-        self._player.command('seek', str(timestamp), 'absolute+exact')
+        try:
+            self._player.command('seek', str(timestamp), 'absolute+exact')
+        except Exception:
+            return
         if hiding_overlay:
-            # Use a short timer to hide overlay after mpv has had time to render
             from PySide6.QtCore import QTimer
             QTimer.singleShot(50, self._black_overlay.hide)
         else:
@@ -122,22 +136,21 @@ class PreviewWidget(QWidget):
         """Start playback."""
         if self._ready:
             self._player.pause = False
+            self._is_playing = True
 
     def pause(self):
         """Pause playback."""
         if self._ready:
             self._player.pause = True
+            self._is_playing = False
 
     @property
     def is_playing(self) -> bool:
-        if self._ready and self._player:
-            return not self._player.pause
-        return False
+        return self._is_playing
 
     def show_frame(self, frame: np.ndarray, fast: bool = True):
         """Legacy compatibility: display a numpy frame.
         Only used for gaps or when mpv isn't available."""
-        # For gap display, we could clear the screen or show black
         pass
 
     def clear_frame(self):

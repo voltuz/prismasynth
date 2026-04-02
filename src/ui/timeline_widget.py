@@ -1,4 +1,5 @@
 import logging
+from enum import IntEnum
 from typing import Optional, List
 
 from PySide6.QtWidgets import QWidget, QScrollBar, QVBoxLayout
@@ -12,6 +13,11 @@ from core.timeline import TimelineModel
 from core.clip import Clip
 
 logger = logging.getLogger(__name__)
+
+
+class EditMode(IntEnum):
+    SELECTION = 0
+    CUT = 1
 
 # Clip color palette (8 alternating colors for visual distinction)
 CLIP_COLORS = [
@@ -28,7 +34,7 @@ CLIP_COLORS = [
 CLIP_HEIGHT_DEFAULT = 60
 CLIP_HEIGHT_MIN = 30
 CLIP_HEIGHT_MAX = 200
-HEADER_HEIGHT = 24
+HEADER_HEIGHT = 48
 RESIZE_HANDLE_HEIGHT = 5  # pixels at bottom edge for drag resize
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
@@ -45,6 +51,8 @@ class TimelineStrip(QWidget):
     playhead_moved = Signal(int)   # timeline frame
     scroll_changed = Signal()      # scroll offset changed (no playhead change)
     clip_clicked = Signal(str, object)  # clip_id, QMouseEvent (for modifier keys)
+    preview_frame_requested = Signal(int)  # cut-mode hover scrub (no playhead move)
+    cut_requested = Signal(int)    # cut-mode click at timeline frame
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -66,6 +74,9 @@ class TimelineStrip(QWidget):
         self._marquee_ctrl = False
         self._thumbnails = {}  # (clip_id, "first"|"last") -> QPixmap
         self._fps = 24.0
+        self._edit_mode = EditMode.SELECTION
+        self._cut_preview_x: Optional[int] = None
+        self._last_preview_frame = -1   # throttle cut-mode hover seeks
 
         self.setMinimumHeight(CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -73,6 +84,7 @@ class TimelineStrip(QWidget):
 
         self._model.clips_changed.connect(self.update)
         self._model.selection_changed.connect(self.update)
+        self._model.in_out_changed.connect(self.update)
 
     @property
     def pixels_per_frame(self) -> float:
@@ -84,6 +96,17 @@ class TimelineStrip(QWidget):
 
     def set_fps(self, fps: float):
         self._fps = fps if fps > 0 else 24.0
+
+    @property
+    def edit_mode(self) -> EditMode:
+        return self._edit_mode
+
+    def set_edit_mode(self, mode: EditMode):
+        self._edit_mode = mode
+        self._cut_preview_x = None
+        self._last_preview_frame = -1
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
 
     def set_playhead(self, frame: int):
         total = self._model.get_total_duration_frames()
@@ -132,8 +155,15 @@ class TimelineStrip(QWidget):
         clip_y = HEADER_HEIGHT + 2
         self._paint_clips(painter, clip_y, w)
 
+        # In/Out overlay
+        self._paint_in_out_overlay(painter, w)
+
         # Playhead
         self._paint_playhead(painter, clip_y, h)
+
+        # Cut preview line
+        if self._edit_mode == EditMode.CUT and self._cut_preview_x is not None:
+            self._paint_cut_preview(painter, clip_y)
 
         # Marquee selection rectangle (Windows Explorer style)
         if self._marquee_active and self._marquee_start and self._marquee_end:
@@ -261,6 +291,41 @@ class TimelineStrip(QWidget):
                 text_rect = QRect(screen_x + tw, y, clip_w - tw * 2, self._clip_height)
                 painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
+    def _paint_cut_preview(self, painter: QPainter, clip_y: int):
+        x = self._cut_preview_x
+        if x is None or x < 0 or x > self.width():
+            return
+        pen = QPen(QColor(255, 255, 255, 150), 1, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(x, clip_y, x, clip_y + self._clip_height)
+
+    def _paint_in_out_overlay(self, painter: QPainter, viewport_width: int):
+        in_pt = self._model.in_point
+        out_pt = self._model.out_point
+        if in_pt is None and out_pt is None:
+            return
+
+        total_h = self.height()
+        dim_color = QColor(0, 0, 0, 120)
+        marker_color = QColor(0, 200, 255)
+
+        if in_pt is not None:
+            in_px = self._frame_to_pixel(in_pt) - self._scroll_offset
+            dim_right = max(0, in_px)
+            if dim_right > 0:
+                painter.fillRect(0, 0, dim_right, total_h, dim_color)
+            if 0 <= in_px <= viewport_width:
+                painter.setPen(QPen(marker_color, 2))
+                painter.drawLine(in_px, 0, in_px, total_h)
+
+        if out_pt is not None:
+            out_px = self._frame_to_pixel(out_pt + 1) - self._scroll_offset
+            if out_px < viewport_width:
+                painter.fillRect(out_px, 0, viewport_width - out_px, total_h, dim_color)
+            if 0 <= out_px <= viewport_width:
+                painter.setPen(QPen(marker_color, 2))
+                painter.drawLine(out_px, 0, out_px, total_h)
+
     def _paint_playhead(self, painter: QPainter, clip_y: int, total_height: int):
         px = self._frame_to_pixel(self._playhead_frame) - self._scroll_offset
         if 0 <= px <= self.width():
@@ -309,11 +374,19 @@ class TimelineStrip(QWidget):
                 self._marquee_ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
                 return
 
-            # Click in ruler area = set playhead
+            # Click in ruler area = set playhead (works in both modes)
             if y < HEADER_HEIGHT:
                 self._dragging_playhead = True
                 frame = int((x + self._scroll_offset) / self._pixels_per_frame)
                 self.set_playhead(frame)
+                return
+
+            # Cut mode: click to split
+            if self._edit_mode == EditMode.CUT:
+                frame = int((x + self._scroll_offset) / self._pixels_per_frame)
+                result = self._model.get_clip_at_position(frame)
+                if result and not result[0].is_gap:
+                    self.cut_requested.emit(frame)
                 return
 
             # Click in clip area
@@ -356,13 +429,43 @@ class TimelineStrip(QWidget):
             self.set_playhead(frame)
             return
 
-        # Hover cursor: show resize cursor near track bottom edge
+        # Hover behavior
+        x = event.position().x()
         y = event.position().y()
         bottom = self._track_bottom_y()
+
         if abs(y - bottom) <= RESIZE_HANDLE_HEIGHT:
             self.setCursor(Qt.CursorShape.SizeVerCursor)
-        elif not self._panning:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._cut_preview_x = None
+        elif self._edit_mode == EditMode.CUT:
+            if HEADER_HEIGHT <= y <= bottom:
+                frame = int((x + self._scroll_offset) / self._pixels_per_frame)
+                result = self._model.get_clip_at_position(frame)
+                if result and not result[0].is_gap:
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                    self._cut_preview_x = int(x)
+                    # Only seek when the frame changes (throttle rapid mouse moves)
+                    if frame != self._last_preview_frame:
+                        self._last_preview_frame = frame
+                        self.preview_frame_requested.emit(frame)
+                else:
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    self._cut_preview_x = None
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self._cut_preview_x = None
+            self.update()
+        else:
+            if not self._panning:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._cut_preview_x = None
+
+    def leaveEvent(self, event):
+        if self._edit_mode == EditMode.CUT and self._cut_preview_x is not None:
+            self._cut_preview_x = None
+            self.update()
+            self.preview_frame_requested.emit(self._playhead_frame)
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -425,6 +528,27 @@ class TimelineStrip(QWidget):
             self._scroll_offset = max(0, self._scroll_offset - delta)
             self.update()
 
+    def _select_adjacent_clip(self, direction: int):
+        """Select next (direction=1) or previous (direction=-1) clip and move playhead."""
+        clips = self._model.clips
+        if not clips:
+            return
+        # Find current clip at playhead
+        result = self._model.get_clip_at_position(self._playhead_frame)
+        if result is None:
+            # Past the end — select last clip
+            idx = len(clips) - 1 if direction < 0 else 0
+        else:
+            current_clip, _ = result
+            idx = self._model.get_clip_index(current_clip.id)
+            idx += direction
+        idx = max(0, min(idx, len(clips) - 1))
+        target = clips[idx]
+        self._model.select_clip(target.id)
+        start = self._model.get_clip_timeline_start(target.id)
+        self.set_playhead(start)
+        self.ensure_playhead_visible()
+
     def keyPressEvent(self, event: QKeyEvent):
         # Arrow keys for frame stepping
         if event.key() == Qt.Key.Key_Left:
@@ -442,6 +566,10 @@ class TimelineStrip(QWidget):
             total = self._model.get_total_duration_frames()
             self.set_playhead(total - 1 if total > 0 else 0)
             self.ensure_playhead_visible()
+        elif event.key() == Qt.Key.Key_Down:
+            self._select_adjacent_clip(1)
+        elif event.key() == Qt.Key.Key_Up:
+            self._select_adjacent_clip(-1)
         else:
             super().keyPressEvent(event)
 
@@ -451,6 +579,8 @@ class TimelineWidget(QWidget):
 
     playhead_changed = Signal(int)
     clip_clicked = Signal(str, object)
+    preview_frame_requested = Signal(int)
+    cut_requested = Signal(int)
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -469,6 +599,8 @@ class TimelineWidget(QWidget):
         self._strip.playhead_moved.connect(self._on_playhead_moved)
         self._strip.scroll_changed.connect(self._update_scrollbar)
         self._strip.clip_clicked.connect(self.clip_clicked.emit)
+        self._strip.preview_frame_requested.connect(self.preview_frame_requested.emit)
+        self._strip.cut_requested.connect(self.cut_requested.emit)
         self._scrollbar.valueChanged.connect(self._strip.set_scroll_offset)
         self._model.clips_changed.connect(self._update_scrollbar)
 

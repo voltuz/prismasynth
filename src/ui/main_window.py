@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from typing import Dict, Optional
 
 from PySide6.QtWidgets import (
@@ -20,7 +21,7 @@ from core.proxy_cache import ProxyManager, ProxyFile, HQProxyGenerator
 from core.project import save_project, load_project
 from utils.paths import get_config_dir
 from ui.preview_widget import PreviewWidget
-from ui.timeline_widget import TimelineWidget
+from ui.timeline_widget import TimelineWidget, EditMode
 from ui.toolbar import MainToolbar
 from ui.clip_info_panel import ClipInfoPanel
 from ui.import_dialog import ImportDialog
@@ -184,6 +185,8 @@ class MainWindow(QMainWindow):
         self._playback_source = None
         self._playback_clip = None
         self._playback_clip_timeline_start = 0
+        self._gap_start_time = 0.0      # monotonic time when gap playback started
+        self._gap_start_frame = 0       # timeline frame at gap start
 
         # Apply dark theme
         self.setStyleSheet(DARK_STYLE)
@@ -200,6 +203,7 @@ class MainWindow(QMainWindow):
         self._toolbar.selection_follows_toggled.connect(self._on_selection_follows_toggled)
         self._toolbar.export_video_clicked.connect(self._on_export_video)
         self._toolbar.export_images_clicked.connect(self._on_export_images)
+        self._toolbar.mode_changed.connect(self._on_mode_changed)
 
         # Central layout
         central = QWidget()
@@ -233,6 +237,8 @@ class MainWindow(QMainWindow):
         # Timeline signals
         self._timeline_widget.playhead_changed.connect(self._on_playhead_changed)
         self._timeline_widget.clip_clicked.connect(self._on_clip_clicked)
+        self._timeline_widget.preview_frame_requested.connect(self._on_preview_frame_requested)
+        self._timeline_widget.cut_requested.connect(self._on_cut_at_frame)
         self._timeline.selection_changed.connect(self._on_selection_changed)
 
         # Status bar
@@ -247,6 +253,7 @@ class MainWindow(QMainWindow):
 
         self._timeline.clips_changed.connect(self._update_status)
         self._timeline.clips_changed.connect(self._mark_dirty)
+        self._timeline.in_out_changed.connect(self._mark_dirty)
 
         # Menu bar
         self._setup_menus()
@@ -355,6 +362,35 @@ class MainWindow(QMainWindow):
         select_gap_action.setShortcut("G")
         select_gap_action.triggered.connect(self._on_select_to_gap)
         edit_menu.addAction(select_gap_action)
+
+        edit_menu.addSeparator()
+
+        set_in_action = QAction("Set In Point", self)
+        set_in_action.setShortcut("I")
+        set_in_action.triggered.connect(self._on_set_in_point)
+        edit_menu.addAction(set_in_action)
+
+        set_out_action = QAction("Set Out Point", self)
+        set_out_action.setShortcut("O")
+        set_out_action.triggered.connect(self._on_set_out_point)
+        edit_menu.addAction(set_out_action)
+
+        clear_in_out_action = QAction("Clear In/Out", self)
+        clear_in_out_action.setShortcut("X")
+        clear_in_out_action.triggered.connect(self._on_clear_in_out)
+        edit_menu.addAction(clear_in_out_action)
+
+        edit_menu.addSeparator()
+
+        selection_mode_action = QAction("Selection Mode", self)
+        selection_mode_action.setShortcut("V")
+        selection_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.SELECTION))
+        edit_menu.addAction(selection_mode_action)
+
+        cut_mode_action = QAction("Cut Mode", self)
+        cut_mode_action.setShortcut("C")
+        cut_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.CUT))
+        edit_menu.addAction(cut_mode_action)
 
     # --- Import ---
 
@@ -489,7 +525,7 @@ class MainWindow(QMainWindow):
             return
 
         # User moved the playhead — restart playback from new position if playing
-        if self._preview.is_playing:
+        if self._preview.is_playing or self._playback_timer.isActive():
             self._stop_playback()
             self._timeline_widget.strip._playhead_frame = frame
             self._start_playback()
@@ -497,11 +533,11 @@ class MainWindow(QMainWindow):
 
         self._status_frame.setText(f"Frame {frame}")
 
-        if self._selection_follows_playhead:
-            result = self._timeline.get_clip_at_position(frame)
-            if result:
-                clip, _ = result
-                self._timeline.select_clip(clip.id)
+        result = self._timeline.get_clip_at_position(frame)
+
+        if self._selection_follows_playhead and result:
+            clip, _ = result
+            self._timeline.select_clip(clip.id)
 
         # Pause thumbnail generation while scrubbing — resume after 500ms idle
         if self._thumbnail_cache:
@@ -509,7 +545,6 @@ class MainWindow(QMainWindow):
             self._thumb_resume_timer.start()
 
         # Seek mpv to the correct source frame (GPU-accelerated)
-        result = self._timeline.get_clip_at_position(frame)
         if result is None or result[0].is_gap:
             self._preview.show_black()
             return
@@ -592,6 +627,75 @@ class MainWindow(QMainWindow):
         frame = self._timeline_widget.strip.playhead_frame
         self._timeline.select_to_gap_left(frame)
 
+    # --- In/Out Points ---
+
+    def _on_set_in_point(self):
+        frame = self._timeline_widget.strip.playhead_frame
+        self._timeline.set_in_point(frame)
+
+    def _on_set_out_point(self):
+        frame = self._timeline_widget.strip.playhead_frame
+        self._timeline.set_out_point(frame)
+
+    def _on_clear_in_out(self):
+        self._timeline.clear_in_out()
+
+    def _get_render_frame_count(self) -> int:
+        start, end = self._timeline.get_render_range()
+        count = 0
+        pos = 0
+        for clip in self._timeline.clips:
+            clip_start = pos
+            clip_end = pos + clip.duration_frames - 1
+            pos += clip.duration_frames
+            if clip_end < start or clip_start > end:
+                continue
+            if clip.is_gap:
+                continue
+            effective_start = max(clip_start, start)
+            effective_end = min(clip_end, end)
+            count += effective_end - effective_start + 1
+        return count
+
+    # --- Edit Mode ---
+
+    def _set_edit_mode(self, mode: EditMode):
+        self._timeline_widget.strip.set_edit_mode(mode)
+        self._toolbar.set_mode(int(mode))
+
+    def _on_mode_changed(self, mode: int):
+        self._timeline_widget.strip.set_edit_mode(EditMode(mode))
+
+    def _on_preview_frame_requested(self, frame: int):
+        """Preview a frame without moving the playhead (cut mode hover scrub)."""
+        if self._thumbnail_cache:
+            self._thumbnail_cache.pause()
+            self._thumb_resume_timer.start()
+
+        result = self._timeline.get_clip_at_position(frame)
+        if result is None or result[0].is_gap:
+            self._preview.show_black()
+            return
+        clip, offset = result
+        source = self._sources.get(clip.source_id)
+        if source:
+            source_frame = clip.source_in + offset
+            self._preview.load_source(source.file_path)
+            self._preview.seek_to_frame(source_frame, source.fps)
+
+    def _on_cut_at_frame(self, frame: int):
+        """Handle a cut-mode click: split the clip at this frame, select left half."""
+        result = self._timeline.get_clip_at_position(frame)
+        if result is None:
+            return
+        clip, _ = result
+        if clip.is_gap:
+            return
+        # Select the clip first so split_clip_at can transfer selection to left half
+        self._timeline.select_clip(clip.id)
+        if self._timeline.split_clip_at(clip.id, frame, select_left_only=True):
+            self._start_thumbnail_cache()
+
     # --- Playback ---
 
     def _toggle_play(self):
@@ -603,26 +707,35 @@ class MainWindow(QMainWindow):
     def _start_playback(self):
         if self._timeline.clip_count == 0:
             return
-        # Ensure mpv has the right source loaded at the playhead position
         frame = self._timeline_widget.strip.playhead_frame
         result = self._timeline.get_clip_at_position(frame)
-        if result is None or result[0].is_gap:
+        if result is None:
             return
         clip, offset = result
-        source = self._sources.get(clip.source_id)
-        if not source:
-            return
 
-        self._preview.load_source(source.file_path)
-        self._preview.seek_to_frame(clip.source_in + offset, source.fps)
-        self._preview.play()
-        self._toolbar.set_playing(True)
-
-        # Track mpv's playback position and update the timeline playhead
-        self._playback_source = source
-        self._playback_clip = clip
-        self._playback_clip_timeline_start = self._timeline.get_clip_timeline_start(clip.id)
-        self._playback_timer.start()
+        if clip.is_gap:
+            # Start on a gap: show black, advance playhead via timer at source fps
+            self._preview.show_black()
+            self._playback_source = None
+            self._playback_clip = clip
+            self._playback_clip_timeline_start = self._timeline.get_clip_timeline_start(clip.id)
+            self._toolbar.set_playing(True)
+            self._gap_start_time = time.monotonic()
+            self._gap_start_frame = frame
+            self._playback_timer.start()
+        else:
+            source = self._sources.get(clip.source_id)
+            if not source:
+                return
+            self._preview.load_source(source.file_path)
+            self._preview.seek_to_frame(clip.source_in + offset, source.fps)
+            self._preview.play()
+            self._toolbar.set_playing(True)
+            self._playback_source = source
+            self._playback_clip = clip
+            self._playback_clip_timeline_start = self._timeline.get_clip_timeline_start(clip.id)
+            self._gap_playback_frame = -1
+            self._playback_timer.start()
 
     def _stop_playback(self):
         self._playback_timer.stop()
@@ -631,6 +744,51 @@ class MainWindow(QMainWindow):
 
     def _on_playback_tick(self):
         """Sync timeline playhead with mpv's current position during native playback."""
+        clip = self._playback_clip
+        if clip is None:
+            self._stop_playback()
+            return
+
+        # Gap playback: advance playhead based on elapsed time at source fps
+        if clip.is_gap:
+            fps = next(iter(self._sources.values())).fps if self._sources else 24.0
+            elapsed = time.monotonic() - self._gap_start_time
+            current_frame = self._gap_start_frame + int(elapsed * fps)
+            gap_end = self._playback_clip_timeline_start + clip.duration_frames
+            if current_frame >= gap_end:
+                # Gap finished — move to next clip
+                result = self._timeline.get_clip_at_position(gap_end)
+                if result is None:
+                    self._stop_playback()
+                    return
+                next_clip, _ = result
+                if next_clip.is_gap:
+                    # Another gap — keep going, reset timer
+                    self._playback_clip = next_clip
+                    self._playback_clip_timeline_start = gap_end
+                    self._gap_start_time = time.monotonic()
+                    self._gap_start_frame = gap_end
+                else:
+                    # Real clip — start mpv playback
+                    next_source = self._sources.get(next_clip.source_id)
+                    if not next_source:
+                        self._stop_playback()
+                        return
+                    self._preview.load_source(next_source.file_path)
+                    self._preview.seek_to_frame(next_clip.source_in, next_source.fps)
+                    self._preview.play()
+                    self._playback_clip = next_clip
+                    self._playback_source = next_source
+                    self._playback_clip_timeline_start = gap_end
+                current_frame = min(current_frame, gap_end)
+
+            self._playback_updating = True
+            self._timeline_widget.set_playhead(current_frame)
+            self._playback_updating = False
+            self._timeline_widget.strip.ensure_playhead_visible()
+            return
+
+        # Normal clip playback: sync with mpv
         if not self._preview.is_playing:
             self._stop_playback()
             return
@@ -643,7 +801,6 @@ class MainWindow(QMainWindow):
         source_frame = int(time_pos * fps)
 
         # Check if we've passed the end of the current clip
-        clip = self._playback_clip
         if source_frame > clip.source_out:
             # Move to next clip on the timeline
             next_start = self._playback_clip_timeline_start + clip.duration_frames
@@ -653,14 +810,14 @@ class MainWindow(QMainWindow):
                 return
             next_clip, _ = result
             if next_clip.is_gap:
-                # Skip gap, find next real clip
-                gap_end = next_start + next_clip.duration_frames
-                result = self._timeline.get_clip_at_position(gap_end)
-                if result is None or result[0].is_gap:
-                    self._stop_playback()
-                    return
-                next_clip, _ = result
-                next_start = gap_end
+                # Enter gap playback mode
+                self._preview.pause()
+                self._preview.show_black()
+                self._playback_clip = next_clip
+                self._playback_clip_timeline_start = next_start
+                self._gap_start_time = time.monotonic()
+                self._gap_start_frame = next_start
+                return
 
             next_source = self._sources.get(next_clip.source_id)
             if not next_source:
@@ -716,9 +873,15 @@ class MainWindow(QMainWindow):
         w = first_source.width if first_source else 1920
         h = first_source.height if first_source else 1080
         fps = first_source.fps if first_source else 24.0
-        total = self._timeline.get_total_duration_frames()
+        # Calculate actual export frames (excluding gaps)
+        export_frames = sum(c.duration_frames for c in self._timeline.clips if not c.is_gap)
+        has_in_out = self._timeline.in_point is not None or self._timeline.out_point is not None
+        render_frames = self._get_render_frame_count() if has_in_out else None
+        clip_count = self._timeline.real_clip_count
 
-        dialog = ExportDialog(w, h, fps, total, self)
+        dialog = ExportDialog(w, h, fps, export_frames, render_frames=render_frames,
+                              clip_count=clip_count, source_width=w, source_height=h,
+                              parent=self)
         dialog._tabs.setCurrentIndex(tab)
         dialog.export_requested.connect(
             lambda settings: self._run_export(settings, dialog)
@@ -727,11 +890,14 @@ class MainWindow(QMainWindow):
 
     def _run_export(self, settings: dict, dialog: ExportDialog):
         self._exporter = Exporter(
-            self._timeline, self._sources, self._reader_pool
+            self._timeline, self._sources
         )
-        self._exporter.progress.connect(dialog.set_progress)
-        self._exporter.status.connect(dialog.set_status)
-        self._exporter.finished.connect(dialog.export_finished)
+        self._exporter.progress.connect(dialog.set_progress, Qt.ConnectionType.QueuedConnection)
+        self._exporter.status.connect(dialog.set_status, Qt.ConnectionType.QueuedConnection)
+        self._exporter.finished.connect(dialog.export_finished, Qt.ConnectionType.QueuedConnection)
+        self._exporter.error.connect(lambda msg: dialog.set_status(f"Error: {msg}"),
+                                     Qt.ConnectionType.QueuedConnection)
+        dialog.rejected.connect(self._exporter.cancel)
         self._exporter.export(settings)
 
     # --- Project management ---
@@ -754,6 +920,9 @@ class MainWindow(QMainWindow):
             return
         self._stop_playback()
         self._hq_proxy_gen.stop()
+        if self._thumbnail_cache is not None:
+            self._thumbnail_cache.stop()
+            self._thumbnail_cache = None
         self._timeline.clear()
         self._reader_pool.close_all()
         self._proxy_manager.close_all()
@@ -783,8 +952,12 @@ class MainWindow(QMainWindow):
     def _save_to(self, path: str):
         try:
             playhead = self._timeline_widget.strip.playhead_frame
+            scroll = self._timeline_widget.strip._scroll_offset
             save_project(path, self._sources, self._timeline.clips,
-                         playhead, self._selection_follows_playhead)
+                         playhead, self._selection_follows_playhead,
+                         in_point=self._timeline.in_point,
+                         out_point=self._timeline.out_point,
+                         scroll_offset=scroll)
             self._project_path = path
             self._dirty = False
             self._autosave_timer.stop()
@@ -838,8 +1011,17 @@ class MainWindow(QMainWindow):
         # Restore clips (preserve saved colors)
         self._timeline.add_clips(data["clips"], assign_colors=False)
 
-        # Restore playhead
+        # Restore playhead and scroll position
         self._timeline_widget.set_playhead(data.get("playhead_position", 0))
+        self._timeline_widget.strip.set_scroll_offset(data.get("scroll_offset", 0))
+
+        # Restore in/out points
+        in_pt = data.get("in_point")
+        out_pt = data.get("out_point")
+        if in_pt is not None:
+            self._timeline.set_in_point(in_pt)
+        if out_pt is not None:
+            self._timeline.set_out_point(out_pt)
 
         # Restore selection follows + sync toolbar toggle
         self._selection_follows_playhead = data.get("selection_follows_playhead", True)

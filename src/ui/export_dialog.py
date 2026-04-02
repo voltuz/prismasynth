@@ -13,10 +13,50 @@ VIDEO_PRESETS = {
         "ext": ".mp4",
         "args": ["-c:v", "libx264", "-preset", "medium", "-crf", "{quality}", "-pix_fmt", "yuv420p"],
     },
+    "h264_nvenc": {
+        "name": "H.264 NVENC (MP4, GPU)",
+        "ext": ".mp4",
+        "args": ["-c:v", "h264_nvenc", "-preset", "p4", "-crf", "{quality}", "-pix_fmt", "yuv420p"],
+    },
     "h265": {
         "name": "H.265/HEVC (MP4)",
         "ext": ".mp4",
         "args": ["-c:v", "libx265", "-preset", "medium", "-crf", "{quality}", "-pix_fmt", "yuv420p"],
+    },
+    "h265_nvenc": {
+        "name": "H.265 NVENC (MP4, GPU)",
+        "ext": ".mp4",
+        "args": ["-c:v", "hevc_nvenc", "-preset", "p4", "-crf", "{quality}", "-pix_fmt", "yuv420p"],
+    },
+    "prores_proxy": {
+        "name": "ProRes 422 Proxy (MOV)",
+        "ext": ".mov",
+        "args": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"],
+    },
+    "prores_lt": {
+        "name": "ProRes 422 LT (MOV)",
+        "ext": ".mov",
+        "args": ["-c:v", "prores_ks", "-profile:v", "1", "-pix_fmt", "yuv422p10le"],
+    },
+    "prores_standard": {
+        "name": "ProRes 422 (MOV)",
+        "ext": ".mov",
+        "args": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"],
+    },
+    "prores_hq": {
+        "name": "ProRes 422 HQ (MOV)",
+        "ext": ".mov",
+        "args": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],
+    },
+    "prores_4444": {
+        "name": "ProRes 4444 (MOV)",
+        "ext": ".mov",
+        "args": ["-c:v", "prores_ks", "-profile:v", "4", "-pix_fmt", "yuva444p10le"],
+    },
+    "prores_4444xq": {
+        "name": "ProRes 4444 XQ (MOV)",
+        "ext": ".mov",
+        "args": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p10le"],
     },
     "ffv1": {
         "name": "FFV1 Lossless (MKV)",
@@ -38,7 +78,9 @@ class ExportDialog(QDialog):
     export_requested = Signal(dict)  # settings dict
 
     def __init__(self, default_width: int = 1920, default_height: int = 1080,
-                 default_fps: float = 24.0, total_frames: int = 0, parent=None):
+                 default_fps: float = 24.0, total_frames: int = 0,
+                 render_frames: int = None, clip_count: int = 0,
+                 source_width: int = 0, source_height: int = 0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export")
         self.setMinimumWidth(500)
@@ -128,8 +170,27 @@ class ExportDialog(QDialog):
         il.addLayout(iform)
         self._tabs.addTab(img_tab, "Image Sequence")
 
-        # Info
-        info_label = QLabel(f"Total frames to export: {total_frames}")
+        # Info stats
+        fps = default_fps if default_fps > 0 else 24.0
+        export_frames = render_frames if render_frames is not None else total_frames
+        duration_secs = export_frames / fps
+        mins, secs = divmod(int(duration_secs), 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            duration_str = f"{hours:d}:{mins:02d}:{secs:02d}"
+        else:
+            duration_str = f"{mins:d}:{secs:02d}"
+
+        if render_frames is not None and render_frames != total_frames:
+            frames_str = f"{render_frames:,} frames (in/out range of {total_frames:,})"
+        else:
+            frames_str = f"{total_frames:,} frames"
+
+        res_str = f"{source_width}x{source_height}" if source_width and source_height else ""
+        parts = [f"Clips: {clip_count}", frames_str, f"Duration: {duration_str}"]
+        if res_str:
+            parts.append(f"Source: {res_str}")
+        info_label = QLabel("  |  ".join(parts))
         info_label.setStyleSheet("color: #aaa;")
         layout.addWidget(info_label)
 
@@ -139,8 +200,18 @@ class ExportDialog(QDialog):
         self._progress.setVisible(False)
         layout.addWidget(self._progress)
 
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet("color: #aaa;")
+        self._progress_label.setVisible(False)
+        layout.addWidget(self._progress_label)
+
         self._status_label = QLabel("")
         layout.addWidget(self._status_label)
+
+        # For ETA calculation
+        self._export_start_time = 0.0
+        self._total_export_frames = render_frames if render_frames is not None else total_frames
+        self._export_fps = default_fps if default_fps > 0 else 24.0
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -206,10 +277,45 @@ class ExportDialog(QDialog):
 
         self._export_btn.setEnabled(False)
         self._progress.setVisible(True)
+        self._progress_label.setVisible(True)
+        import time
+        self._export_start_time = time.monotonic()
         self.export_requested.emit(settings)
 
     def set_progress(self, pct: int):
         self._progress.setValue(pct)
+        if pct <= 0 or self._export_start_time <= 0:
+            return
+        import time
+        elapsed = time.monotonic() - self._export_start_time
+        total_frames = self._total_export_frames
+        fps = self._export_fps
+        done_frames = int(total_frames * pct / 100)
+        done_secs = done_frames / fps
+        total_secs = total_frames / fps
+
+        # ETA
+        if pct > 0:
+            eta_secs = max(0, elapsed * (100 - pct) / pct)
+            eta_m, eta_s = divmod(int(eta_secs), 60)
+            eta_str = f"{eta_m:d}:{eta_s:02d}"
+        else:
+            eta_str = "--:--"
+
+        # Formatted times
+        def fmt_time(s):
+            m, sec = divmod(int(s), 60)
+            h, m = divmod(m, 60)
+            return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:d}:{sec:02d}"
+
+        # Export speed in fps
+        export_fps = done_frames / elapsed if elapsed > 0 else 0
+
+        self._progress_label.setText(
+            f"{done_frames:,} / {total_frames:,} frames  |  "
+            f"{fmt_time(done_secs)} / {fmt_time(total_secs)}  |  "
+            f"{export_fps:.1f} fps  |  ETA: {eta_str}"
+        )
 
     def set_status(self, msg: str):
         self._status_label.setText(msg)
