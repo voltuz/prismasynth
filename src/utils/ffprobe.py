@@ -78,3 +78,41 @@ def probe_video(file_path: str) -> Optional[VideoInfo]:
         duration_seconds=duration_seconds,
         codec=codec,
     )
+
+
+_hdr_cache: dict = {}
+
+
+def probe_hdr(file_path: str) -> bool:
+    """Check if a video file is HDR (PQ/HLG + BT.2020). Cached per path."""
+    if file_path in _hdr_cache:
+        return _hdr_cache[file_path]
+
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        file_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            _hdr_cache[file_path] = False
+            return False
+        data = json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        _hdr_cache[file_path] = False
+        return False
+
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        transfer = stream.get("color_transfer", "")
+        primaries = stream.get("color_primaries", "")
+        is_hdr = (transfer in ("smpte2084", "arib-std-b67")
+                  and primaries == "bt2020")
+        _hdr_cache[file_path] = is_hdr
+        return is_hdr
+
+    _hdr_cache[file_path] = False
+    return False

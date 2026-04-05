@@ -3,8 +3,9 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QFileDialog,
     QProgressBar, QGroupBox, QLineEdit, QTabWidget, QWidget,
+    QCheckBox, QSlider, QButtonGroup, QRadioButton, QFrame,
 )
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 
 
 VIDEO_PRESETS = {
@@ -16,7 +17,7 @@ VIDEO_PRESETS = {
     "h264_nvenc": {
         "name": "H.264 NVENC (MP4, GPU)",
         "ext": ".mp4",
-        "args": ["-c:v", "h264_nvenc", "-preset", "p4", "-crf", "{quality}", "-pix_fmt", "yuv420p"],
+        "args": ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "{quality}", "-pix_fmt", "yuv420p"],
     },
     "h265": {
         "name": "H.265/HEVC (MP4)",
@@ -26,27 +27,27 @@ VIDEO_PRESETS = {
     "h265_nvenc": {
         "name": "H.265 NVENC (MP4, GPU)",
         "ext": ".mp4",
-        "args": ["-c:v", "hevc_nvenc", "-preset", "p4", "-crf", "{quality}", "-pix_fmt", "yuv420p"],
+        "args": ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "{quality}", "-pix_fmt", "yuv420p"],
     },
     "prores_proxy": {
         "name": "ProRes 422 Proxy (MOV)",
         "ext": ".mov",
-        "args": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"],
+        "args": ["-c:v", "prores_aw", "-profile:v", "0", "-pix_fmt", "yuv422p10le"],
     },
     "prores_lt": {
         "name": "ProRes 422 LT (MOV)",
         "ext": ".mov",
-        "args": ["-c:v", "prores_ks", "-profile:v", "1", "-pix_fmt", "yuv422p10le"],
+        "args": ["-c:v", "prores_aw", "-profile:v", "1", "-pix_fmt", "yuv422p10le"],
     },
     "prores_standard": {
         "name": "ProRes 422 (MOV)",
         "ext": ".mov",
-        "args": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"],
+        "args": ["-c:v", "prores_aw", "-profile:v", "2", "-pix_fmt", "yuv422p10le"],
     },
     "prores_hq": {
         "name": "ProRes 422 HQ (MOV)",
         "ext": ".mov",
-        "args": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],
+        "args": ["-c:v", "prores_aw", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],
     },
     "prores_4444": {
         "name": "ProRes 4444 (MOV)",
@@ -95,18 +96,79 @@ class ExportDialog(QDialog):
         # --- Video tab ---
         video_tab = QWidget()
         vl = QVBoxLayout(video_tab)
-        vform = QFormLayout()
 
-        self._codec_combo = QComboBox()
-        for key, preset in VIDEO_PRESETS.items():
-            self._codec_combo.addItem(preset["name"], key)
-        vform.addRow("Codec:", self._codec_combo)
+        # Codec selection — grouped radio buttons
+        CODEC_GROUPS = [
+            ("H.264", [
+                ("h264_nvenc", "NVENC (GPU)"),
+                ("h264", "Software"),
+            ]),
+            ("H.265 / HEVC", [
+                ("h265_nvenc", "NVENC (GPU)"),
+                ("h265", "Software"),
+            ]),
+            ("ProRes", [
+                ("prores_proxy", "422 Proxy"),
+                ("prores_lt", "422 LT"),
+                ("prores_standard", "422"),
+                ("prores_hq", "422 HQ"),
+                ("prores_4444", "4444"),
+                ("prores_4444xq", "4444 XQ"),
+            ]),
+            ("Lossless", [
+                ("ffv1", "FFV1"),
+            ]),
+        ]
+
+        self._codec_group = QButtonGroup(self)
+        self._codec_buttons = {}  # key -> QRadioButton
+        codec_layout = QHBoxLayout()
+        codec_layout.setSpacing(12)
+
+        for group_name, codecs in CODEC_GROUPS:
+            group_box = QGroupBox(group_name)
+            group_vl = QVBoxLayout(group_box)
+            group_vl.setSpacing(2)
+            group_vl.setContentsMargins(8, 8, 8, 6)
+            for key, label in codecs:
+                rb = QRadioButton(label)
+                rb.setProperty("codec_key", key)
+                self._codec_group.addButton(rb)
+                self._codec_buttons[key] = rb
+                group_vl.addWidget(rb)
+            codec_layout.addWidget(group_box)
+
+        # Default to H.264 NVENC
+        self._codec_buttons["h264_nvenc"].setChecked(True)
+        self._codec_group.buttonClicked.connect(self._on_codec_changed)
+
+        vl.addLayout(codec_layout)
+
+        # Settings below codec selection
+        vform = QFormLayout()
 
         self._quality_spin = QSpinBox()
         self._quality_spin.setRange(0, 51)
         self._quality_spin.setValue(18)
-        self._quality_spin.setToolTip("CRF quality (lower = better, 0 = lossless). Ignored for FFV1.")
-        vform.addRow("Quality (CRF):", self._quality_spin)
+        self._quality_spin.setToolTip("Quality (lower = better, 0 = lossless)")
+        self._quality_label = QLabel("Quality:")
+        vform.addRow(self._quality_label, self._quality_spin)
+
+        # Denoise controls
+        self._denoise_check = QCheckBox("Denoise (FastDVDnet)")
+        self._denoise_check.setToolTip("AI temporal denoiser — uses 5-frame windows for high-quality noise removal")
+        self._denoise_sigma = QSpinBox()
+        self._denoise_sigma.setRange(5, 55)
+        self._denoise_sigma.setValue(25)
+        self._denoise_sigma.setEnabled(False)
+        self._denoise_sigma.setToolTip("5-15: light (clean sources)  |  15-30: medium (film grain)  |  30-55: heavy (noisy/low light)")
+        self._denoise_check.toggled.connect(self._denoise_sigma.setEnabled)
+        denoise_layout = QHBoxLayout()
+        denoise_layout.addWidget(self._denoise_check)
+        denoise_layout.addWidget(QLabel("Strength:"))
+        denoise_layout.addWidget(self._denoise_sigma)
+        denoise_layout.addStretch()
+        vform.addRow("", denoise_layout)
 
         self._vid_width = QSpinBox()
         self._vid_width.setRange(128, 7680)
@@ -224,8 +286,18 @@ class ExportDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
+    def _selected_codec_key(self):
+        btn = self._codec_group.checkedButton()
+        return btn.property("codec_key") if btn else "h264_nvenc"
+
+    def _on_codec_changed(self):
+        key = self._selected_codec_key()
+        has_quality = "{quality}" in " ".join(VIDEO_PRESETS[key]["args"])
+        self._quality_spin.setVisible(has_quality)
+        self._quality_label.setVisible(has_quality)
+
     def _browse_video_output(self):
-        codec_key = self._codec_combo.currentData()
+        codec_key = self._selected_codec_key()
         ext = VIDEO_PRESETS[codec_key]["ext"]
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Video", "", f"Video (*{ext})"
@@ -245,7 +317,7 @@ class ExportDialog(QDialog):
             if not output:
                 self._status_label.setText("Please specify an output path.")
                 return
-            codec_key = self._codec_combo.currentData()
+            codec_key = self._selected_codec_key()
             preset = VIDEO_PRESETS[codec_key]
             quality = self._quality_spin.value()
             args = [a.replace("{quality}", str(quality)) for a in preset["args"]]
@@ -258,6 +330,8 @@ class ExportDialog(QDialog):
                 "width": self._vid_width.value(),
                 "height": self._vid_height.value(),
                 "fps": self._vid_fps.value(),
+                "denoise": self._denoise_check.isChecked(),
+                "denoise_sigma": self._denoise_sigma.value(),
             }
         else:
             # Image sequence export
@@ -313,8 +387,8 @@ class ExportDialog(QDialog):
 
         self._progress_label.setText(
             f"{done_frames:,} / {total_frames:,} frames  |  "
-            f"{fmt_time(done_secs)} / {fmt_time(total_secs)}  |  "
-            f"{export_fps:.1f} fps  |  ETA: {eta_str}"
+            f"{export_fps:.1f} fps  |  "
+            f"Elapsed: {fmt_time(elapsed)}  |  ETA: {eta_str}"
         )
 
     def set_status(self, msg: str):
