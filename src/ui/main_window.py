@@ -17,7 +17,7 @@ from core.video_source import VideoSource
 from core.video_reader import VideoReaderPool
 from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
-from core.proxy_cache import ProxyManager, ProxyFile
+from core.proxy_cache import ProxyManager
 from core.project import save_project, load_project
 from utils.paths import get_config_dir
 from ui.preview_widget import PreviewWidget

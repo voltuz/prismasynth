@@ -9,8 +9,6 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
 from core.video_reader import VideoReaderPool, get_frame_cache
-from core.proxy_cache import ProxyManager
-
 logger = logging.getLogger(__name__)
 
 PREFETCH_BUFFER_SIZE = 60  # frames to buffer ahead
@@ -183,13 +181,11 @@ class ScrubDecoder(QObject):
     _restart_timer = Signal()  # internal: safely restart debounce timer from any thread
 
     def __init__(self, timeline: TimelineModel, sources: Dict[str, VideoSource],
-                 reader_pool: VideoReaderPool, proxy_manager: Optional[ProxyManager] = None,
-                 parent=None):
+                 reader_pool: VideoReaderPool, parent=None):
         super().__init__(parent)
         self._timeline = timeline
         self._sources = sources
         self._reader_pool = reader_pool
-        self._proxy_manager = proxy_manager
 
         self._pending_frame: Optional[int] = None
         self._lock = threading.Lock()
@@ -206,9 +202,6 @@ class ScrubDecoder(QObject):
         self._debounce_timer.setInterval(8)  # ~120Hz max decode rate
         self._debounce_timer.timeout.connect(self._dispatch_decode)
         self._restart_timer.connect(self._debounce_timer.start)
-
-    def set_proxy_manager(self, proxy_manager: ProxyManager):
-        self._proxy_manager = proxy_manager
 
     def request_frame(self, timeline_frame: int):
         """Request a frame. Prefers full-res cached frames; proxy is last resort."""

@@ -11,12 +11,6 @@ def get_cache_dir() -> Path:
     return d
 
 
-def get_thumbnail_dir() -> Path:
-    d = get_cache_dir() / "thumbnails"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 def get_config_dir() -> Path:
     base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     d = base / APP_NAME
