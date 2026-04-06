@@ -62,7 +62,7 @@ VIDEO_PRESETS = {
     "ffv1": {
         "name": "FFV1 Lossless (MKV)",
         "ext": ".mkv",
-        "args": ["-c:v", "ffv1", "-level", "3", "-slicecrc", "1", "-pix_fmt", "yuv444p10le"],
+        "args": ["-c:v", "ffv1", "-level", "3", "-slices", "4", "-slicecrc", "1", "-pix_fmt", "yuv444p10le"],
     },
 }
 

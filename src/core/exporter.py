@@ -256,7 +256,8 @@ class Exporter(QObject):
             )
             for src_in, count in group["segments"]:
                 flat_segments.append(
-                    (group["path"], src_in, count, group["fps"], vf, hw))
+                    (group["path"], src_in, count, group["fps"], vf, hw,
+                     is_hdr))
 
         total_frames = sum(s[2] for s in flat_segments)
         suffix = ""
@@ -265,29 +266,65 @@ class Exporter(QObject):
         self.status.emit(
             f"Encoding {len(flat_segments)} segments to {output_path}...{suffix}")
 
+        def _build_segment_cmd(path, src_in, count, src_fps, vf, hw, hdr,
+                               out_file):
+            """Build FFmpeg command for a single segment."""
+            ss = src_in / src_fps if src_fps > 0 else 0
+            hwaccel = ["-hwaccel", "cuda"]
+            # SDR + NVENC + no filters: full GPU pipeline (zero-copy)
+            if not vf and is_nvenc:
+                hwaccel += ["-hwaccel_output_format", "cuda"]
+                gpu_vf = "scale_cuda=format=yuv420p"
+            else:
+                gpu_vf = None
+            cmd = (["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw
+                   + hwaccel + [
+                "-ss", f"{ss:.6f}",
+                "-i", path,
+                "-frames:v", str(count),
+            ])
+            if vf:
+                cmd += ["-vf", vf]
+            elif gpu_vf:
+                cmd += ["-vf", gpu_vf]
+            if hdr:
+                cmd += ["-colorspace", "bt709", "-color_trc", "bt709",
+                        "-color_primaries", "bt709"]
+            if not is_nvenc:
+                threads_per = max(2, cpu_count // max_parallel)
+                cmd += ["-threads", str(threads_per)]
+            cmd += ["-r", str(fps), "-an"] + ffmpeg_args + [out_file]
+            return cmd
+
+        # Single segment: encode directly to output (no temp files, no concat)
+        if len(flat_segments) == 1:
+            path, src_in, count, src_fps, vf, hw, hdr = flat_segments[0]
+            cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
+                                     hdr, output_path)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            self._active_procs = [proc]
+            _, stderr_data = proc.communicate()
+            self._active_procs = []
+            if proc.returncode != 0 and not self._cancelled:
+                err = (stderr_data or b"").decode(errors="replace")[-500:]
+                raise RuntimeError(f"Encoding failed: {err}")
+            self.progress.emit(100)
+            self.status.emit(f"Video saved to {output_path}")
+            return
+
+        # Multiple segments: temp files + parallel encode + concat
         temp_dir = tempfile.mkdtemp(prefix="prismasynth_export_",
                                      dir=os.path.dirname(output_path))
         try:
             temp_files = []
             commands = []
-            for i, (path, src_in, count, src_fps, vf, hw) in enumerate(
+            for i, (path, src_in, count, src_fps, vf, hw, hdr) in enumerate(
                     flat_segments):
-                ss = src_in / src_fps if src_fps > 0 else 0
-                dur = count / src_fps if src_fps > 0 else 0
                 tmp = os.path.join(temp_dir, f"seg_{i:04d}.mkv")
                 temp_files.append(tmp)
-                cmd = (["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw + [
-                    "-hwaccel", "cuda",
-                    "-ss", f"{ss:.6f}", "-i", path,
-                    "-t", f"{dur:.6f}",
-                ])
-                if vf:
-                    cmd += ["-vf", vf]
-                # CPU codecs: add threading so each process uses multiple cores
-                if not is_nvenc:
-                    threads_per = max(2, cpu_count // max_parallel)
-                    cmd += ["-threads", str(threads_per)]
-                cmd += ["-r", str(fps), "-an"] + ffmpeg_args + [tmp]
+                cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
+                                         hdr, tmp)
                 commands.append((cmd, count))
 
             # Thread pool: as-soon-as-done scheduling (no batch-wait)
@@ -409,196 +446,6 @@ class Exporter(QObject):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _export_video_select(self, settings: dict):
-        """Fast export: single FFmpeg process per source with select filter."""
-        width = settings["width"]
-        height = settings["height"]
-        fps = settings["fps"]
-        output_path = settings["output_path"]
-        ffmpeg_args = settings["ffmpeg_args"]
-
-        groups = self._build_source_groups()
-        if not groups:
-            self.status.emit("Nothing to export")
-            return
-
-        gpu_available, opencl_device = _probe_gpu_tonemap()
-        total_frames = sum(g["total_frames"] for g in groups.values())
-
-        if len(groups) == 1:
-            # Single source — encode directly to output (no temp files)
-            sid, group = next(iter(groups.items()))
-            source = self._sources.get(sid)
-            is_hdr = probe_hdr(group["path"])
-            use_gpu_tm = gpu_available and is_hdr
-            hw_args = self._gpu_hw_args(opencl_device) if use_gpu_tm else []
-
-            seek_frame = group["segments"][0][0]
-            last_seg = group["segments"][-1]
-            last_frame = last_seg[0] + last_seg[1]
-            select_expr = self._build_select_expr(group["segments"], seek_frame)
-
-            vf = self._build_vf(
-                width, height, use_gpu_tm, is_hdr=is_hdr,
-                source_width=source.width if source else 0,
-                source_height=source.height if source else 0,
-                select_expr=select_expr, fps=fps,
-            )
-
-            ss = seek_frame / group["fps"] if group["fps"] > 0 else 0
-            dur = (last_frame - seek_frame) / group["fps"] if group["fps"] > 0 else 0
-
-            suffix = ""
-            if is_hdr:
-                suffix = " (GPU tonemap)" if use_gpu_tm else " (CPU tonemap)"
-            self.status.emit(f"Encoding to {output_path}...{suffix}")
-
-            cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
-                   "-progress", "pipe:1"] + hw_args + [
-                "-hwaccel", "cuda",
-                "-ss", f"{ss:.6f}", "-t", f"{dur:.6f}",
-                "-i", group["path"],
-            ]
-            if vf:
-                cmd += ["-vf", vf]
-            # Output -t caps duration to actual content (input -t is the full
-            # span including gaps, needed for the select filter to reach all clips)
-            output_dur = group["total_frames"] / fps if fps > 0 else 0
-            cmd += ["-r", str(fps), "-an",
-                    "-t", f"{output_dur:.6f}"] + ffmpeg_args + [output_path]
-
-            logger.info("Select export: %d segments coalesced from source, "
-                        "decode range %d frames, output %d frames",
-                        len(group["segments"]), last_frame - seek_frame,
-                        group["total_frames"])
-            self._run_ffmpeg_with_progress(cmd, total_frames)
-        else:
-            # Multi-source — encode each source to temp, then concat
-            temp_dir = tempfile.mkdtemp(prefix="prismasynth_export_",
-                                         dir=os.path.dirname(output_path))
-            try:
-                temp_files = []
-                frames_done = 0
-                for i, (sid, group) in enumerate(groups.items()):
-                    if self._cancelled:
-                        return
-                    source = self._sources.get(sid)
-                    is_hdr = probe_hdr(group["path"])
-                    use_gpu_tm = gpu_available and is_hdr
-                    hw_args = self._gpu_hw_args(opencl_device) if use_gpu_tm else []
-
-                    seek_frame = group["segments"][0][0]
-                    last_seg = group["segments"][-1]
-                    last_frame = last_seg[0] + last_seg[1]
-                    select_expr = self._build_select_expr(group["segments"],
-                                                         seek_frame)
-                    vf = self._build_vf(
-                        width, height, use_gpu_tm, is_hdr=is_hdr,
-                        source_width=source.width if source else 0,
-                        source_height=source.height if source else 0,
-                        select_expr=select_expr, fps=fps,
-                    )
-
-                    ss = seek_frame / group["fps"] if group["fps"] > 0 else 0
-                    dur = ((last_frame - seek_frame) / group["fps"]
-                           if group["fps"] > 0 else 0)
-                    tmp = os.path.join(temp_dir, f"source_{i:04d}.mkv")
-                    temp_files.append(tmp)
-
-                    self.status.emit(
-                        f"Encoding source {i + 1}/{len(groups)}...")
-
-                    cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
-                           "-progress", "pipe:1"] + hw_args + [
-                        "-hwaccel", "cuda",
-                        "-ss", f"{ss:.6f}", "-t", f"{dur:.6f}",
-                        "-i", group["path"],
-                    ]
-                    if vf:
-                        cmd += ["-vf", vf]
-                    output_dur = group["total_frames"] / fps if fps > 0 else 0
-                    cmd += ["-r", str(fps), "-an",
-                            "-t", f"{output_dur:.6f}"] + ffmpeg_args + [tmp]
-
-                    self._run_ffmpeg_with_progress(
-                        cmd, group["total_frames"],
-                        progress_offset=frames_done,
-                        progress_total=total_frames,
-                    )
-                    frames_done += group["total_frames"]
-
-                if self._cancelled:
-                    return
-
-                # Concat all source outputs
-                self.status.emit("Concatenating sources...")
-                concat_list = os.path.join(temp_dir, "concat.txt")
-                with open(concat_list, "w", encoding="utf-8") as f:
-                    for tmp in temp_files:
-                        escaped = tmp.replace("\\", "/").replace("'", "'\\''")
-                        f.write(f"file '{escaped}'\n")
-                concat_cmd = [
-                    "ffmpeg", "-y", "-nostdin", "-v", "error",
-                    "-f", "concat", "-safe", "0", "-i", concat_list,
-                    "-c", "copy", output_path,
-                ]
-                result = subprocess.run(concat_cmd, capture_output=True)
-                if result.returncode != 0 and not self._cancelled:
-                    stderr = result.stderr.decode(errors="replace")[-500:]
-                    raise RuntimeError(f"Concat failed: {stderr}")
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-        if not self._cancelled:
-            self.progress.emit(100)
-            self.status.emit(f"Video saved to {output_path}")
-
-    def _run_ffmpeg_with_progress(self, cmd, expected_frames,
-                                   progress_offset=0, progress_total=None):
-        """Run a single FFmpeg process, parsing -progress pipe:1 for updates."""
-        if progress_total is None:
-            progress_total = expected_frames
-
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
-        self._active_procs = [proc]
-
-        # Drain stderr in a background thread to prevent pipe deadlock
-        stderr_chunks = []
-        def _drain_stderr():
-            try:
-                for chunk in iter(lambda: proc.stderr.read(4096), b""):
-                    stderr_chunks.append(chunk)
-            except (OSError, ValueError):
-                pass
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        stderr_thread.start()
-
-        try:
-            for line in proc.stdout:
-                if self._cancelled:
-                    proc.kill()
-                    break
-                line_str = line.decode(errors="replace").strip()
-                if line_str.startswith("frame="):
-                    try:
-                        cur = int(line_str.split("=", 1)[1].strip())
-                        done = progress_offset + cur
-                        pct = min(99, int(done / progress_total * 100))
-                        self.progress.emit(pct)
-                    except (ValueError, IndexError):
-                        pass
-            proc.wait()
-        finally:
-            self._active_procs = []
-            stderr_thread.join(timeout=5)
-
-        if proc.returncode != 0 and not self._cancelled:
-            stderr = b"".join(stderr_chunks).decode(errors="replace")[-500:]
-            raise RuntimeError(
-                f"FFmpeg failed (code {proc.returncode}): {stderr}"
-            )
-
     def _export_video_concat(self, segments, temp_dir, output_path, fps,
                              vf, hw_args, ffmpeg_args, max_parallel, total_frames):
         """Encode each segment to a temp file, then concat."""
@@ -607,16 +454,16 @@ class Exporter(QObject):
 
         for i, (source_path, src_in, duration, src_fps, _sid) in enumerate(segments):
             ss = src_in / src_fps if src_fps > 0 else 0
-            dur = duration / src_fps if src_fps > 0 else 0
             tmp = os.path.join(temp_dir, f"seg_{i:04d}.mkv")
             temp_files.append(tmp)
 
-            cmd = ["ffmpeg", "-y", "-v", "quiet"] + hw_args + [
+            cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw_args + [
                 "-hwaccel", "cuda",
-                "-ss", f"{ss:.6f}", "-i", source_path,
-                "-t", f"{dur:.6f}",
+                "-ss", f"{ss:.6f}",
+                "-i", source_path,
+                "-frames:v", str(duration),
                 "-vf", vf,
-                "-r", str(fps),
+                "-r", str(fps), "-an",
             ] + ffmpeg_args + [tmp]
             commands.append((cmd, duration))
 
@@ -675,7 +522,7 @@ class Exporter(QObject):
                 f.write(f"file '{escaped}'\n")
 
         concat_cmd = [
-            "ffmpeg", "-y", "-v", "quiet",
+            "ffmpeg", "-y", "-nostdin", "-v", "error",
             "-f", "concat", "-safe", "0", "-i", concat_list,
             "-c", "copy", output_path,
         ]
@@ -699,21 +546,34 @@ class Exporter(QObject):
         os.makedirs(output_dir, exist_ok=True)
         self.status.emit(f"Exporting frames to {output_dir}...")
 
-        frame_index = 0
-        for frame_data in self._iter_frames_ffmpeg(width, height):
-            if self._cancelled:
-                return
-            frame_index += 1
-            filename = os.path.join(output_dir, f"{frame_index:06d}{ext}")
-
+        def _write_frame(index, data):
+            filename = os.path.join(output_dir, f"{index:06d}{ext}")
             if fmt == "exr":
-                self._save_exr(frame_data, filename)
+                self._save_exr(data, filename)
             elif fmt == "jpg":
-                bgr = cv2.cvtColor(frame_data, cv2.COLOR_RGB2BGR)
+                bgr = cv2.cvtColor(data, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(filename, bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
             else:  # png
-                bgr = cv2.cvtColor(frame_data, cv2.COLOR_RGB2BGR)
+                bgr = cv2.cvtColor(data, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(filename, bgr)
+
+        frame_index = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            pending = []
+            for frame_data in self._iter_frames_ffmpeg(width, height):
+                if self._cancelled:
+                    return
+                frame_index += 1
+                # Submit write to thread pool (overlaps I/O with decode)
+                pending.append(pool.submit(_write_frame, frame_index,
+                                           frame_data.copy()))
+                # Limit queue depth to avoid memory bloat
+                if len(pending) >= 16:
+                    pending[0].result()
+                    pending.pop(0)
+            # Drain remaining writes
+            for f in pending:
+                f.result()
 
         self.status.emit(f"Exported {frame_index} frames to {output_dir}")
 

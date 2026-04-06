@@ -10,7 +10,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core.clip import Clip
 from core.video_source import VideoSource
-from core.proxy_cache import ProxyFile, JpegProxyFile, _jproxy_path
+from core.proxy_cache import ProxyFile
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +117,8 @@ class SceneDetector(QThread):
         # Pre-allocate padded array — all decode paths write directly into it
         padded = np.empty((TNET_PAD + total + pad_end, TNET_HEIGHT, TNET_WIDTH, 3), dtype=np.uint8)
 
-        # Decode frames — try proxy first, then parallel ffmpeg
-        n_frames = self._decode_from_proxy(padded, total)
-        if n_frames == 0:
-            n_frames = self._decode_parallel(padded, total)
+        # Decode frames — try parallel ffmpeg, then single
+        n_frames = self._decode_parallel(padded, total)
         if n_frames == 0:
             n_frames = self._decode_single(padded, total)
 
@@ -185,40 +183,6 @@ class SceneDetector(QThread):
         return cut_frames
 
     # --- Decode: from JPEG proxy (fastest, ~628 fps) ---
-
-    def _decode_from_proxy(self, padded: np.ndarray, total: int) -> int:
-        """Read frames from existing .jproxy file. ~2.5x faster than ffmpeg."""
-        jpath = _jproxy_path(self._source)
-        if not jpath.exists():
-            return 0
-
-        proxy = JpegProxyFile(self._source)
-        if not proxy.open():
-            return 0
-
-        if proxy.n_frames < total * 0.9:
-            proxy.close()
-            return 0
-
-        logger.info("Using existing jproxy for decode (%d frames)", proxy.n_frames)
-        n = min(proxy.n_frames, total)
-
-        for i in range(n):
-            if self._cancelled:
-                proxy.close()
-                return 0
-            frame = proxy.get_frame(i)
-            if frame is None:
-                proxy.close()
-                return i
-            padded[TNET_PAD + i] = cv2.resize(frame, (TNET_WIDTH, TNET_HEIGHT),
-                                               interpolation=cv2.INTER_AREA)
-            if i % max(1, n // 200) == 0:
-                self.progress.emit(min(100, int(i / n * 100)))
-                self.detail_progress.emit(i, n, "Decoding (proxy)")
-
-        proxy.close()
-        return n
 
     # --- Decode: parallel ffmpeg segments (~396 fps) ---
 

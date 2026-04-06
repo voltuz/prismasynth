@@ -6,7 +6,7 @@ from typing import Dict, Optional
 
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QHBoxLayout, QVBoxLayout,
-    QLabel, QStatusBar, QMessageBox, QFileDialog,
+    QLabel, QStatusBar, QMessageBox, QFileDialog, QProgressBar,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
@@ -17,7 +17,7 @@ from core.video_source import VideoSource
 from core.video_reader import VideoReaderPool
 from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
-from core.proxy_cache import ProxyManager, ProxyFile, HQProxyGenerator
+from core.proxy_cache import ProxyManager, ProxyFile
 from core.project import save_project, load_project
 from utils.paths import get_config_dir
 from ui.preview_widget import PreviewWidget
@@ -153,8 +153,6 @@ class MainWindow(QMainWindow):
         self._sources: Dict[str, VideoSource] = {}
         self._reader_pool = VideoReaderPool(use_gpu=True)
         self._proxy_manager = ProxyManager()
-        self._hq_proxy_gen = HQProxyGenerator()
-        self._hq_proxy_gen.finished.connect(self._on_hq_proxy_ready)
         self._exporter: Optional[Exporter] = None
         self._last_clicked_clip_id: Optional[str] = None
         self._thumbnail_cache: Optional[ThumbnailCache] = None
@@ -442,11 +440,8 @@ class MainWindow(QMainWindow):
         self._timeline.add_clips(clips)
         self._timeline_widget.set_fps(source.fps)
 
-        # Load any existing proxy
+        # Load any existing proxy (for scene detection reuse)
         self._proxy_manager.load_or_open(source)
-
-        # Start background HQ proxy generation (960x540 JPEG — doesn't block)
-        self._hq_proxy_gen.generate(source)
 
         # Start thumbnail generation
         self._start_thumbnail_cache()
@@ -471,9 +466,18 @@ class MainWindow(QMainWindow):
         if source is None:
             source = next(iter(self._sources.values()))
 
+        # Pause GPU-heavy subsystems to avoid CUDA/mpv contention during detection
+        self._preview.pause()
+        if self._thumbnail_cache is not None:
+            self._thumbnail_cache.pause()
+
         dialog = DetectDialog(source, self)
         dialog.detection_complete.connect(self._on_detection_complete)
         dialog.exec()
+
+        # Resume thumbnail generation after dialog closes
+        if self._thumbnail_cache is not None:
+            self._thumbnail_cache.resume()
 
     def _on_detection_complete(self, source_id: str, clips):
         """Replace all clips from this source with the detected scene clips."""
@@ -486,9 +490,9 @@ class MainWindow(QMainWindow):
         source = self._sources.get(source_id)
         if source:
             self._proxy_manager.load_or_open(source)
-            self._hq_proxy_gen.generate(source)
 
         self._start_thumbnail_cache()
+
         if clips:
             self._timeline_widget.set_playhead(0)
         self._update_status()
@@ -498,8 +502,7 @@ class MainWindow(QMainWindow):
         if self._thumbnail_cache is not None:
             self._thumbnail_cache.stop()
         self._thumbnail_cache = ThumbnailCache(
-            self._reader_pool, self._timeline, self._sources,
-            proxy_manager=self._proxy_manager,
+            self._timeline, self._sources,
         )
         self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._thumbnail_cache.generate_all()
@@ -508,13 +511,6 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QPixmap
         pixmap = QPixmap.fromImage(qimage)
         self._timeline_widget.strip.set_thumbnail(clip_id, position, pixmap)
-
-    def _on_hq_proxy_ready(self, source_id: str):
-        """Background HQ proxy generation finished — upgrade the proxy."""
-        source = self._sources.get(source_id)
-        if source is not None:
-            self._proxy_manager.upgrade_to_hq(source)
-            logger.info("HQ proxy ready for %s", source.file_path)
 
     # --- Playhead ---
 
@@ -919,7 +915,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self._stop_playback()
-        self._hq_proxy_gen.stop()
+
         if self._thumbnail_cache is not None:
             self._thumbnail_cache.stop()
             self._thumbnail_cache = None
@@ -987,7 +983,7 @@ class MainWindow(QMainWindow):
 
         # Clear current state
         self._stop_playback()
-        self._hq_proxy_gen.stop()
+
         self._timeline.clear()
         self._reader_pool.close_all()
         self._proxy_manager.close_all()
@@ -1000,8 +996,6 @@ class MainWindow(QMainWindow):
         for source in self._sources.values():
             self._reader_pool.register_source(source)
             self._proxy_manager.load_or_open(source)
-            # Generate HQ proxy if only legacy proxy exists
-            self._hq_proxy_gen.generate(source)
 
         # Set FPS from first source
         if self._sources:
@@ -1138,7 +1132,7 @@ class MainWindow(QMainWindow):
         self._autosave_timer.stop()
         if self._thumbnail_cache:
             self._thumbnail_cache.stop()
-        self._hq_proxy_gen.stop()
+
         self._preview.cleanup()
         self._reader_pool.close_all()
         self._proxy_manager.close_all()
