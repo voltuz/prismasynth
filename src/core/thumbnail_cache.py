@@ -1,12 +1,12 @@
 import logging
-import os
 import subprocess
-import tempfile
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Dict, List, Optional, Set, Tuple
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
@@ -18,15 +18,17 @@ logger = logging.getLogger(__name__)
 
 THUMB_WIDTH = 96
 THUMB_HEIGHT = 54
+THUMB_FRAME_SIZE = THUMB_WIDTH * THUMB_HEIGHT * 3
+_MAX_WORKERS = 4
 
 
 class ThumbnailCache(QObject):
-    """Background thumbnail generation using per-source FFmpeg select filter.
+    """Viewport-only thumbnail generation with playhead-distance priority.
 
-    For each source, spawns one FFmpeg process that seeks only the needed frames
-    using select='eq(n,F1)+eq(n,F2)+...' and outputs MJPEG via pipe.
-    Low-priority background — yields to scrubbing and playback.
-    No disk cache — thumbnails regenerated fresh each session.
+    Only generates thumbnails for clips currently visible in the viewport.
+    4 parallel ffmpeg -ss seeks for throughput (~38ms/frame effective).
+    Re-checks priority between every submission so viewport changes
+    take effect within one seek (~100ms).
     """
 
     thumbnail_ready = Signal(str, str, QImage)  # clip_id, "first"|"last", qimage
@@ -39,11 +41,15 @@ class ThumbnailCache(QObject):
         self._mem_cache: Dict[str, QImage] = {}
         self._stopped = False
         self._coord_thread: Optional[threading.Thread] = None
-        self._active_proc: Optional[subprocess.Popen] = None
 
-        # Pause support
+        # Pause support (scrubbing priority)
         self._pause_event = threading.Event()
         self._pause_event.set()
+
+        # Priority management — updated from main thread on scroll
+        self._priority_clip_ids: Set[str] = set()
+        self._playhead_frame: int = 0
+        self._priority_lock = threading.Lock()
 
     def pause(self):
         self._pause_event.clear()
@@ -51,196 +57,160 @@ class ThumbnailCache(QObject):
     def resume(self):
         self._pause_event.set()
 
-    def generate_all(self):
-        """Start thumbnail generation in a background coordinator thread."""
+    def generate_all(self, priority_clip_ids: Set[str] = None,
+                     playhead_frame: int = 0):
+        """Start thumbnail generation. priority_clip_ids are generated first."""
         if self._coord_thread and self._coord_thread.is_alive():
+            if priority_clip_ids is not None:
+                self.reprioritize(priority_clip_ids, playhead_frame)
             return
         self._stopped = False
+        with self._priority_lock:
+            self._priority_clip_ids = set(priority_clip_ids or [])
+            self._playhead_frame = playhead_frame
         self._coord_thread = threading.Thread(target=self._coordinate, daemon=True)
         self._coord_thread.start()
 
+    def reprioritize(self, visible_clip_ids: Set[str],
+                     playhead_frame: int = 0):
+        """Called on scroll — next submission uses the new viewport."""
+        with self._priority_lock:
+            self._priority_clip_ids = set(visible_clip_ids)
+            self._playhead_frame = playhead_frame
+
     def _coordinate(self):
-        """Collect needed frames per source, generate via select-filter MJPEG."""
-        # Group needed frames by source
-        source_requests: Dict[str, List[Tuple[int, str, str]]] = defaultdict(list)
+        """Generate thumbnails for visible clips only, 4 parallel seeks,
+        priority re-checked between every submission."""
+        # Build clip lookup once
+        clip_lookup: Dict[str, List[Tuple[str, int, str]]] = {}
         for clip in self._timeline.clips:
-            if clip.is_gap or self._stopped:
+            if clip.is_gap:
                 continue
-            source_requests[clip.source_id].append(
-                (clip.source_in, clip.id, "first"))
-            source_requests[clip.source_id].append(
-                (clip.source_out, clip.id, "last"))
+            clip_lookup[clip.id] = [
+                (clip.source_id, clip.source_in, "first"),
+                (clip.source_id, clip.source_out, "last"),
+            ]
 
-        if not source_requests or self._stopped:
-            return
-
-        # Emit any already-cached thumbnails immediately
-        remaining: Dict[str, List[Tuple[int, str, str]]] = defaultdict(list)
-        for source_id, requests in source_requests.items():
-            for frame_num, clip_id, position in requests:
-                key = f"{source_id}_{frame_num}"
-                if key in self._mem_cache:
-                    self.thumbnail_ready.emit(
-                        clip_id, position, self._mem_cache[key])
-                else:
-                    remaining[source_id].append((frame_num, clip_id, position))
-
-        if not remaining:
-            return
-
-        # Process each source with one FFmpeg select-filter process
-        for source_id, requests in remaining.items():
-            if self._stopped:
-                return
-            source = self._sources.get(source_id)
-            if source is None:
-                continue
-            self._generate_for_source(source, requests)
-
-    def _generate_for_source(self, source: VideoSource,
-                             requests: List[Tuple[int, str, str]]):
-        """One FFmpeg process per source: select only needed frames as MJPEG."""
-        # Deduplicate frame numbers and sort (output arrives in source order)
-        frame_to_requests: Dict[int, List[Tuple[str, str]]] = defaultdict(list)
-        for frame_num, clip_id, position in requests:
-            frame_to_requests[frame_num].append((clip_id, position))
-        unique_frames = sorted(frame_to_requests.keys())
-
-        if not unique_frames or self._stopped:
-            return
-
-        # Build select expression and write to filter script file
-        # (avoids Windows command-line length limits for large timelines)
-        select_terms = "+".join(f"eq(n\\,{f})" for f in unique_frames)
-        vf = (f"select='{select_terms}',"
-              f"scale={THUMB_WIDTH}:{THUMB_HEIGHT}:flags=fast_bilinear")
-
-        filter_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", prefix="prismasynth_vf_",
-            delete=False, encoding="utf-8")
-        filter_file.write(vf)
-        filter_file.close()
-        filter_path = filter_file.name
-
-        cmd = [
-            "ffmpeg", "-nostdin", "-v", "error", "-hwaccel", "cuda",
-            "-i", source.file_path,
-            "-filter_script:v", filter_path, "-vsync", "drop",
-            "-c:v", "mjpeg", "-q:v", "5",
-            "-f", "image2pipe", "pipe:1",
-        ]
+        pool = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+        # In-flight futures: future -> (source_id, frame_num, clip_id, position)
+        in_flight: Dict[Future, Tuple[str, int, str, str]] = {}
 
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except OSError as e:
-            logger.warning("Failed to start FFmpeg for thumbnails: %s", e)
-            try:
-                os.unlink(filter_path)
-            except OSError:
-                pass
-            return
-        self._active_proc = proc
+            while not self._stopped:
+                # Wait if paused (scrubbing)
+                while not self._pause_event.wait(timeout=0.1):
+                    if self._stopped:
+                        return
 
-        # Check if FFmpeg exits immediately (bad filter syntax)
-        time.sleep(0.2)
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().decode(errors="replace")[:500]
-            logger.warning("FFmpeg thumbnail process exited immediately: %s",
-                           stderr)
-            try:
-                os.unlink(filter_path)
-            except OSError:
-                pass
-            return
-
-        # Parse MJPEG stream — frames arrive in ascending source frame order
-        buf = bytearray()
-        frame_idx = 0
-        SOI = b'\xff\xd8'
-        EOI = b'\xff\xd9'
-
-        try:
-            while not self._stopped and frame_idx < len(unique_frames):
-                chunk = proc.stdout.read(64 * 1024)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-
-                # Extract complete JPEG frames
-                while frame_idx < len(unique_frames):
-                    soi = buf.find(SOI)
-                    if soi < 0:
-                        break
-                    eoi = buf.find(EOI, soi + 2)
-                    if eoi < 0:
-                        break
-
-                    jpeg_data = bytes(buf[soi:eoi + 2])
-                    del buf[:eoi + 2]
-
-                    # Map this JPEG to the corresponding source frame number
-                    frame_num = unique_frames[frame_idx]
-                    frame_idx += 1
-
-                    qimage = self._jpeg_to_qimage(jpeg_data)
-                    if qimage is None:
+                # Drain completed futures
+                done = [f for f in in_flight if f.done()]
+                for f in done:
+                    source_id, frame_num, clip_id, position = in_flight.pop(f)
+                    try:
+                        qimage = f.result()
+                    except Exception:
                         continue
-
-                    # Cache and emit for all clips that need this frame
-                    key = f"{source.id}_{frame_num}"
-                    self._mem_cache[key] = qimage
-                    for clip_id, position in frame_to_requests[frame_num]:
-                        if self._stopped:
-                            return
-                        # Respect pause (scrubbing/playback priority)
-                        while not self._pause_event.wait(timeout=0.1):
-                            if self._stopped:
-                                return
+                    if qimage is not None:
+                        cache_key = f"{source_id}_{frame_num}"
+                        self._mem_cache[cache_key] = qimage
                         self.thumbnail_ready.emit(clip_id, position, qimage)
 
-                    # Brief yield so main thread stays responsive
-                    time.sleep(0.002)
+                # Fill pool up to _MAX_WORKERS with highest-priority visible frames
+                while len(in_flight) < _MAX_WORKERS and not self._stopped:
+                    frame = self._pick_next(clip_lookup, in_flight)
+                    if frame is None:
+                        break  # Nothing to submit
+                    source_id, frame_num, clip_id, position = frame
+                    source = self._sources.get(source_id)
+                    if source is None:
+                        continue
+                    fut = pool.submit(self._grab_frame, source, frame_num)
+                    in_flight[fut] = (source_id, frame_num, clip_id, position)
 
-        except Exception as e:
-            logger.debug("Thumbnail generation error: %s", e)
+                if not in_flight:
+                    # Nothing in-flight, nothing to submit — idle
+                    time.sleep(0.05)
+                else:
+                    # Brief sleep to avoid busy-spinning on future checks
+                    time.sleep(0.01)
+
         finally:
-            self._active_proc = None
-            try:
-                proc.stdout.close()
-                proc.kill()
-                proc.wait()
-            except Exception:
-                pass
-            try:
-                os.unlink(filter_path)
-            except OSError:
-                pass
+            pool.shutdown(wait=False, cancel_futures=True)
 
-        logger.info("Generated %d thumbnails for %s",
-                    frame_idx, source.file_path)
+    def _pick_next(self, clip_lookup, in_flight):
+        """Pick the highest-priority uncached visible frame not already in-flight."""
+        with self._priority_lock:
+            visible_ids = self._priority_clip_ids
+            playhead = self._playhead_frame
+
+        # Already in-flight frame keys
+        in_flight_keys = {(v[0], v[1]) for v in in_flight.values()}
+
+        # Collect uncached visible frames
+        needed = []
+        for clip_id in visible_ids:
+            entries = clip_lookup.get(clip_id)
+            if not entries:
+                continue
+            for source_id, frame_num, position in entries:
+                key = (source_id, frame_num)
+                if key in in_flight_keys:
+                    continue
+                cache_key = f"{source_id}_{frame_num}"
+                if cache_key in self._mem_cache:
+                    # Already cached — emit and skip
+                    self.thumbnail_ready.emit(
+                        clip_id, position, self._mem_cache[cache_key])
+                    continue
+                needed.append((source_id, frame_num, clip_id, position))
+
+        if not needed:
+            return None
+
+        # Closest to playhead first
+        needed.sort(key=lambda r: abs(r[1] - playhead))
+        return needed[0]
 
     @staticmethod
-    def _jpeg_to_qimage(jpeg_data: bytes) -> Optional[QImage]:
-        """Decode JPEG bytes to QImage."""
-        arr = np.frombuffer(jpeg_data, dtype=np.uint8)
-        bgr = __import__('cv2').imdecode(arr, __import__('cv2').IMREAD_COLOR)
-        if bgr is None:
+    def _grab_frame(source: VideoSource,
+                    frame_num: int) -> Optional[QImage]:
+        """Grab one frame via ffmpeg -ss seek (~100ms)."""
+        timestamp = frame_num / source.fps if source.fps > 0 else 0.0
+        cmd = [
+            "ffmpeg", "-nostdin", "-v", "quiet",
+            "-ss", f"{timestamp:.4f}",
+            "-i", source.file_path,
+            "-frames:v", "1",
+            "-vf", f"scale={THUMB_WIDTH}:{THUMB_HEIGHT}:flags=fast_bilinear",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "pipe:1",
+        ]
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            data, _ = proc.communicate(timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
             return None
-        rgb = __import__('cv2').cvtColor(bgr, __import__('cv2').COLOR_BGR2RGB)
+
+        if len(data) != THUMB_FRAME_SIZE:
+            return None
+
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+            THUMB_HEIGHT, THUMB_WIDTH, 3)
         h, w, ch = rgb.shape
-        # .copy() so QImage owns its pixel data (prevents use-after-free)
         return QImage(bytes(rgb.data), w, h, ch * w,
                       QImage.Format.Format_RGB888).copy()
 
     def stop(self):
         self._stopped = True
         self._pause_event.set()
-        if self._active_proc:
-            try:
-                self._active_proc.kill()
-            except OSError:
-                pass
         if self._coord_thread and self._coord_thread.is_alive():
             self._coord_thread.join(timeout=3.0)
         self._coord_thread = None

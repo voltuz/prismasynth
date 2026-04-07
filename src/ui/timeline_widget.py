@@ -213,6 +213,22 @@ class TimelineStrip(QWidget):
         """Convert a timeline frame number to pixel position. Single source of truth."""
         return int(frame * self._pixels_per_frame)
 
+    def get_visible_clip_ids(self):
+        """Return IDs of non-gap clips currently visible in the viewport."""
+        visible = []
+        cumulative = 0
+        vw = self.width()
+        for clip in self._model.clips:
+            start_px = self._frame_to_pixel(cumulative)
+            cumulative += clip.duration_frames
+            end_px = self._frame_to_pixel(cumulative)
+            screen_x = start_px - self._scroll_offset
+            if screen_x + (end_px - start_px) < 0 or screen_x > vw:
+                continue
+            if not clip.is_gap:
+                visible.append(clip.id)
+        return visible
+
     def _paint_clips(self, painter: QPainter, y: int, viewport_width: int):
         cumulative_frames = 0
         selected = self._model.selected_ids

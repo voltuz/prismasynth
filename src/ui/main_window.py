@@ -15,6 +15,7 @@ from core.timeline import TimelineModel
 from core.clip import Clip
 from core.video_source import VideoSource
 from core.video_reader import VideoReaderPool
+from core.edl_exporter import export_edl
 from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
 from core.proxy_cache import ProxyManager
@@ -175,6 +176,11 @@ class MainWindow(QMainWindow):
         self._thumb_resume_timer.setSingleShot(True)
         self._thumb_resume_timer.setInterval(500)
         self._thumb_resume_timer.timeout.connect(self._resume_thumbnails)
+        # Debounce viewport changes (scroll) — reprioritize after 300ms idle
+        self._viewport_timer = QTimer()
+        self._viewport_timer.setSingleShot(True)
+        self._viewport_timer.setInterval(300)
+        self._viewport_timer.timeout.connect(self._do_reprioritize)
 
         # Playback — mpv plays natively, timer syncs the timeline playhead
         self._playback_timer = QTimer()
@@ -237,6 +243,7 @@ class MainWindow(QMainWindow):
         self._timeline_widget.clip_clicked.connect(self._on_clip_clicked)
         self._timeline_widget.preview_frame_requested.connect(self._on_preview_frame_requested)
         self._timeline_widget.cut_requested.connect(self._on_cut_at_frame)
+        self._timeline_widget.strip.scroll_changed.connect(self._on_viewport_changed)
         self._timeline.selection_changed.connect(self._on_selection_changed)
 
         # Status bar
@@ -290,35 +297,6 @@ class MainWindow(QMainWindow):
         save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         save_as_action.triggered.connect(self._on_save_project_as)
         file_menu.addAction(save_as_action)
-
-        file_menu.addSeparator()
-
-        import_action = QAction("Import Video...", self)
-        import_action.setShortcut(QKeySequence("Ctrl+I"))
-        import_action.triggered.connect(self._on_import)
-        file_menu.addAction(import_action)
-
-        file_menu.addSeparator()
-
-        export_vid_action = QAction("Export Video...", self)
-        export_vid_action.setShortcut(QKeySequence("Ctrl+E"))
-        export_vid_action.triggered.connect(self._on_export_video)
-        file_menu.addAction(export_vid_action)
-
-        export_img_action = QAction("Export Image Sequence...", self)
-        export_img_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
-        export_img_action.triggered.connect(self._on_export_images)
-        file_menu.addAction(export_img_action)
-
-        detect_action = QAction("Detect Cuts...", self)
-        detect_action.setShortcut(QKeySequence("Ctrl+D"))
-        detect_action.triggered.connect(self._on_detect_cuts)
-        file_menu.addAction(detect_action)
-
-        play_action = QAction("Play/Pause", self)
-        play_action.setShortcut("Space")
-        play_action.triggered.connect(self._toggle_play)
-        file_menu.addAction(play_action)
 
         edit_menu = menu.addMenu("Edit")
 
@@ -389,6 +367,44 @@ class MainWindow(QMainWindow):
         cut_mode_action.setShortcut("C")
         cut_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.CUT))
         edit_menu.addAction(cut_mode_action)
+
+        # --- Timeline menu ---
+        timeline_menu = menu.addMenu("Timeline")
+
+        import_action = QAction("Import Video...", self)
+        import_action.setShortcut(QKeySequence("Ctrl+I"))
+        import_action.triggered.connect(self._on_import)
+        timeline_menu.addAction(import_action)
+
+        timeline_menu.addSeparator()
+
+        export_vid_action = QAction("Export Video...", self)
+        export_vid_action.setShortcut(QKeySequence("Ctrl+E"))
+        export_vid_action.triggered.connect(self._on_export_video)
+        timeline_menu.addAction(export_vid_action)
+
+        export_img_action = QAction("Export Image Sequence...", self)
+        export_img_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        export_img_action.triggered.connect(self._on_export_images)
+        timeline_menu.addAction(export_img_action)
+
+        edl_action = QAction("Export EDL...", self)
+        edl_action.triggered.connect(self._on_export_edl)
+        timeline_menu.addAction(edl_action)
+
+        timeline_menu.addSeparator()
+
+        detect_action = QAction("Detect Cuts...", self)
+        detect_action.setShortcut(QKeySequence("Ctrl+D"))
+        detect_action.triggered.connect(self._on_detect_cuts)
+        timeline_menu.addAction(detect_action)
+
+        timeline_menu.addSeparator()
+
+        play_action = QAction("Play/Pause", self)
+        play_action.setShortcut("Space")
+        play_action.triggered.connect(self._toggle_play)
+        timeline_menu.addAction(play_action)
 
     # --- Import ---
 
@@ -505,12 +521,26 @@ class MainWindow(QMainWindow):
             self._timeline, self._sources,
         )
         self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
-        self._thumbnail_cache.generate_all()
+        visible = set(self._timeline_widget.strip.get_visible_clip_ids())
+        playhead = self._timeline_widget.strip.playhead_frame
+        self._thumbnail_cache.generate_all(
+            priority_clip_ids=visible, playhead_frame=playhead)
 
     def _on_thumbnail_ready(self, clip_id: str, position: str, qimage):
         from PySide6.QtGui import QPixmap
         pixmap = QPixmap.fromImage(qimage)
         self._timeline_widget.strip.set_thumbnail(clip_id, position, pixmap)
+
+    def _on_viewport_changed(self):
+        """Scroll or zoom changed — debounce before reprioritizing thumbnails."""
+        self._viewport_timer.start()
+
+    def _do_reprioritize(self):
+        """Actually reprioritize after scroll settles (300ms debounce)."""
+        if self._thumbnail_cache:
+            visible = set(self._timeline_widget.strip.get_visible_clip_ids())
+            playhead = self._timeline_widget.strip.playhead_frame
+            self._thumbnail_cache.reprioritize(visible, playhead)
 
     # --- Playhead ---
 
@@ -858,6 +888,34 @@ class MainWindow(QMainWindow):
 
     def _on_export_images(self):
         self._show_export_dialog(tab=1)
+
+    def _on_export_edl(self):
+        if self._timeline.clip_count == 0:
+            QMessageBox.information(self, "Export EDL", "No clips to export.")
+            return
+        from ui.edl_dialog import EdlDialog
+        clip_count = self._timeline.real_clip_count
+        total_frames = sum(c.duration_frames for c in self._timeline.clips
+                           if not c.is_gap)
+        first_source = next(iter(self._sources.values()), None)
+        fps = first_source.fps if first_source else 24.0
+        has_range = (self._timeline.in_point is not None
+                     or self._timeline.out_point is not None)
+        dialog = EdlDialog(clip_count, total_frames, fps,
+                           has_render_range=has_range, parent=self)
+        dialog.export_requested.connect(
+            lambda s: self._run_edl_export(s, dialog))
+        dialog.exec()
+
+    def _run_edl_export(self, settings: dict, dialog):
+        first_source = next(iter(self._sources.values()), None)
+        fps = first_source.fps if first_source else 24.0
+        export_edl(
+            self._timeline, self._sources, settings["output_path"],
+            include_gaps=settings["include_gaps"],
+            use_render_range=settings["use_render_range"],
+            fps=fps,
+        )
 
     def _show_export_dialog(self, tab: int = 0):
         if self._timeline.clip_count == 0:
