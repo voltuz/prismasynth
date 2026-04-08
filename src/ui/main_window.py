@@ -232,9 +232,13 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(top_widget)
 
-        # Bottom area: timeline
+        # Bottom area: timeline (with left/right margins)
         self._timeline_widget = TimelineWidget(self._timeline)
-        splitter.addWidget(self._timeline_widget)
+        timeline_container = QWidget()
+        tl_layout = QVBoxLayout(timeline_container)
+        tl_layout.setContentsMargins(16, 0, 16, 0)
+        tl_layout.addWidget(self._timeline_widget)
+        splitter.addWidget(timeline_container)
 
         splitter.setSizes([400, 200])
 
@@ -301,17 +305,17 @@ class MainWindow(QMainWindow):
         edit_menu = menu.addMenu("Edit")
 
         split_action = QAction("Split at Playhead", self)
-        split_action.setShortcut("S")
+        split_action.setShortcut("S")  # middle finger home
         split_action.triggered.connect(self._on_split)
         edit_menu.addAction(split_action)
 
         delete_action = QAction("Delete Selected", self)
-        delete_action.setShortcut("Backspace")
+        delete_action.setShortcut("W")  # top row middle — most-used delete
         delete_action.triggered.connect(self._on_delete)
         edit_menu.addAction(delete_action)
 
         ripple_delete_action = QAction("Ripple Delete Selected", self)
-        ripple_delete_action.setShortcut("Delete")
+        ripple_delete_action.setShortcut("D")  # index finger home — ripple delete
         ripple_delete_action.triggered.connect(self._on_ripple_delete)
         edit_menu.addAction(ripple_delete_action)
 
@@ -335,19 +339,19 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(select_all_action)
 
         select_gap_action = QAction("Select to Gap Left", self)
-        select_gap_action.setShortcut("G")
+        select_gap_action.setShortcut("A")  # pinky home — select to gap
         select_gap_action.triggered.connect(self._on_select_to_gap)
         edit_menu.addAction(select_gap_action)
 
         edit_menu.addSeparator()
 
         set_in_action = QAction("Set In Point", self)
-        set_in_action.setShortcut("I")
+        set_in_action.setShortcut("E")  # top row — in point
         set_in_action.triggered.connect(self._on_set_in_point)
         edit_menu.addAction(set_in_action)
 
         set_out_action = QAction("Set Out Point", self)
-        set_out_action.setShortcut("O")
+        set_out_action.setShortcut("R")  # top row — out point
         set_out_action.triggered.connect(self._on_set_out_point)
         edit_menu.addAction(set_out_action)
 
@@ -487,7 +491,14 @@ class MainWindow(QMainWindow):
         if self._thumbnail_cache is not None:
             self._thumbnail_cache.pause()
 
-        dialog = DetectDialog(source, self)
+        # Pass render range if in/out points are set
+        frame_range = None
+        if (self._timeline.in_point is not None
+                or self._timeline.out_point is not None):
+            r_start, r_end = self._timeline.get_render_range()
+            frame_range = (r_start, r_end)
+
+        dialog = DetectDialog(source, frame_range=frame_range, parent=self)
         dialog.detection_complete.connect(self._on_detection_complete)
         dialog.exec()
 
@@ -519,6 +530,7 @@ class MainWindow(QMainWindow):
             self._thumbnail_cache.stop()
         self._thumbnail_cache = ThumbnailCache(
             self._timeline, self._sources,
+            proxy_manager=self._proxy_manager,
         )
         self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
         visible = set(self._timeline_widget.strip.get_visible_clip_ids())
@@ -630,18 +642,50 @@ class MainWindow(QMainWindow):
             self._timeline.split_clip_at(clip.id, frame)
             self._start_thumbnail_cache()
 
+    def _earliest_selected_frame(self) -> int:
+        """Get timeline position of the earliest selected clip."""
+        selected = self._timeline.selected_ids
+        if not selected:
+            return -1
+        earliest = -1
+        for clip in self._timeline.clips:
+            if clip.id in selected:
+                pos = self._timeline.get_clip_timeline_start(clip.id)
+                if earliest < 0 or pos < earliest:
+                    earliest = pos
+                break  # clips are ordered, first match is earliest
+        return earliest
+
     def _on_delete(self):
-        """Delete selected clips, replacing with gaps (Backspace)."""
+        """Delete selected clips, replacing with gaps."""
         if not self._timeline.selected_ids:
             return
+        # Teleport playhead only when deleting gaps
+        selected = self._timeline.selected_ids
+        deleting_gaps = all(
+            c.is_gap for c in self._timeline.clips if c.id in selected)
+        target_frame = self._earliest_selected_frame() if deleting_gaps else -1
         self._timeline.delete_selected()
+        if target_frame >= 0:
+            self._timeline_widget.set_playhead(target_frame)
+            self._timeline_widget.strip.ensure_playhead_visible()
         self._refresh_preview_after_edit()
 
     def _on_ripple_delete(self):
-        """Ripple delete selected clips — collapse the space (Delete)."""
+        """Ripple delete selected clips — collapse the space."""
         if not self._timeline.selected_ids:
             return
+        # Only teleport playhead when deleting gaps
+        selected = self._timeline.selected_ids
+        deleting_gaps = all(
+            c.is_gap for c in self._timeline.clips if c.id in selected)
+        target_frame = self._earliest_selected_frame() if deleting_gaps else -1
         self._timeline.ripple_delete_selected()
+        if target_frame >= 0:
+            total = self._timeline.get_total_duration_frames()
+            target_frame = min(target_frame, max(0, total - 1))
+            self._timeline_widget.set_playhead(target_frame)
+            self._timeline_widget.strip.ensure_playhead_visible()
         self._refresh_preview_after_edit()
 
     def _refresh_preview_after_edit(self):

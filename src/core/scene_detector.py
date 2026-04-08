@@ -64,10 +64,12 @@ class SceneDetector(QThread):
     error = Signal(str)
 
     def __init__(self, source: VideoSource, threshold: float = DEFAULT_THRESHOLD,
-                 parent=None):
+                 frame_range: tuple = None, parent=None):
         super().__init__(parent)
         self._source = source
         self._threshold = threshold
+        # Optional (start_frame, end_frame) to limit detection range
+        self._frame_range = frame_range
         self._cancelled = False
         self._procs: list = []
 
@@ -111,16 +113,21 @@ class SceneDetector(QThread):
             logger.warning("TransNetV2 failed to initialize: %s", e)
             return None
 
-        total = self._source.total_frames
+        if self._frame_range:
+            range_start, range_end = self._frame_range
+            total = range_end - range_start + 1
+        else:
+            range_start = 0
+            total = self._source.total_frames
         pad_end = TNET_PAD + TNET_STEP - (total % TNET_STEP if total % TNET_STEP != 0 else TNET_STEP)
 
         # Pre-allocate padded array — all decode paths write directly into it
         padded = np.empty((TNET_PAD + total + pad_end, TNET_HEIGHT, TNET_WIDTH, 3), dtype=np.uint8)
 
         # Decode frames — try parallel ffmpeg, then single
-        n_frames = self._decode_parallel(padded, total)
+        n_frames = self._decode_parallel(padded, total, range_start)
         if n_frames == 0:
-            n_frames = self._decode_single(padded, total)
+            n_frames = self._decode_single(padded, total, range_start)
 
         if self._cancelled or n_frames == 0:
             return [] if self._cancelled else None
@@ -186,7 +193,8 @@ class SceneDetector(QThread):
 
     # --- Decode: parallel ffmpeg segments (~396 fps) ---
 
-    def _decode_parallel(self, padded: np.ndarray, total: int) -> int:
+    def _decode_parallel(self, padded: np.ndarray, total: int,
+                         range_start: int = 0) -> int:
         """Decode using N parallel ffmpeg/NVDEC processes."""
         fps = self._source.fps if self._source.fps > 0 else 24.0
         frame_size = TNET_WIDTH * TNET_HEIGHT * 3
@@ -253,8 +261,8 @@ class SceneDetector(QThread):
 
         threads = []
         for i in range(n_seg):
-            start = i * frames_per_seg
-            count = frames_per_seg if i < n_seg - 1 else total - start
+            start = range_start + i * frames_per_seg
+            count = frames_per_seg if i < n_seg - 1 else total - (i * frames_per_seg)
             t = threading.Thread(target=decode_segment, args=(i, start, count))
             threads.append(t)
             t.start()
@@ -271,10 +279,20 @@ class SceneDetector(QThread):
 
     # --- Decode: single ffmpeg (fallback, ~262 fps) ---
 
-    def _decode_single(self, padded: np.ndarray, total: int) -> int:
+    def _decode_single(self, padded: np.ndarray, total: int,
+                       range_start: int = 0) -> int:
         """Single ffmpeg process decode — CPU fallback."""
         frame_size = TNET_WIDTH * TNET_HEIGHT * 3
+        fps = self._source.fps if self._source.fps > 0 else 24.0
+        ss = range_start / fps if range_start > 0 else None
+        dur = total / fps if range_start > 0 else None
         cmd = _build_ffmpeg_cmd_cpu(self._source.file_path, TNET_WIDTH, TNET_HEIGHT)
+        if ss is not None:
+            # Insert -ss and -t for range-limited decode
+            cmd = cmd[:3] + ["-ss", f"{ss:.4f}"] + cmd[3:]
+            if dur is not None:
+                idx = cmd.index("-i") + 2
+                cmd = cmd[:idx] + ["-t", f"{dur + 5:.4f}"] + cmd[idx:]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self._procs.append(proc)
 
@@ -343,7 +361,12 @@ class SceneDetector(QThread):
     # --- Common ---
 
     def _cuts_to_clips(self, cuts: List[int]) -> List[Clip]:
-        total = self._source.total_frames
+        if self._frame_range:
+            range_start, range_end = self._frame_range
+            total = range_end - range_start + 1
+        else:
+            range_start = 0
+            total = self._source.total_frames
         if total <= 0:
             return []
         # TransNetV2 reports the last frame of each shot as the cut point.
@@ -358,7 +381,7 @@ class SceneDetector(QThread):
                 continue
             clips.append(Clip(
                 source_id=self._source.id,
-                source_in=frame_in,
-                source_out=frame_out,
+                source_in=range_start + frame_in,
+                source_out=range_start + frame_out,
             ))
         return clips

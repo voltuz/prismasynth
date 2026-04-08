@@ -20,9 +20,11 @@ class DetectDialog(QDialog):
 
     detection_complete = Signal(str, list)  # source_id, List[Clip]
 
-    def __init__(self, source: VideoSource, parent=None):
+    def __init__(self, source: VideoSource, frame_range: tuple = None,
+                 parent=None):
         super().__init__(parent)
         self._source = source
+        self._frame_range = frame_range
         self.setWindowTitle("Detect Cuts")
         self.setMinimumWidth(450)
         self.setModal(True)
@@ -30,11 +32,23 @@ class DetectDialog(QDialog):
         layout = QVBoxLayout(self)
 
         name = source.file_path.split('/')[-1].split(chr(92))[-1]
-        layout.addWidget(QLabel(
-            f"{name}\n"
-            f"{source.width}x{source.height}, {source.fps:.2f} fps, "
-            f"{source.total_frames:,} frames"
-        ))
+        if frame_range:
+            start, end = frame_range
+            range_frames = end - start + 1
+            layout.addWidget(QLabel(
+                f"{name}\n"
+                f"{source.width}x{source.height}, {source.fps:.2f} fps, "
+                f"{range_frames:,} frames (in/out range of {source.total_frames:,})"
+            ))
+            warn = QLabel("Detection limited to in/out render range.")
+            warn.setStyleSheet("color: #e8a735; font-size: 11px;")
+            layout.addWidget(warn)
+        else:
+            layout.addWidget(QLabel(
+                f"{name}\n"
+                f"{source.width}x{source.height}, {source.fps:.2f} fps, "
+                f"{source.total_frames:,} frames"
+            ))
 
         # Threshold setting
         form = QFormLayout()
@@ -89,7 +103,8 @@ class DetectDialog(QDialog):
         self._phase_start_time = self._start_time
 
         threshold = self._threshold_spin.value()
-        self._detector = SceneDetector(self._source, threshold=threshold)
+        self._detector = SceneDetector(self._source, threshold=threshold,
+                                       frame_range=self._frame_range)
         self._detector.progress.connect(self._on_progress)
         self._detector.detail_progress.connect(self._on_detail_progress)
         self._detector.phase_changed.connect(self._on_phase_changed)

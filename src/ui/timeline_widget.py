@@ -35,6 +35,7 @@ CLIP_HEIGHT_DEFAULT = 60
 CLIP_HEIGHT_MIN = 30
 CLIP_HEIGHT_MAX = 200
 HEADER_HEIGHT = 48
+TIMELINE_H_PADDING = 4  # small internal padding for playhead clearance
 RESIZE_HANDLE_HEIGHT = 5  # pixels at bottom edge for drag resize
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
@@ -133,9 +134,9 @@ class TimelineStrip(QWidget):
         playhead_px = self._frame_to_pixel(self._playhead_frame) - self._scroll_offset
         margin = 100
         if playhead_px < margin:
-            self._scroll_offset = max(0, int(self._playhead_frame * self._pixels_per_frame) - margin)
+            self._scroll_offset = max(0, self._frame_to_pixel(self._playhead_frame) - margin)
         elif playhead_px > self.width() - margin:
-            self._scroll_offset = max(0, int(self._playhead_frame * self._pixels_per_frame) - self.width() + margin)
+            self._scroll_offset = max(0, self._frame_to_pixel(self._playhead_frame) - self.width() + margin)
 
     # --- Painting ---
 
@@ -196,8 +197,8 @@ class TimelineStrip(QWidget):
                 interval = ni
                 break
 
-        start_sec = self._scroll_offset / (self._pixels_per_frame * self._fps)
-        end_sec = (self._scroll_offset + width) / (self._pixels_per_frame * self._fps)
+        start_sec = max(0, self._scroll_offset - TIMELINE_H_PADDING) / (self._pixels_per_frame * self._fps)
+        end_sec = max(0, self._scroll_offset + width - TIMELINE_H_PADDING) / (self._pixels_per_frame * self._fps)
         t = (int(start_sec / interval)) * interval
         while t <= end_sec:
             x = self._frame_to_pixel(int(t * self._fps)) - self._scroll_offset
@@ -211,7 +212,19 @@ class TimelineStrip(QWidget):
 
     def _frame_to_pixel(self, frame: int) -> int:
         """Convert a timeline frame number to pixel position. Single source of truth."""
-        return int(frame * self._pixels_per_frame)
+        return TIMELINE_H_PADDING + int(frame * self._pixels_per_frame)
+
+    def _pixel_to_frame(self, screen_x: float) -> int:
+        """Convert a screen x coordinate to timeline frame number.
+        Clamps to content area so the playhead can't enter the padding."""
+        # Clamp screen_x to content bounds
+        x = max(TIMELINE_H_PADDING, screen_x)
+        total = self._model.get_total_duration_frames()
+        if total > 0:
+            max_px = self._frame_to_pixel(total - 1) - self._scroll_offset
+            x = min(x, max_px)
+        return max(0, int((x + self._scroll_offset - TIMELINE_H_PADDING)
+                          / self._pixels_per_frame))
 
     def get_visible_clip_ids(self):
         """Return IDs of non-gap clips currently visible in the viewport."""
@@ -361,6 +374,12 @@ class TimelineStrip(QWidget):
         return HEADER_HEIGHT + 2 + self._clip_height
 
     def mousePressEvent(self, event: QMouseEvent):
+        # Quick-cut: right-click while dragging playhead splits at playhead
+        if event.button() == Qt.MouseButton.RightButton:
+            if self._dragging_playhead:
+                self.cut_requested.emit(self._playhead_frame)
+                return
+
         if event.button() == Qt.MouseButton.MiddleButton:
             # Middle-click: start panning
             self._panning = True
@@ -393,20 +412,20 @@ class TimelineStrip(QWidget):
             # Click in ruler area = set playhead (works in both modes)
             if y < HEADER_HEIGHT:
                 self._dragging_playhead = True
-                frame = int((x + self._scroll_offset) / self._pixels_per_frame)
+                frame = self._pixel_to_frame(x)
                 self.set_playhead(frame)
                 return
 
             # Cut mode: click to split
             if self._edit_mode == EditMode.CUT:
-                frame = int((x + self._scroll_offset) / self._pixels_per_frame)
+                frame = self._pixel_to_frame(x)
                 result = self._model.get_clip_at_position(frame)
                 if result and not result[0].is_gap:
                     self.cut_requested.emit(frame)
                 return
 
             # Click in clip area
-            frame = int((x + self._scroll_offset) / self._pixels_per_frame)
+            frame = self._pixel_to_frame(x)
             result = self._model.get_clip_at_position(frame)
             if result:
                 clip, _ = result
@@ -441,7 +460,7 @@ class TimelineStrip(QWidget):
 
         if self._dragging_playhead:
             x = event.position().x()
-            frame = max(0, int((x + self._scroll_offset) / self._pixels_per_frame))
+            frame = self._pixel_to_frame(x)
             self.set_playhead(frame)
             return
 
@@ -455,7 +474,7 @@ class TimelineStrip(QWidget):
             self._cut_preview_x = None
         elif self._edit_mode == EditMode.CUT:
             if HEADER_HEIGHT <= y <= bottom:
-                frame = int((x + self._scroll_offset) / self._pixels_per_frame)
+                frame = self._pixel_to_frame(x)
                 result = self._model.get_clip_at_position(frame)
                 if result and not result[0].is_gap:
                     self.setCursor(Qt.CursorShape.CrossCursor)
@@ -502,8 +521,8 @@ class TimelineStrip(QWidget):
         x2 = max(self._marquee_start.x(), self._marquee_end.x())
 
         # Convert pixel range to frame range
-        frame_start = int((x1 + self._scroll_offset) / self._pixels_per_frame)
-        frame_end = int((x2 + self._scroll_offset) / self._pixels_per_frame)
+        frame_start = self._pixel_to_frame(x1)
+        frame_end = self._pixel_to_frame(x2)
 
         # Walk clips and find overlapping ones
         selected = set() if not self._marquee_ctrl else set(self._model.selected_ids)
@@ -527,13 +546,13 @@ class TimelineStrip(QWidget):
             delta = event.angleDelta().y()
             mouse_x = event.position().x()
             # Frame under mouse before zoom
-            frame_under_mouse = (mouse_x + self._scroll_offset) / self._pixels_per_frame
+            frame_under_mouse = (mouse_x + self._scroll_offset - TIMELINE_H_PADDING) / self._pixels_per_frame
 
             factor = 1.15 if delta > 0 else 1 / 1.15
             self._pixels_per_frame = max(0.01, min(20.0, self._pixels_per_frame * factor))
 
             # Adjust scroll so the frame under mouse stays in place
-            new_px = frame_under_mouse * self._pixels_per_frame
+            new_px = TIMELINE_H_PADDING + frame_under_mouse * self._pixels_per_frame
             self._scroll_offset = max(0, int(new_px - mouse_x))
             self.update()
             # Notify parent to update scrollbar

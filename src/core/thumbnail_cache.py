@@ -11,13 +11,14 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
+from core.proxy_cache import ProxyManager
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
 
 logger = logging.getLogger(__name__)
 
-THUMB_WIDTH = 96
-THUMB_HEIGHT = 54
+THUMB_WIDTH = 192
+THUMB_HEIGHT = 108
 THUMB_FRAME_SIZE = THUMB_WIDTH * THUMB_HEIGHT * 3
 _MAX_WORKERS = 4
 
@@ -34,11 +35,14 @@ class ThumbnailCache(QObject):
     thumbnail_ready = Signal(str, str, QImage)  # clip_id, "first"|"last", qimage
 
     def __init__(self, timeline: TimelineModel,
-                 sources: Dict[str, VideoSource], parent=None):
+                 sources: Dict[str, VideoSource],
+                 proxy_manager: ProxyManager = None, parent=None):
         super().__init__(parent)
         self._timeline = timeline
         self._sources = sources
+        self._proxy_manager = proxy_manager
         self._mem_cache: Dict[str, QImage] = {}
+        self._lq_emitted: Set[str] = set()  # cache keys where LQ placeholder was sent
         self._stopped = False
         self._coord_thread: Optional[threading.Thread] = None
 
@@ -158,10 +162,25 @@ class ThumbnailCache(QObject):
                     continue
                 cache_key = f"{source_id}_{frame_num}"
                 if cache_key in self._mem_cache:
-                    # Already cached — emit and skip
+                    # Already cached (HQ) — emit and skip
                     self.thumbnail_ready.emit(
                         clip_id, position, self._mem_cache[cache_key])
                     continue
+                # Emit LQ placeholder from proxy if available
+                if (cache_key not in self._lq_emitted
+                        and self._proxy_manager is not None):
+                    proxy = self._proxy_manager.get_proxy(source_id)
+                    if proxy and frame_num < proxy.n_frames:
+                        lq_frame = proxy.get_frame(frame_num)
+                        if lq_frame is not None:
+                            thumb = cv2.resize(
+                                lq_frame, (THUMB_WIDTH, THUMB_HEIGHT),
+                                interpolation=cv2.INTER_NEAREST)
+                            h, w, ch = thumb.shape
+                            qimg = QImage(bytes(thumb.data), w, h, ch * w,
+                                          QImage.Format.Format_RGB888).copy()
+                            self.thumbnail_ready.emit(clip_id, position, qimg)
+                            self._lq_emitted.add(cache_key)
                 needed.append((source_id, frame_num, clip_id, position))
 
         if not needed:

@@ -11,18 +11,37 @@ from core.timeline import TimelineModel
 from core.video_source import VideoSource
 
 
+def _frame_to_tc_count(frame: int, fps: float) -> int:
+    """Convert frame number to total TC frame count using time-based conversion.
+    Uses integer arithmetic to avoid floating-point rounding issues."""
+    fps_int = round(fps)
+    # For NTSC rates: fps = fps_int * 1000 / 1001
+    # frame * 1001 gives ticks at 1/24000s resolution
+    # Integer division avoids float rounding
+    actual_time = frame / fps
+    secs = int(actual_time)
+    ff = round((actual_time - secs) * fps_int)
+    if ff >= fps_int:
+        ff = 0
+        secs += 1
+    return secs * fps_int + ff
+
+
+def _tc_count_to_string(tc_total: int, fps_int: int) -> str:
+    """Convert TC frame count to HH:MM:SS:FF string."""
+    ff = tc_total % fps_int
+    total_secs = tc_total // fps_int
+    ss = total_secs % 60
+    mm = (total_secs // 60) % 60
+    hh = total_secs // 3600
+    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+
+
 def frames_to_timecode(frames: int, fps: float) -> str:
-    """Convert frame count to non-drop-frame timecode HH:MM:SS:FF."""
+    """Convert frame number to non-drop-frame timecode HH:MM:SS:FF."""
     if fps <= 0:
         fps = 24.0
-    fps_int = round(fps)
-    ff = frames % fps_int
-    total_secs = frames // fps_int
-    ss = total_secs % 60
-    total_mins = total_secs // 60
-    mm = total_mins % 60
-    hh = total_mins // 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+    return _tc_count_to_string(_frame_to_tc_count(frames, fps), round(fps))
 
 
 def _reel_name(source: VideoSource) -> str:
@@ -68,10 +87,12 @@ def export_edl(timeline: TimelineModel, sources: Dict[str, VideoSource],
     lines = []
     lines.append(f"TITLE: {title}")
     lines.append(f"FCM: NON-DROP FRAME")
+    lines.append(f"* FRAME RATE: {fps:.3f}")
     lines.append("")
 
     event_num = 0
     rec_pos = 0  # record (output) position in frames
+    rec_tc = 0   # running record TC total (chains perfectly, no gaps)
     timeline_pos = 0  # position in the original timeline
 
     for clip in clips:
@@ -90,22 +111,25 @@ def export_edl(timeline: TimelineModel, sources: Dict[str, VideoSource],
 
         if clip.is_gap:
             if include_gaps:
-                # Advance record position through the gap
                 rec_pos += eff_duration
+                rec_tc += eff_duration
             continue
 
         source = sources.get(clip.source_id)
         if source is None:
             continue
 
-        # Source timecodes (offset into the source file)
+        # Source timecodes: SRC_IN is time-based (matches Resolve's PTS),
+        # SRC_OUT = SRC_IN_tc + duration (preserves exact frame count)
         offset_in_clip = eff_start - clip_start
-        src_in = clip.source_in + offset_in_clip
-        src_out = src_in + eff_duration
+        src_in_frame = clip.source_in + offset_in_clip
+        fps_int = round(fps)
+        src_in_tc = _frame_to_tc_count(src_in_frame, fps)
+        src_out_tc = src_in_tc + eff_duration
 
-        # Record timecodes (position on the output timeline)
-        rec_in = rec_pos
-        rec_out = rec_pos + eff_duration
+        # Record timecodes: chained from running total (no gaps)
+        rec_in_tc = rec_tc
+        rec_out_tc = rec_tc + eff_duration
 
         event_num += 1
         reel = _reel_name(source)
@@ -113,16 +137,17 @@ def export_edl(timeline: TimelineModel, sources: Dict[str, VideoSource],
 
         lines.append(
             f"{event_num:03d}  {reel}  V     C        "
-            f"{frames_to_timecode(src_in, fps)} "
-            f"{frames_to_timecode(src_out, fps)} "
-            f"{frames_to_timecode(rec_in, fps)} "
-            f"{frames_to_timecode(rec_out, fps)}"
+            f"{_tc_count_to_string(src_in_tc, fps_int)} "
+            f"{_tc_count_to_string(src_out_tc, fps_int)} "
+            f"{_tc_count_to_string(rec_in_tc, fps_int)} "
+            f"{_tc_count_to_string(rec_out_tc, fps_int)}"
         )
         lines.append(f"* FROM CLIP NAME: {filename}")
         lines.append(f"* SOURCE FILE: {source.file_path}")
         lines.append("")
 
         rec_pos += eff_duration
+        rec_tc = rec_out_tc
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
