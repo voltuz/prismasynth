@@ -372,6 +372,11 @@ class MainWindow(QMainWindow):
         cut_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.CUT))
         edit_menu.addAction(cut_mode_action)
 
+        scrub_follow_action = QAction("Scrub Follow", self)
+        scrub_follow_action.setShortcut("F")
+        scrub_follow_action.triggered.connect(self._toggle_scrub_follow)
+        edit_menu.addAction(scrub_follow_action)
+
         # --- Timeline menu ---
         timeline_menu = menu.addMenu("Timeline")
 
@@ -728,6 +733,10 @@ class MainWindow(QMainWindow):
         return count
 
     # --- Edit Mode ---
+
+    def _toggle_scrub_follow(self):
+        active = self._timeline_widget.strip.toggle_scrub_follow()
+        logger.info("Scrub follow: %s", "ON" if active else "OFF")
 
     def _set_edit_mode(self, mode: EditMode):
         self._timeline_widget.strip.set_edit_mode(mode)

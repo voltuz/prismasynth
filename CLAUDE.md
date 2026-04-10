@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with TransNetV2 (GPU neural network), review/delete/split clips on a timeline, export as video or image sequence. Single-track editor — no layers, no compositing.
+PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with TransNetV2 (GPU neural network), review/delete/split clips on a timeline, export as video, image sequence, or EDL. Single-track editor — no layers, no compositing.
 
 ## Running
 
@@ -22,11 +22,15 @@ venv\Scripts\python src\main.py
 
 Requires FFmpeg + ffprobe on PATH, `libmpv-2.dll` in `src/` (from mpv.io builds). Python 3.11+.
 
+**No tests or CI.** There is no test suite — verify changes by running the app.
+
 ## Architecture
 
 Three-layer design: `src/ui/` (PySide6 widgets) → `src/core/` (business logic, threading) → `src/utils/` (ffprobe, paths).
 
-**Entry point:** `src/main.py` → `MainWindow` in `src/ui/main_window.py` (the orchestrator that wires everything together).
+**Entry point:** `src/main.py` → `MainWindow` in `src/ui/main_window.py` (the orchestrator that wires everything together). `main.py` adds `src/` to `sys.path`, sets dark Fusion theme, and installs an exception hook that writes to `src/crash.log`.
+
+**Menu bar:** File, Edit, Timeline. Timeline menu contains Import, Export Video/Image/EDL, Detect Cuts, Play/Pause.
 
 ### Data Model
 
@@ -45,23 +49,32 @@ The preview widget embeds mpv for GPU-accelerated decode and display. The entire
 - Source switching: `mpv.loadfile(path)` when crossing clip boundaries (with `wait_for_property('seekable')`)
 - Gaps: black overlay widget on top of mpv (no mpv state change — avoids stutter). Overlay hidden via `QTimer.singleShot(50ms)` after seek to prevent stale frame flash.
 - mpv initialized in `showEvent()` after widget's winId() is valid
+- **Zoom/Pan:** Scroll wheel zooms toward cursor (anchor-preserving math via `video-zoom` = `log2(r)`). Middle-mouse drags to pan. Pan clamped so video always covers the widget. Double-click resets to fit. Bottom-left `QComboBox` overlay shows presets (Fit, 50%-400%) and accepts arbitrary `N%` input. `_apply_zoom()` pushes `video-zoom`, `video-pan-x`, `video-pan-y` into mpv.
 - **Seek throttle:** `seek_to_time()` enforces a minimum 33ms interval between seeks to prevent overwhelming mpv during rapid scrubbing.
 - **Cached `_is_playing`:** A Python bool tracks playback state instead of querying `self._player.pause` (mpv C property). Updated by `play()`, `pause()`, `load_source()`. Avoids native property access on every mouse event.
 - **`_ensure_video_visible()`** must be called before `loadfile` — `clear_frame()` sets `vid='no'` which disables the video track, and `wait_for_property('seekable')` will hang forever if the video track is disabled.
 
-### Edit Modes
+### Edit Modes & Keyboard Shortcuts
 
 Two modes controlled by `EditMode` enum in `timeline_widget.py`:
 
 - **Selection mode** (V key, default): Normal clip selection, marquee selection, playhead dragging.
-- **Cut mode** (C key): Hover shows dashed cut-preview line, preview syncs to mouse position without moving playhead, click splits clip. Left half is selected after split (`select_left_only=True`).
+- **Cut mode** (C key): Hover shows dashed cut-preview line, preview syncs to mouse position without moving playhead, click splits clip.
+- **Quick-cut:** Right-click during playhead drag splits at playhead position (works in selection mode, no mode switch needed).
 
-Mode state lives on `TimelineStrip._edit_mode`. Toolbar has exclusive `QActionGroup` toggle buttons synced via `MainToolbar.set_mode()` (uses `blockSignals` to avoid loops).
+**WASD layout** (left hand in gaming position):
+
+| Key | Action | Key | Action |
+|-----|--------|-----|--------|
+| W | Delete (gap-leave) | E | Set In point |
+| A | Select to gap | R | Set Out point |
+| S | Split at playhead | X | Clear In/Out |
+| D | Ripple delete | C | Cut mode |
+| V | Selection mode | Space | Play/Pause |
 
 ### In/Out Render Points
 
-- `TimelineModel._in_point` / `_out_point` (Optional[int] frame numbers) define export range.
-- I key sets in, O sets out, X clears both. Setting in >= out auto-clears the other.
+- `TimelineModel._in_point` / `_out_point` (Optional[int] frame numbers) define export and scene detection range.
 - `get_render_range()` returns `(start, end)` clamped to timeline bounds, filling missing ends with 0 / total-1.
 - Visualized as cyan markers + semi-transparent dim overlay outside the range.
 - Persisted in `.psynth` project files. Not included in undo/redo snapshots (tool setting, not timeline edit).
@@ -92,24 +105,35 @@ Playback uses mpv natively (`player.pause = False`). A 60Hz QTimer (`_playback_t
 - Image sequence export uses `_iter_frames_ffmpeg()` with per-source select filter + MJPEG pipe. Parallel frame writing via 4-worker ThreadPoolExecutor.
 - Denoised export pipes decoded frames through FastDVDnet (5-frame sliding window) to FFmpeg encoder.
 
+### EDL Export
+
+CMX 3600 EDL for import into Premiere Pro, DaVinci Resolve, Avid. Options: include/exclude gaps, use in/out render range.
+
+- **Time-based timecode conversion:** `frame/fps → actual time → NDF TC` using `round()`. This matches how Resolve derives timecodes from source PTS. Frame-counting (`frame // fps_int`) diverges at non-integer FPS (23.976, 29.97) by ~1 frame per 1000 frames.
+- **Anchored durations:** SRC_OUT = SRC_IN_tc + duration (frame-counting from anchor). This preserves exact frame counts while SRC_IN uses time-based positioning.
+- **Chained record timecodes:** REC_IN/OUT chain as a running TC total — no gaps between clips.
+- Source path comments (`* SOURCE FILE:`) for NLE relinking.
+
 ### Thumbnail System
 
-`ThumbnailCache` generates thumbnails in a low-priority background thread. No disk cache — regenerated fresh each session.
+Viewport-prioritized thumbnail generation with playhead-distance sorting. 4 parallel ffmpeg `-ss` seeks (~38ms/frame).
 
-- **One FFmpeg per source** with `select='eq(n,F1)+eq(n,F2)+...'` filter — seeks only needed frames (clip.source_in + clip.source_out for each clip).
-- **MJPEG pipe output** — FFmpeg encodes thumbnails as JPEG, Python splits the stream on SOI/EOI markers. No per-frame process spawn.
-- **Filter script file** — select expression written to temp file, loaded via `-filter_script:v` to avoid Windows command-line length limits.
-- **Priority:** Pauses immediately when user scrubs (via `_pause_event`). Resumes after 500ms idle (`_thumb_resume_timer`). `time.sleep(0.002)` between emissions yields to main thread.
-- **Memory-only cache:** `_mem_cache` dict of QImage, keyed by `{source_id}_{frame_num}`. `_ndarray_to_qimage` returns `.copy()` to prevent use-after-free across thread boundaries.
+- **Visible-only scope:** Only generates thumbnails for clips currently in the timeline viewport. No forward generation beyond visible area.
+- **Playhead priority:** Within the visible set, frames closest to the playhead are generated first.
+- **LQ proxy placeholders:** If a `.proxy` file exists (from scene detection), instantly upscales 48x27 frames to 192x108 as blurry placeholders while HQ thumbnails load.
+- **4 parallel workers:** `ThreadPoolExecutor` with per-frame `-ss` seeks. Priority re-checked before each new submission (~100ms latency on viewport change).
+- **Pause on scrub:** `_pause_event` halts generation during playhead drag. Resumes after 500ms idle (`_thumb_resume_timer`). Viewport reprioritize debounced to 300ms (`_viewport_timer`).
+- **Memory-only cache:** `_mem_cache` dict of QImage at 192x108, keyed by `{source_id}_{frame_num}`. Regenerated fresh each session. `_ndarray_to_qimage` returns `.copy()` to prevent use-after-free across thread boundaries.
+- **`communicate()`** for subprocess cleanup — prevents Windows handle leaks over hundreds of thumbnails.
 
 ### Proxy System (Scene Detection Only)
 
-`ProxyFile` (48x27 mmap binary) is generated during scene detection for TransNetV2 input reuse. Stored at `%LOCALAPPDATA%/prismasynth/cache/proxies/`. Managed by `ProxyManager`. Not used for thumbnails or scrubbing.
+`ProxyFile` (48x27 mmap binary) is generated during scene detection for TransNetV2 input reuse. Stored at `%LOCALAPPDATA%/prismasynth/cache/proxies/`. Managed by `ProxyManager`. Also used as LQ thumbnail placeholders.
 
 ### Import & Scene Detection (separate steps)
 
 1. **Import** (`ImportDialog` or drag-and-drop) — probes file via ffprobe, creates a single whole-file clip. No detection.
-2. **Detect Cuts** (`DetectDialog`, Ctrl+D) — runs SceneDetector on a source, replaces its clips via `ripple_delete_by_source()`.
+2. **Detect Cuts** (`DetectDialog`, Ctrl+D) — runs SceneDetector on a source, replaces its clips via `ripple_delete_by_source()`. Respects in/out render range when set.
 
 Scene detection uses two decode paths: parallel 4-segment ffmpeg/NVDEC (~396 fps), single CPU fallback (~245 fps). TransNetV2 GPU inference with HSV frame differencing fallback. mpv and thumbnails are paused during detection to avoid GPU contention.
 
@@ -118,7 +142,7 @@ Scene detection uses two decode paths: parallel 4-segment ffmpeg/NVDEC (~396 fps
 | Thread | What | Key constraint |
 |--------|------|---------------|
 | Main (Qt) | All UI, signal slots, mpv commands | QPixmap only here |
-| Thumbnail coordinator | One FFmpeg per source via select filter | Pauses during scrubbing, yields between emissions |
+| Thumbnail coordinator | 4 parallel ffmpeg `-ss` seeks per visible frame | Pauses during scrubbing, priority-sorted |
 | Scene detection (QThread) | Parallel ffmpeg decode + TransNetV2 inference | Stores subprocess refs for cancellation |
 | Export | Per-segment ffmpeg subprocesses (ThreadPoolExecutor) | Signals must use QueuedConnection to UI |
 
@@ -126,11 +150,11 @@ Scene detection uses two decode paths: parallel 4-segment ffmpeg/NVDEC (~396 fps
 
 ### Gaps
 
-Backspace deletes a clip, leaving a gap (same-duration `Clip` with `source_id=None`). Delete key ripple-deletes (collapses space). Adjacent gaps auto-merge. Gaps are selectable, visible as dark dashed rectangles. Skipped during export. Playable during playback (shows black, advances at source FPS).
+W deletes a clip, leaving a gap (same-duration `Clip` with `source_id=None`). D ripple-deletes (collapses space). Adjacent gaps auto-merge. Gaps are selectable, visible as dark dashed rectangles. Skipped during export. Playable during playback (shows black, advances at source FPS). Deleting a gap (W or D) teleports the playhead to the gap's position.
 
 ### Timeline Widget
 
-Custom-painted strip (not Qt model/view). Clip positions computed from cumulative frame counts via `_frame_to_pixel()` to prevent truncation drift. Track height is draggable (30-200px). Thumbnails scale to fill track height at 16:9 aspect with 6px color border. Marquee selection by dragging below the track (Ctrl to add).
+Custom-painted strip (not Qt model/view). Clip positions computed from cumulative frame counts via `_frame_to_pixel()` / `_pixel_to_frame()` to prevent truncation drift. Both account for `TIMELINE_H_PADDING`. Playhead clamped to content area. Track height is draggable (30-200px). Thumbnails scale to fill track height at 16:9 aspect with 6px color border. Marquee selection by dragging below the track (Ctrl to add). Timeline widget wrapped in a container with left/right margins.
 
 **Paint order:** background → ruler → clips → in/out overlay → cut preview line → playhead → marquee rectangle.
 
@@ -150,3 +174,8 @@ Custom-painted strip (not Qt model/view). Clip positions computed from cumulativ
 - Pause mpv and thumbnail cache before scene detection to prevent GPU contention crashes.
 - All FFmpeg commands should include `-nostdin` (prevents stdin reads on Windows) and `-v error` (consistent error capture).
 - Export uses `-frames:v N` (not `-t`) for frame-accurate output. Pre-input `-ss` for fast seeking.
+- EDL timecodes use time-based conversion (`frame/fps`) with `round()`, not frame-counting (`frame // fps_int`). SRC_OUT is anchored to SRC_IN + duration for exact frame counts.
+- Thumbnail subprocess must use `communicate()` (not `stdout.read()` + `wait()`) to prevent Windows handle leaks.
+- `run.bat` sets `PYTHON_GIL=1` for Python 3.13+ free-threaded builds — required for correct threading behavior.
+- `playback_engine.py` exists in `src/core/` but is unused — mpv handles playback natively. Retained as reference only.
+- Autosave fires every 60 seconds when the project is dirty (has unsaved changes).

@@ -76,6 +76,7 @@ class TimelineStrip(QWidget):
         self._thumbnails = {}  # (clip_id, "first"|"last") -> QPixmap
         self._fps = 24.0
         self._edit_mode = EditMode.SELECTION
+        self._scrub_follow = False     # F key: playhead follows mouse without clicking
         self._cut_preview_x: Optional[int] = None
         self._last_preview_frame = -1   # throttle cut-mode hover seeks
 
@@ -109,6 +110,11 @@ class TimelineStrip(QWidget):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
+    def toggle_scrub_follow(self):
+        """Toggle scrub-follow mode: playhead follows mouse without clicking."""
+        self._scrub_follow = not self._scrub_follow
+        return self._scrub_follow
+
     def set_playhead(self, frame: int):
         total = self._model.get_total_duration_frames()
         if total == 0:
@@ -122,6 +128,7 @@ class TimelineStrip(QWidget):
     def set_scroll_offset(self, offset: int):
         self._scroll_offset = max(0, offset)
         self.update()
+        self.scroll_changed.emit()
 
     def set_thumbnail(self, clip_id: str, position: str, pixmap: QPixmap):
         self._thumbnails[(clip_id, position)] = pixmap
@@ -374,9 +381,9 @@ class TimelineStrip(QWidget):
         return HEADER_HEIGHT + 2 + self._clip_height
 
     def mousePressEvent(self, event: QMouseEvent):
-        # Quick-cut: right-click while dragging playhead splits at playhead
+        # Quick-cut: right-click while scrubbing (drag or scrub-follow mode)
         if event.button() == Qt.MouseButton.RightButton:
-            if self._dragging_playhead:
+            if self._dragging_playhead or self._scrub_follow:
                 self.cut_requested.emit(self._playhead_frame)
                 return
 
@@ -458,11 +465,13 @@ class TimelineStrip(QWidget):
             self.scroll_changed.emit()
             return
 
-        if self._dragging_playhead:
+        if self._dragging_playhead or self._scrub_follow:
             x = event.position().x()
             frame = self._pixel_to_frame(x)
             self.set_playhead(frame)
-            return
+            if not self._scrub_follow:
+                return
+            # In scrub-follow, fall through to hover behavior (cursor updates)
 
         # Hover behavior
         x = event.position().x()
