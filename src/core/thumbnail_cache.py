@@ -67,13 +67,32 @@ class ThumbnailCache(QObject):
         # Wake event — signals coordinator to re-check for work
         self._wake_event = threading.Event()
 
+        # When False, coordinator still emits LQ proxy placeholders but skips
+        # submitting expensive HQ ffmpeg/PyAV decode jobs.
+        self._hq_enabled = True
+
         # Track live subprocesses so stop() can kill them immediately
         # instead of waiting for per-frame communicate() timeouts.
         self._active_procs: Set[subprocess.Popen] = set()
         self._procs_lock = threading.Lock()
 
+    def set_hq_enabled(self, enabled: bool):
+        """Toggle HQ thumbnail generation. LQ proxy placeholders keep emitting
+        either way while the cache is running."""
+        self._hq_enabled = enabled
+        self._wake_event.set()
+
     def pause(self):
         self._pause_event.clear()
+        # Kill in-flight ffmpeg subprocesses so single-frame grabs abort
+        # immediately instead of holding CPU/disk through communicate().
+        with self._procs_lock:
+            procs = list(self._active_procs)
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
 
     def resume(self):
         self._pause_event.set()
@@ -214,6 +233,11 @@ class ThumbnailCache(QObject):
         if not by_source:
             return
 
+        # LQ placeholders were emitted above; skip the expensive HQ decode
+        # jobs when the user has disabled HQ generation.
+        if not self._hq_enabled:
+            return
+
         # For each source, build sweep runs ordered by playhead distance
         for source_id, frames in by_source.items():
             source = self._sources.get(source_id)
@@ -267,7 +291,7 @@ class ThumbnailCache(QObject):
     def _grab_frame_single(self, source: VideoSource,
                            frame_num: int) -> Optional[List[Tuple[int, QImage]]]:
         """Grab one frame via ffmpeg seek. Used for isolated frames."""
-        if self._stopped:
+        if self._stopped or not self._pause_event.is_set():
             return None
         timestamp = frame_num / source.fps if source.fps > 0 else 0.0
         cmd = [
@@ -317,7 +341,7 @@ class ThumbnailCache(QObject):
         """Grab multiple frames via a single PyAV sequential decode.
         target_frames must be sorted ascending. Seeks once to the first target,
         then decodes forward through all targets."""
-        if self._stopped:
+        if self._stopped or not self._pause_event.is_set():
             return None
         fps = source.fps if source.fps > 0 else 24.0
         results = []
@@ -335,7 +359,9 @@ class ThumbnailCache(QObject):
             container.seek(target_pts[0], stream=stream)
 
             for frame in container.decode(stream):
-                if self._stopped:
+                # Abort mid-sweep when the user is scrubbing — frees CPU
+                # for the Qt main thread to repaint the playhead.
+                if self._stopped or not self._pause_event.is_set():
                     break
                 if frame.pts is None:
                     continue

@@ -281,6 +281,8 @@ class MainWindow(QMainWindow):
         self._timeline_widget.clip_clicked.connect(self._on_clip_clicked)
         self._timeline_widget.preview_frame_requested.connect(self._on_preview_frame_requested)
         self._timeline_widget.cut_requested.connect(self._on_cut_at_frame)
+        self._timeline_widget.thumbnails_toggled.connect(self._on_thumbnails_toggled)
+        self._timeline_widget.hq_thumbnails_toggled.connect(self._on_hq_thumbnails_toggled)
         self._timeline_widget.strip.scroll_changed.connect(self._on_viewport_changed)
         self._timeline.selection_changed.connect(self._on_selection_changed)
 
@@ -679,6 +681,9 @@ class MainWindow(QMainWindow):
                      total_clips, len(results))
 
     def _start_thumbnail_cache(self):
+        # Respect the user's toggle — master off means nothing runs.
+        if not self._timeline_widget.thumbnails_enabled:
+            return
         visible = set(self._timeline_widget.strip.get_visible_clip_ids())
         playhead = self._timeline_widget.strip.playhead_frame
         if self._thumbnail_cache is None:
@@ -687,11 +692,25 @@ class MainWindow(QMainWindow):
                 proxy_manager=self._proxy_manager,
             )
             self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
+            self._thumbnail_cache.set_hq_enabled(self._timeline_widget.hq_thumbnails_enabled)
             self._thumbnail_cache.start(
                 priority_clip_ids=visible, playhead_frame=playhead)
         else:
             self._thumbnail_cache.notify_clips_changed()
             self._thumbnail_cache.reprioritize(visible, playhead)
+
+    def _on_thumbnails_toggled(self, enabled: bool):
+        if enabled:
+            self._start_thumbnail_cache()
+        elif self._thumbnail_cache is not None:
+            self._thumbnail_cache.stop()
+            self._thumbnail_cache = None
+
+    def _on_hq_thumbnails_toggled(self, enabled: bool):
+        # Master off → advanced toggle has no immediate effect; state is
+        # applied next time the cache is started.
+        if self._thumbnail_cache is not None:
+            self._thumbnail_cache.set_hq_enabled(enabled)
 
     def _on_thumbnail_ready(self, clip_id: str, position: str, qimage):
         from PySide6.QtGui import QPixmap

@@ -2,15 +2,16 @@ import logging
 from enum import IntEnum
 from typing import Optional, List
 
-from PySide6.QtWidgets import QWidget, QScrollBar, QVBoxLayout
-from PySide6.QtCore import Qt, Signal, QRect, QPoint
+from PySide6.QtWidgets import QWidget, QScrollBar, QVBoxLayout, QToolButton, QMenu
+from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize
 from PySide6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QPixmap,
+    QPainter, QPen, QBrush, QColor, QFont, QPixmap, QAction,
     QMouseEvent, QWheelEvent, QPaintEvent, QKeyEvent,
 )
 
 from core.timeline import TimelineModel
 from core.clip import Clip
+from ui.icon_loader import icon
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class TimelineStrip(QWidget):
         self._marquee_end: Optional[QPoint] = None
         self._marquee_ctrl = False
         self._thumbnails = {}  # (clip_id, "first"|"last") -> QPixmap
+        self._thumbnails_enabled = True
         self._fps = 24.0
         self._edit_mode = EditMode.SELECTION
         self._scrub_follow = False     # F key: playhead follows mouse without clicking
@@ -134,6 +136,20 @@ class TimelineStrip(QWidget):
 
     def set_thumbnail(self, clip_id: str, position: str, pixmap: QPixmap):
         self._thumbnails[(clip_id, position)] = pixmap
+        self.update()
+
+    def set_thumbnails_enabled(self, enabled: bool):
+        """Toggle thumbnail rendering. When off, clips show as solid color blocks."""
+        if self._thumbnails_enabled == enabled:
+            return
+        self._thumbnails_enabled = enabled
+        if not enabled:
+            self._thumbnails.clear()
+        self.update()
+
+    @property
+    def thumbnails_enabled(self) -> bool:
+        return self._thumbnails_enabled
         self.update()
 
     def get_total_width(self) -> int:
@@ -302,19 +318,20 @@ class TimelineStrip(QWidget):
             th = self._clip_height - pad * 2
             tw = int(th * 16 / 9)
 
-            # First frame thumbnail — always shown, cropped to clip bounds with border
-            thumb_first = self._thumbnails.get((clip.id, "first"))
-            if thumb_first and clip_w > pad * 2 and th > 0:
-                painter.save()
-                thumb_clip = QRect(screen_x + pad, y + pad, clip_w - pad * 2, th)
-                painter.setClipRect(thumb_clip)
-                painter.drawPixmap(screen_x + pad, y + pad, tw, th, thumb_first)
-                painter.restore()
+            if self._thumbnails_enabled:
+                # First frame thumbnail — always shown, cropped to clip bounds with border
+                thumb_first = self._thumbnails.get((clip.id, "first"))
+                if thumb_first and clip_w > pad * 2 and th > 0:
+                    painter.save()
+                    thumb_clip = QRect(screen_x + pad, y + pad, clip_w - pad * 2, th)
+                    painter.setClipRect(thumb_clip)
+                    painter.drawPixmap(screen_x + pad, y + pad, tw, th, thumb_first)
+                    painter.restore()
 
-            # Last frame thumbnail (right edge) — only when clip fits both
-            thumb_last = self._thumbnails.get((clip.id, "last"))
-            if thumb_last and clip_w > tw * 2 + pad * 4 and th > 0:
-                painter.drawPixmap(screen_x + clip_w - tw - pad, y + pad, tw, th, thumb_last)
+                # Last frame thumbnail (right edge) — only when clip fits both
+                thumb_last = self._thumbnails.get((clip.id, "last"))
+                if thumb_last and clip_w > tw * 2 + pad * 4 and th > 0:
+                    painter.drawPixmap(screen_x + clip_w - tw - pad, y + pad, tw, th, thumb_last)
 
             # Duration label in center
             if clip_w > tw * 2 + 40:
@@ -572,11 +589,19 @@ class TimelineStrip(QWidget):
             self.update()
             # Notify parent to update scrollbar
             self.playhead_moved.emit(self._playhead_frame)
+            self.scroll_changed.emit()
         else:
             # Horizontal scroll
             delta = event.angleDelta().y()
             self._scroll_offset = max(0, self._scroll_offset - delta)
             self.update()
+            self.scroll_changed.emit()
+
+    def resizeEvent(self, event):
+        # Widget width changes alter which clips are in the viewport, so
+        # nudge the cache to re-examine visibility.
+        super().resizeEvent(event)
+        self.scroll_changed.emit()
 
     def _select_adjacent_clip(self, direction: int):
         """Select next (direction=1) or previous (direction=-1) clip and move playhead."""
@@ -633,6 +658,8 @@ class TimelineWidget(QWidget):
     clip_clicked = Signal(str, object)
     preview_frame_requested = Signal(int)
     cut_requested = Signal(int)
+    thumbnails_toggled = Signal(bool)
+    hq_thumbnails_toggled = Signal(bool)
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -648,6 +675,37 @@ class TimelineWidget(QWidget):
         layout.addWidget(self._strip, 1)
         layout.addWidget(self._scrollbar)
 
+        # Thumbnail toggle — small checkable overlay in the strip's top-right.
+        self._thumb_toggle = QToolButton(self._strip)
+        self._thumb_toggle.setIcon(icon("thumbnails"))
+        self._thumb_toggle.setIconSize(QSize(14, 14))
+        self._thumb_toggle.setCheckable(True)
+        self._thumb_toggle.setChecked(True)
+        self._thumb_toggle.setToolTip("Toggle clip thumbnails")
+        self._thumb_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._thumb_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._thumb_toggle.setFixedSize(22, 22)
+        self._thumb_toggle.setStyleSheet(
+            "QToolButton {"
+            " background-color: rgba(58, 58, 58, 220);"
+            " border: 1px solid #555;"
+            " border-radius: 3px;"
+            "}"
+            "QToolButton:hover { background-color: rgba(85, 85, 85, 230); }"
+            "QToolButton:checked {"
+            " background-color: #5577aa;"
+            " border-color: #6688bb;"
+            "}"
+        )
+        self._thumb_toggle.toggled.connect(self._on_thumb_toggled)
+        self._thumb_toggle.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._thumb_toggle.customContextMenuRequested.connect(self._show_thumb_menu)
+        self._strip.installEventFilter(self)
+        self._position_thumb_toggle()
+
+        # HQ generation is part of the advanced options — default on.
+        self._hq_thumbnails_enabled = True
+
         self._strip.playhead_moved.connect(self._on_playhead_moved)
         self._strip.scrub_started.connect(self.scrub_started.emit)
         self._strip.scrub_ended.connect(self.scrub_ended.emit)
@@ -661,6 +719,53 @@ class TimelineWidget(QWidget):
     @property
     def strip(self) -> TimelineStrip:
         return self._strip
+
+    @property
+    def thumbnails_enabled(self) -> bool:
+        return self._thumb_toggle.isChecked()
+
+    @property
+    def hq_thumbnails_enabled(self) -> bool:
+        return self._hq_thumbnails_enabled
+
+    def _on_thumb_toggled(self, checked: bool):
+        self._strip.set_thumbnails_enabled(checked)
+        self._update_thumb_icon()
+        self.thumbnails_toggled.emit(checked)
+
+    def _show_thumb_menu(self, pos):
+        menu = QMenu(self._thumb_toggle)
+        hq_action = QAction("Generate HQ Thumbnails", menu)
+        hq_action.setCheckable(True)
+        hq_action.setChecked(self._hq_thumbnails_enabled)
+        hq_action.toggled.connect(self._on_hq_thumb_toggled)
+        menu.addAction(hq_action)
+        menu.exec(self._thumb_toggle.mapToGlobal(pos))
+
+    def _on_hq_thumb_toggled(self, enabled: bool):
+        if self._hq_thumbnails_enabled == enabled:
+            return
+        self._hq_thumbnails_enabled = enabled
+        self._update_thumb_icon()
+        self.hq_thumbnails_toggled.emit(enabled)
+
+    def _update_thumb_icon(self):
+        # Degraded = master on but HQ off → LQ placeholders only.
+        degraded = self._thumb_toggle.isChecked() and not self._hq_thumbnails_enabled
+        self._thumb_toggle.setIcon(
+            icon("thumbnails-degraded") if degraded else icon("thumbnails"))
+
+    def _position_thumb_toggle(self):
+        margin = 6
+        x = self._strip.width() - self._thumb_toggle.width() - margin
+        y = margin
+        self._thumb_toggle.move(x, y)
+        self._thumb_toggle.raise_()
+
+    def eventFilter(self, obj, event):
+        if obj is self._strip and event.type() == event.Type.Resize:
+            self._position_thumb_toggle()
+        return super().eventFilter(obj, event)
 
     def set_playhead(self, frame: int):
         self._strip.set_playhead(frame)
