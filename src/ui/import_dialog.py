@@ -3,7 +3,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFileDialog,
+    QPushButton, QFileDialog, QMessageBox,
 )
 from PySide6.QtCore import Signal
 
@@ -17,20 +17,28 @@ VIDEO_FILTERS = "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v *
 
 
 class ImportDialog(QDialog):
-    """Dialog for importing videos. Probes the file and creates a single
-    whole-file clip. Cut detection is a separate step."""
+    """Dialog for importing one or more videos. Probes all selected files,
+    validates that they share the same resolution and FPS (and match existing
+    timeline sources if any), and creates one whole-file clip per source.
+    Cut detection is a separate step."""
 
-    import_complete = Signal(object, list)  # VideoSource, List[Clip]
+    # Emits list of (VideoSource, Clip) pairs for all imported files
+    import_complete = Signal(list)  # List[Tuple[VideoSource, Clip]]
 
-    def __init__(self, parent=None):
+    def __init__(self, ref_width: int = 0, ref_height: int = 0,
+                 ref_fps: float = 0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import Video")
         self.setMinimumWidth(450)
         self.setModal(True)
 
+        self._ref_width = ref_width
+        self._ref_height = ref_height
+        self._ref_fps = ref_fps
+
         layout = QVBoxLayout(self)
 
-        self._status_label = QLabel("Select a video file to import.")
+        self._status_label = QLabel("Select video file(s) to import.")
         layout.addWidget(self._status_label)
 
         btn_layout = QHBoxLayout()
@@ -49,32 +57,75 @@ class ImportDialog(QDialog):
         )
         if not paths:
             return
-        self._start_import(paths[0])
+        self._start_import(paths)
 
-    def _start_import(self, file_path: str):
-        name = file_path.split('/')[-1].split(chr(92))[-1]
-        self._status_label.setText(f"Probing: {name}")
+    def _start_import(self, file_paths: list):
+        self._status_label.setText(f"Probing {len(file_paths)} file(s)...")
 
-        info = probe_video(file_path)
-        if info is None:
-            self._status_label.setText("Error: Could not read video file. Is FFmpeg installed?")
-            return
+        # Probe all files
+        probed = []
+        for path in file_paths:
+            info = probe_video(path)
+            if info is None:
+                name = path.split('/')[-1].split(chr(92))[-1]
+                QMessageBox.critical(
+                    self, "Import Error",
+                    f"Could not read video file:\n{name}\n\n"
+                    "Is FFmpeg installed and on PATH?"
+                )
+                self._status_label.setText("Select video file(s) to import.")
+                return
+            probed.append((path, info))
 
-        source = VideoSource(
-            file_path=file_path,
-            total_frames=info.total_frames,
-            fps=info.fps,
-            width=info.width,
-            height=info.height,
-            codec=info.codec,
-        )
+        # Determine reference resolution/fps: use existing timeline if set,
+        # otherwise use first file
+        if self._ref_width > 0:
+            ref_w, ref_h, ref_fps = self._ref_width, self._ref_height, self._ref_fps
+            ref_label = "timeline"
+        else:
+            first_path, first_info = probed[0]
+            ref_w, ref_h, ref_fps = first_info.width, first_info.height, first_info.fps
+            ref_label = first_path.split('/')[-1].split(chr(92))[-1]
 
-        # Single clip spanning the entire file
-        clip = Clip(
-            source_id=source.id,
-            source_in=0,
-            source_out=source.total_frames - 1,
-        )
+        # Validate all files match reference
+        for path, info in probed:
+            name = path.split('/')[-1].split(chr(92))[-1]
+            if info.width != ref_w or info.height != ref_h:
+                QMessageBox.critical(
+                    self, "Import Error",
+                    f"Resolution mismatch — batch rejected.\n\n"
+                    f"{name} is {info.width}x{info.height}\n"
+                    f"Expected {ref_w}x{ref_h} (from {ref_label})"
+                )
+                self._status_label.setText("Select video file(s) to import.")
+                return
+            if abs(info.fps - ref_fps) > 0.02:
+                QMessageBox.critical(
+                    self, "Import Error",
+                    f"FPS mismatch — batch rejected.\n\n"
+                    f"{name} is {info.fps:.3f} fps\n"
+                    f"Expected {ref_fps:.3f} fps (from {ref_label})"
+                )
+                self._status_label.setText("Select video file(s) to import.")
+                return
 
-        self.import_complete.emit(source, [clip])
+        # Build sources and clips
+        results = []
+        for path, info in probed:
+            source = VideoSource(
+                file_path=path,
+                total_frames=info.total_frames,
+                fps=info.fps,
+                width=info.width,
+                height=info.height,
+                codec=info.codec,
+            )
+            clip = Clip(
+                source_id=source.id,
+                source_in=0,
+                source_out=source.total_frames - 1,
+            )
+            results.append((source, clip))
+
+        self.import_complete.emit(results)
         self.accept()

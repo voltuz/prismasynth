@@ -26,14 +26,17 @@ def _proxy_path(source: VideoSource) -> Path:
 class ProxyFile:
     """Memory-mapped flat binary file of all video frames at 48x27 RGB24.
     Provides microsecond random access to any frame — no decode needed.
-    Used by TransNetV2 scene detection for fast frame reuse."""
+    Used by TransNetV2 scene detection for fast frame reuse.
+    Supports an optional frame_offset for proxies that don't start at frame 0."""
 
     def __init__(self, source: VideoSource):
         self._source = source
         self._path = _proxy_path(source)
+        self._offset_path = self._path.with_suffix('.offset')
         self._mmap: Optional[mmap.mmap] = None
         self._file = None
         self._n_frames = 0
+        self._frame_offset = 0  # source frame number of proxy index 0
 
     @property
     def exists(self) -> bool:
@@ -42,6 +45,10 @@ class ProxyFile:
     @property
     def n_frames(self) -> int:
         return self._n_frames
+
+    @property
+    def frame_offset(self) -> int:
+        return self._frame_offset
 
     def open(self) -> bool:
         """Open existing proxy file for reading. Returns True if successful."""
@@ -52,7 +59,14 @@ class ProxyFile:
             self._n_frames = file_size // PROXY_FRAME_SIZE
             self._file = open(self._path, "rb")
             self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-            logger.info("Opened proxy: %s (%d frames)", self._path, self._n_frames)
+            # Read frame offset if it exists
+            if self._offset_path.exists():
+                try:
+                    self._frame_offset = int(self._offset_path.read_text().strip())
+                except (ValueError, OSError):
+                    self._frame_offset = 0
+            logger.info("Opened proxy: %s (%d frames, offset=%d)",
+                        self._path, self._n_frames, self._frame_offset)
             return True
         except Exception as e:
             logger.warning("Failed to open proxy %s: %s", self._path, e)
@@ -60,10 +74,13 @@ class ProxyFile:
             return False
 
     def get_frame(self, frame_number: int) -> Optional[np.ndarray]:
-        """Get a frame by number. Returns RGB24 numpy array at 48x27, or None."""
-        if self._mmap is None or frame_number < 0 or frame_number >= self._n_frames:
+        """Get a frame by source frame number. Returns RGB24 numpy array at 48x27, or None."""
+        if self._mmap is None:
             return None
-        offset = frame_number * PROXY_FRAME_SIZE
+        idx = frame_number - self._frame_offset
+        if idx < 0 or idx >= self._n_frames:
+            return None
+        offset = idx * PROXY_FRAME_SIZE
         raw = self._mmap[offset:offset + PROXY_FRAME_SIZE]
         return np.frombuffer(raw, dtype=np.uint8).reshape(PROXY_HEIGHT, PROXY_WIDTH, 3).copy()
 
@@ -85,16 +102,20 @@ class ProxyFile:
         self.close()
 
     @staticmethod
-    def save_frames(source: VideoSource, frames: list):
-        """Save a list of RGB24 numpy arrays (48x27) as a proxy file."""
+    def save_frames(source: VideoSource, frames: list, frame_offset: int = 0):
+        """Save a list of RGB24 numpy arrays (48x27) as a proxy file.
+        frame_offset: source frame number of frames[0]."""
         path = _proxy_path(source)
+        offset_path = path.with_suffix('.offset')
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(path, "wb") as f:
                 for frame in frames:
                     f.write(frame.tobytes())
-            logger.info("Saved proxy: %s (%d frames, %.0f MB)",
-                         path, len(frames), path.stat().st_size / 1e6)
+            # Write offset file (always, even if 0 — so stale offsets are overwritten)
+            offset_path.write_text(str(frame_offset))
+            logger.info("Saved proxy: %s (%d frames, offset=%d, %.0f MB)",
+                         path, len(frames), frame_offset, path.stat().st_size / 1e6)
         except OSError:
             # File may be mmap'd by ProxyManager — skip, existing proxy still works
             logger.warning("Proxy file locked (mmap'd), skipping save for %s", path)
@@ -109,10 +130,15 @@ class ProxyManager:
     def get_proxy(self, source_id: str) -> Optional[ProxyFile]:
         return self._proxies.get(source_id)
 
-    def load_or_open(self, source: VideoSource) -> Optional[ProxyFile]:
-        """Open .proxy file for a source. Returns None if no proxy exists."""
-        if source.id in self._proxies:
+    def load_or_open(self, source: VideoSource, force_reopen: bool = False) -> Optional[ProxyFile]:
+        """Open .proxy file for a source. Returns None if no proxy exists.
+        force_reopen=True closes any existing mmap and reopens from disk."""
+        if source.id in self._proxies and not force_reopen:
             return self._proxies[source.id]
+        # Close existing proxy if reopening
+        if source.id in self._proxies:
+            self._proxies[source.id].close()
+            del self._proxies[source.id]
         proxy = ProxyFile(source)
         if proxy.open():
             self._proxies[source.id] = proxy

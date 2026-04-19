@@ -13,7 +13,6 @@ Single-track editor — no layers, no compositing. Built for speed: the entire p
   - ProRes 422 (profiles 0-3) and 4444
   - FFV1 lossless
   - Image sequence (PNG/JPEG)
-  - Denoised export through FastDVDnet (5-frame sliding window)
 - **HDR handling** — `probe_hdr()` detects HDR sources and routes through GPU `tonemap_opencl=hable` or a CPU `zscale` fallback. SDR sources skip tonemap entirely.
 - **Frame-accurate** — export uses `-frames:v N` (integer frame count) to eliminate float rounding from time-based durations.
 - **CMX 3600 EDL export** — time-based timecode conversion matching DaVinci Resolve's PTS derivation. Compatible with Premiere Pro, Resolve, and Avid.
@@ -120,7 +119,6 @@ src/
 │   ├── exporter.py          # parallel FFmpeg pipeline
 │   ├── scene_detector.py    # TransNetV2 + NVDEC
 │   ├── thumbnail_cache.py   # viewport-prioritized generation
-│   ├── fastdvdnet/          # denoiser
 │   └── project.py           # .psynth save/load
 └── utils/
     ├── ffprobe.py           # HDR detection, metadata probing

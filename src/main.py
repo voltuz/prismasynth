@@ -11,6 +11,7 @@ os.environ['PATH'] = _src_dir + os.pathsep + os.environ['PATH']
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
 
 from ui.main_window import MainWindow
 
@@ -40,9 +41,24 @@ def setup_logging():
 def main():
     sys.excepthook = _excepthook
     setup_logging()
+
+    # Windows: declare an explicit AppUserModelID so the taskbar uses our
+    # own icon/grouping instead of inheriting Python's.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "prismasynth.app")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("PrismaSynth")
     app.setStyle("Fusion")
+
+    icon_path = os.path.join(_src_dir, "app.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     window = MainWindow()
     window.show()

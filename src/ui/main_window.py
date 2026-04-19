@@ -21,6 +21,7 @@ from core.thumbnail_cache import ThumbnailCache
 from core.proxy_cache import ProxyManager
 from core.project import save_project, load_project
 from utils.paths import get_config_dir
+from ui.icon_loader import icon
 from ui.preview_widget import PreviewWidget
 from ui.timeline_widget import TimelineWidget, EditMode
 from ui.toolbar import MainToolbar
@@ -63,6 +64,37 @@ QToolBar QToolButton:checked {
 QStatusBar {
     background-color: #333;
     color: #aaa;
+}
+QMenuBar {
+    background-color: #333;
+    color: #ddd;
+}
+QMenuBar::item {
+    background-color: transparent;
+    padding: 4px 10px;
+}
+QMenuBar::item:selected {
+    background-color: #555;
+}
+QMenuBar::item:pressed {
+    background-color: #5577aa;
+}
+QMenu {
+    background-color: #333;
+    color: #ddd;
+    border: 1px solid #555;
+}
+QMenu::item {
+    padding: 4px 24px;
+}
+QMenu::item:selected {
+    background-color: #5577aa;
+    color: #fff;
+}
+QMenu::separator {
+    height: 1px;
+    background: #555;
+    margin: 4px 8px;
 }
 QGroupBox {
     border: 1px solid #555;
@@ -155,6 +187,7 @@ class MainWindow(QMainWindow):
         self._reader_pool = VideoReaderPool(use_gpu=True)
         self._proxy_manager = ProxyManager()
         self._exporter: Optional[Exporter] = None
+        self._detect_partials: dict = {}
         self._last_clicked_clip_id: Optional[str] = None
         self._thumbnail_cache: Optional[ThumbnailCache] = None
         self._selection_follows_playhead = True
@@ -205,8 +238,7 @@ class MainWindow(QMainWindow):
         self._toolbar.delete_clicked.connect(self._on_delete)
         self._toolbar.select_to_gap_clicked.connect(self._on_select_to_gap)
         self._toolbar.selection_follows_toggled.connect(self._on_selection_follows_toggled)
-        self._toolbar.export_video_clicked.connect(self._on_export_video)
-        self._toolbar.export_images_clicked.connect(self._on_export_images)
+        self._toolbar.export_clicked.connect(self._on_export_video)
         self._toolbar.mode_changed.connect(self._on_mode_changed)
 
         # Central layout
@@ -244,6 +276,8 @@ class MainWindow(QMainWindow):
 
         # Timeline signals
         self._timeline_widget.playhead_changed.connect(self._on_playhead_changed)
+        self._timeline_widget.scrub_started.connect(self._preview.scrub_start)
+        self._timeline_widget.scrub_ended.connect(self._preview.scrub_end)
         self._timeline_widget.clip_clicked.connect(self._on_clip_clicked)
         self._timeline_widget.preview_frame_requested.connect(self._on_preview_frame_requested)
         self._timeline_widget.cut_requested.connect(self._on_cut_at_frame)
@@ -277,12 +311,12 @@ class MainWindow(QMainWindow):
         menu = self.menuBar()
         file_menu = menu.addMenu("File")
 
-        new_action = QAction("New Project", self)
+        new_action = QAction(icon("new"), "New Project", self)
         new_action.setShortcut(QKeySequence("Ctrl+N"))
         new_action.triggered.connect(self._on_new_project)
         file_menu.addAction(new_action)
 
-        open_action = QAction("Open Project...", self)
+        open_action = QAction(icon("open"), "Open Project...", self)
         open_action.setShortcut(QKeySequence("Ctrl+O"))
         open_action.triggered.connect(self._on_open_project)
         file_menu.addAction(open_action)
@@ -292,87 +326,87 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        save_action = QAction("Save Project", self)
+        save_action = QAction(icon("save"), "Save Project", self)
         save_action.setShortcut(QKeySequence("Ctrl+S"))
         save_action.triggered.connect(self._on_save_project)
         file_menu.addAction(save_action)
 
-        save_as_action = QAction("Save Project As...", self)
+        save_as_action = QAction(icon("save-as"), "Save Project As...", self)
         save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         save_as_action.triggered.connect(self._on_save_project_as)
         file_menu.addAction(save_as_action)
 
         edit_menu = menu.addMenu("Edit")
 
-        split_action = QAction("Split at Playhead", self)
+        split_action = QAction(icon("scissors"), "Split at Playhead", self)
         split_action.setShortcut("S")  # middle finger home
         split_action.triggered.connect(self._on_split)
         edit_menu.addAction(split_action)
 
-        delete_action = QAction("Delete Selected", self)
+        delete_action = QAction(icon("trash"), "Delete Selected", self)
         delete_action.setShortcut("W")  # top row middle — most-used delete
         delete_action.triggered.connect(self._on_delete)
         edit_menu.addAction(delete_action)
 
-        ripple_delete_action = QAction("Ripple Delete Selected", self)
+        ripple_delete_action = QAction(icon("ripple-delete"), "Ripple Delete Selected", self)
         ripple_delete_action.setShortcut("D")  # index finger home — ripple delete
         ripple_delete_action.triggered.connect(self._on_ripple_delete)
         edit_menu.addAction(ripple_delete_action)
 
         edit_menu.addSeparator()
 
-        undo_action = QAction("Undo", self)
+        undo_action = QAction(icon("undo"), "Undo", self)
         undo_action.setShortcut(QKeySequence("Ctrl+Z"))
         undo_action.triggered.connect(self._timeline.undo)
         edit_menu.addAction(undo_action)
 
-        redo_action = QAction("Redo", self)
+        redo_action = QAction(icon("redo"), "Redo", self)
         redo_action.setShortcut(QKeySequence("Ctrl+Shift+Z"))
         redo_action.triggered.connect(self._timeline.redo)
         edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
 
-        select_all_action = QAction("Select All", self)
+        select_all_action = QAction(icon("select-all"), "Select All", self)
         select_all_action.setShortcut(QKeySequence("Ctrl+A"))
         select_all_action.triggered.connect(self._timeline.select_all)
         edit_menu.addAction(select_all_action)
 
-        select_gap_action = QAction("Select to Gap Left", self)
+        select_gap_action = QAction(icon("select-gap"), "Select to Gap Left", self)
         select_gap_action.setShortcut("A")  # pinky home — select to gap
         select_gap_action.triggered.connect(self._on_select_to_gap)
         edit_menu.addAction(select_gap_action)
 
         edit_menu.addSeparator()
 
-        set_in_action = QAction("Set In Point", self)
+        set_in_action = QAction(icon("set-in"), "Set In Point", self)
         set_in_action.setShortcut("E")  # top row — in point
         set_in_action.triggered.connect(self._on_set_in_point)
         edit_menu.addAction(set_in_action)
 
-        set_out_action = QAction("Set Out Point", self)
+        set_out_action = QAction(icon("set-out"), "Set Out Point", self)
         set_out_action.setShortcut("R")  # top row — out point
         set_out_action.triggered.connect(self._on_set_out_point)
         edit_menu.addAction(set_out_action)
 
-        clear_in_out_action = QAction("Clear In/Out", self)
+        clear_in_out_action = QAction(icon("clear-in-out"), "Clear In/Out", self)
         clear_in_out_action.setShortcut("X")
         clear_in_out_action.triggered.connect(self._on_clear_in_out)
         edit_menu.addAction(clear_in_out_action)
 
         edit_menu.addSeparator()
 
-        selection_mode_action = QAction("Selection Mode", self)
+        selection_mode_action = QAction(icon("cursor"), "Selection Mode", self)
         selection_mode_action.setShortcut("V")
         selection_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.SELECTION))
         edit_menu.addAction(selection_mode_action)
 
-        cut_mode_action = QAction("Cut Mode", self)
+        cut_mode_action = QAction(icon("cut-mode"), "Cut Mode", self)
         cut_mode_action.setShortcut("C")
         cut_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.CUT))
         edit_menu.addAction(cut_mode_action)
 
-        scrub_follow_action = QAction("Scrub Follow", self)
+        scrub_follow_action = QAction(icon("target"), "Scrub Follow", self)
         scrub_follow_action.setShortcut("F")
         scrub_follow_action.triggered.connect(self._toggle_scrub_follow)
         edit_menu.addAction(scrub_follow_action)
@@ -380,37 +414,37 @@ class MainWindow(QMainWindow):
         # --- Timeline menu ---
         timeline_menu = menu.addMenu("Timeline")
 
-        import_action = QAction("Import Video...", self)
+        import_action = QAction(icon("import"), "Import Video...", self)
         import_action.setShortcut(QKeySequence("Ctrl+I"))
         import_action.triggered.connect(self._on_import)
         timeline_menu.addAction(import_action)
 
         timeline_menu.addSeparator()
 
-        export_vid_action = QAction("Export Video...", self)
+        export_vid_action = QAction(icon("film"), "Export Video...", self)
         export_vid_action.setShortcut(QKeySequence("Ctrl+E"))
         export_vid_action.triggered.connect(self._on_export_video)
         timeline_menu.addAction(export_vid_action)
 
-        export_img_action = QAction("Export Image Sequence...", self)
+        export_img_action = QAction(icon("image"), "Export Image Sequence...", self)
         export_img_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         export_img_action.triggered.connect(self._on_export_images)
         timeline_menu.addAction(export_img_action)
 
-        edl_action = QAction("Export EDL...", self)
+        edl_action = QAction(icon("document"), "Export EDL...", self)
         edl_action.triggered.connect(self._on_export_edl)
         timeline_menu.addAction(edl_action)
 
         timeline_menu.addSeparator()
 
-        detect_action = QAction("Detect Cuts...", self)
+        detect_action = QAction(icon("wand"), "Detect Cuts...", self)
         detect_action.setShortcut(QKeySequence("Ctrl+D"))
         detect_action.triggered.connect(self._on_detect_cuts)
         timeline_menu.addAction(detect_action)
 
         timeline_menu.addSeparator()
 
-        play_action = QAction("Play/Pause", self)
+        play_action = QAction(icon("play"), "Play/Pause", self)
         play_action.setShortcut("Space")
         play_action.triggered.connect(self._toggle_play)
         timeline_menu.addAction(play_action)
@@ -419,28 +453,73 @@ class MainWindow(QMainWindow):
 
     _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.mxf'}
 
+    def _get_timeline_ref(self):
+        """Return (width, height, fps) from the first existing source, or zeros."""
+        if self._sources:
+            s = next(iter(self._sources.values()))
+            return s.width, s.height, s.fps
+        return 0, 0, 0.0
+
     def _on_import(self):
-        dialog = ImportDialog(self)
+        ref_w, ref_h, ref_fps = self._get_timeline_ref()
+        dialog = ImportDialog(ref_width=ref_w, ref_height=ref_h,
+                              ref_fps=ref_fps, parent=self)
         dialog.import_complete.connect(self._on_import_complete)
         dialog.exec()
 
-    def _import_file(self, file_path: str):
-        """Import a video file directly (used by drag-and-drop)."""
+    def _import_files(self, file_paths: list):
+        """Import video files directly (used by drag-and-drop).
+        Validates resolution/FPS against existing timeline sources."""
         from utils.ffprobe import probe_video
-        info = probe_video(file_path)
-        if info is None:
-            logger.warning("Could not probe dropped file: %s", file_path)
-            return
-        source = VideoSource(
-            file_path=file_path,
-            total_frames=info.total_frames,
-            fps=info.fps,
-            width=info.width,
-            height=info.height,
-            codec=info.codec,
-        )
-        clip = Clip(source_id=source.id, source_in=0, source_out=source.total_frames - 1)
-        self._on_import_complete(source, [clip])
+        ref_w, ref_h, ref_fps = self._get_timeline_ref()
+
+        probed = []
+        for path in file_paths:
+            info = probe_video(path)
+            if info is None:
+                logger.warning("Could not probe dropped file: %s", path)
+                return
+            probed.append((path, info))
+
+        # Use first file as reference if timeline is empty
+        if ref_w == 0 and probed:
+            ref_w, ref_h, ref_fps = probed[0][1].width, probed[0][1].height, probed[0][1].fps
+
+        # Validate all files match reference
+        for path, info in probed:
+            name = os.path.basename(path)
+            if info.width != ref_w or info.height != ref_h:
+                QMessageBox.critical(
+                    self, "Import Error",
+                    f"Resolution mismatch — batch rejected.\n\n"
+                    f"{name} is {info.width}x{info.height}, "
+                    f"expected {ref_w}x{ref_h}"
+                )
+                return
+            if abs(info.fps - ref_fps) > 0.02:
+                QMessageBox.critical(
+                    self, "Import Error",
+                    f"FPS mismatch — batch rejected.\n\n"
+                    f"{name} is {info.fps:.3f} fps, "
+                    f"expected {ref_fps:.3f} fps"
+                )
+                return
+
+        results = []
+        for path, info in probed:
+            source = VideoSource(
+                file_path=path,
+                total_frames=info.total_frames,
+                fps=info.fps,
+                width=info.width,
+                height=info.height,
+                codec=info.codec,
+            )
+            clip = Clip(source_id=source.id, source_in=0,
+                        source_out=source.total_frames - 1)
+            results.append((source, clip))
+
+        self._on_import_complete(results)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -452,96 +531,167 @@ class MainWindow(QMainWindow):
                         return
 
     def dropEvent(self, event):
+        paths = []
         for url in event.mimeData().urls():
             if url.isLocalFile():
                 path = url.toLocalFile()
                 ext = os.path.splitext(path)[1].lower()
                 if ext in self._VIDEO_EXTENSIONS:
-                    self._import_file(path)
+                    paths.append(path)
+        if paths:
+            self._import_files(paths)
 
-    def _on_import_complete(self, source: VideoSource, clips):
-        self._sources[source.id] = source
-        self._reader_pool.register_source(source)
-        self._timeline.add_clips(clips)
-        self._timeline_widget.set_fps(source.fps)
+    def _on_import_complete(self, results: list):
+        """Handle import of one or more (VideoSource, Clip) pairs."""
+        if not results:
+            return
+        all_clips = []
+        for source, clip in results:
+            self._sources[source.id] = source
+            self._reader_pool.register_source(source)
+            self._proxy_manager.load_or_open(source)
+            all_clips.append(clip)
 
-        # Load any existing proxy (for scene detection reuse)
-        self._proxy_manager.load_or_open(source)
+        self._timeline.add_clips(all_clips)
+        self._timeline_widget.set_fps(results[0][0].fps)
 
         # Start thumbnail generation
         self._start_thumbnail_cache()
 
         # Show first frame
-        if clips:
+        if all_clips:
             self._timeline_widget.set_playhead(0)
 
         self._update_status()
-        logger.info("Imported %s: %d clips", source.file_path, len(clips))
+        for source, clip in results:
+            logger.info("Imported %s", source.file_path)
 
     def _on_detect_cuts(self):
-        """Run cut detection on a source. Uses the first source if only one,
-        or the source of the selected clip."""
+        """Run cut detection on all non-gap clips on the timeline.
+        Respects in/out render range when set."""
         if not self._sources:
             return
-        # Pick source: from selected clip, or first available
-        source = None
-        selected = self._timeline.get_selected_clips()
-        if selected and selected[0].source_id:
-            source = self._sources.get(selected[0].source_id)
-        if source is None:
-            source = next(iter(self._sources.values()))
 
         # Pause GPU-heavy subsystems to avoid CUDA/mpv contention during detection
         self._preview.pause()
         if self._thumbnail_cache is not None:
             self._thumbnail_cache.pause()
 
-        # Pass render range if in/out points are set
-        frame_range = None
-        if (self._timeline.in_point is not None
-                or self._timeline.out_point is not None):
+        # Determine analysis range
+        in_out_limited = (self._timeline.in_point is not None
+                          or self._timeline.out_point is not None)
+        if in_out_limited:
             r_start, r_end = self._timeline.get_render_range()
-            frame_range = (r_start, r_end)
+        else:
+            r_start = 0
+            r_end = self._timeline.get_total_duration_frames() - 1
 
-        dialog = DetectDialog(source, frame_range=frame_range, parent=self)
+        # Build segments from timeline clips within the analysis range
+        segments = []
+        # Track prefix/suffix clips for partially-clamped clips
+        self._detect_partials = {}  # clip_id -> (prefix_Clip|None, suffix_Clip|None)
+        pos = 0
+        for clip in self._timeline.clips:
+            clip_start = pos
+            clip_end = pos + clip.duration_frames - 1
+            pos += clip.duration_frames
+
+            if clip.is_gap:
+                continue
+            # Skip clips entirely outside the analysis range
+            if clip_end < r_start or clip_start > r_end:
+                continue
+
+            # Clamp clip to the analysis range
+            clamp_start = max(clip_start, r_start)
+            clamp_end = min(clip_end, r_end)
+            offset_start = clamp_start - clip_start
+            offset_end = clamp_end - clip_start
+            source_in = clip.source_in + offset_start
+            source_out = clip.source_in + offset_end
+
+            # Build prefix/suffix for partially-clamped clips
+            prefix = None
+            suffix = None
+            if offset_start > 0:
+                prefix = Clip(source_id=clip.source_id,
+                              source_in=clip.source_in,
+                              source_out=source_in - 1,
+                              color_index=clip.color_index)
+            if source_out < clip.source_out:
+                suffix = Clip(source_id=clip.source_id,
+                              source_in=source_out + 1,
+                              source_out=clip.source_out,
+                              color_index=clip.color_index)
+            if prefix or suffix:
+                self._detect_partials[clip.id] = (prefix, suffix)
+
+            segments.append((clip.source_id, source_in, source_out, clip.id))
+
+        if not segments:
+            if self._thumbnail_cache is not None:
+                self._thumbnail_cache.resume()
+            return
+
+        dialog = DetectDialog(segments, self._sources,
+                              in_out_limited=in_out_limited, parent=self)
         dialog.detection_complete.connect(self._on_detection_complete)
         dialog.exec()
+
+        # Clean up partials regardless of accept/reject
+        self._detect_partials = {}
 
         # Resume thumbnail generation after dialog closes
         if self._thumbnail_cache is not None:
             self._thumbnail_cache.resume()
 
-    def _on_detection_complete(self, source_id: str, clips):
-        """Replace all clips from this source with the detected scene clips."""
-        # Remove existing clips for this source entirely (not gap-replace)
-        self._timeline.ripple_delete_by_source(source_id)
-        # Add new scene clips
-        self._timeline.add_clips(clips)
+    def _on_detection_complete(self, results: dict):
+        """Replace analyzed clips with detected scene clips.
+        results: {clip_id: [Clip, ...]}"""
+        # Re-attach prefix/suffix clips for partially-clamped clips
+        partials = self._detect_partials
+        for clip_id, sub_clips in results.items():
+            if clip_id in partials:
+                prefix, suffix = partials[clip_id]
+                if prefix:
+                    sub_clips.insert(0, prefix)
+                if suffix:
+                    sub_clips.append(suffix)
+        self._detect_partials = {}
 
-        # Load proxy saved by scene detector
-        source = self._sources.get(source_id)
-        if source:
-            self._proxy_manager.load_or_open(source)
+        self._timeline.replace_detected(results)
+
+        # Reload proxies saved by scene detector (force reopen to pick up new data)
+        seen_sources = set()
+        for clips in results.values():
+            for clip in clips:
+                if clip.source_id and clip.source_id not in seen_sources:
+                    seen_sources.add(clip.source_id)
+                    source = self._sources.get(clip.source_id)
+                    if source:
+                        self._proxy_manager.load_or_open(source, force_reopen=True)
 
         self._start_thumbnail_cache()
 
-        if clips:
-            self._timeline_widget.set_playhead(0)
+        total_clips = sum(len(v) for v in results.values())
         self._update_status()
-        logger.info("Detected %d cuts for source %s", len(clips), source_id)
+        logger.info("Detection complete: %d clips from %d segments",
+                     total_clips, len(results))
 
     def _start_thumbnail_cache(self):
-        if self._thumbnail_cache is not None:
-            self._thumbnail_cache.stop()
-        self._thumbnail_cache = ThumbnailCache(
-            self._timeline, self._sources,
-            proxy_manager=self._proxy_manager,
-        )
-        self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
         visible = set(self._timeline_widget.strip.get_visible_clip_ids())
         playhead = self._timeline_widget.strip.playhead_frame
-        self._thumbnail_cache.generate_all(
-            priority_clip_ids=visible, playhead_frame=playhead)
+        if self._thumbnail_cache is None:
+            self._thumbnail_cache = ThumbnailCache(
+                self._timeline, self._sources,
+                proxy_manager=self._proxy_manager,
+            )
+            self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
+            self._thumbnail_cache.start(
+                priority_clip_ids=visible, playhead_frame=playhead)
+        else:
+            self._thumbnail_cache.notify_clips_changed()
+            self._thumbnail_cache.reprioritize(visible, playhead)
 
     def _on_thumbnail_ready(self, clip_id: str, position: str, qimage):
         from PySide6.QtGui import QPixmap

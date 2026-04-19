@@ -50,6 +50,8 @@ class TimelineStrip(QWidget):
     """Custom-painted timeline strip showing clips as colored blocks."""
 
     playhead_moved = Signal(int)   # timeline frame
+    scrub_started = Signal()       # user started dragging playhead
+    scrub_ended = Signal()         # user released playhead drag
     scroll_changed = Signal()      # scroll offset changed (no playhead change)
     clip_clicked = Signal(str, object)  # clip_id, QMouseEvent (for modifier keys)
     preview_frame_requested = Signal(int)  # cut-mode hover scrub (no playhead move)
@@ -419,6 +421,7 @@ class TimelineStrip(QWidget):
             # Click in ruler area = set playhead (works in both modes)
             if y < HEADER_HEIGHT:
                 self._dragging_playhead = True
+                self.scrub_started.emit()
                 frame = self._pixel_to_frame(x)
                 self.set_playhead(frame)
                 return
@@ -440,6 +443,7 @@ class TimelineStrip(QWidget):
             else:
                 # Clicked on empty space — set playhead, clear selection
                 self._dragging_playhead = True
+                self.scrub_started.emit()
                 self.set_playhead(frame)
 
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -522,7 +526,9 @@ class TimelineStrip(QWidget):
             if self._resizing_track:
                 self._resizing_track = False
                 self.setCursor(Qt.CursorShape.ArrowCursor)
-            self._dragging_playhead = False
+            if self._dragging_playhead:
+                self._dragging_playhead = False
+                self.scrub_ended.emit()
 
     def _finish_marquee_selection(self):
         """Compute which clips overlap the marquee and select them."""
@@ -622,6 +628,8 @@ class TimelineWidget(QWidget):
     """Timeline widget with strip + horizontal scrollbar."""
 
     playhead_changed = Signal(int)
+    scrub_started = Signal()
+    scrub_ended = Signal()
     clip_clicked = Signal(str, object)
     preview_frame_requested = Signal(int)
     cut_requested = Signal(int)
@@ -641,6 +649,8 @@ class TimelineWidget(QWidget):
         layout.addWidget(self._scrollbar)
 
         self._strip.playhead_moved.connect(self._on_playhead_moved)
+        self._strip.scrub_started.connect(self.scrub_started.emit)
+        self._strip.scrub_ended.connect(self.scrub_ended.emit)
         self._strip.scroll_changed.connect(self._update_scrollbar)
         self._strip.clip_clicked.connect(self.clip_clicked.emit)
         self._strip.preview_frame_requested.connect(self.preview_frame_requested.emit)

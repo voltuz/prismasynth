@@ -376,3 +376,24 @@ class TimelineModel(QObject):
         self._selected_ids.clear()
         self.clips_changed.emit()
         self.selection_changed.emit()
+
+    def replace_detected(self, replacements: dict, assign_colors: bool = True):
+        """Replace clips by ID with lists of detected sub-clips.
+        replacements: {clip_id: [Clip, ...]}. Gaps and non-matched clips are preserved."""
+        self._push_undo()
+        new_list = []
+        for c in self._clips:
+            if c.id in replacements:
+                sub_clips = replacements[c.id]
+                if assign_colors:
+                    for sc in sub_clips:
+                        if not sc.is_gap:
+                            sc.color_index = self._color_counter % 8
+                            self._color_counter += 1
+                new_list.extend(sub_clips)
+            else:
+                new_list.append(c)
+        self._clips = new_list
+        self._selected_ids.clear()
+        self.clips_changed.emit()
+        self.selection_changed.emit()

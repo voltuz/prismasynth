@@ -44,8 +44,8 @@ Three-layer design: `src/ui/` (PySide6 widgets) → `src/core/` (business logic,
 The preview widget embeds mpv for GPU-accelerated decode and display. The entire pipeline stays on GPU: NVDEC decode → GPU buffer → GPU display. No frames touch CPU RAM during scrubbing.
 
 - `PreviewWidget` creates an mpv instance embedded in a QWidget via window handle (`wid`)
-- Configured with `hwdec=auto`, `hr_seek=yes`, `keep_open=yes`, `ao=null`
-- Timeline playhead changes → `mpv.command('seek', timestamp, 'absolute+exact')`
+- Configured with `hwdec=auto`, `hr_seek=yes`, `hr_seek_framedrop=yes`, `keep_open=yes`, `ao=null`, 150MB/75MB demuxer forward/backward cache
+- Timeline playhead changes → `mpv.command_async('seek', timestamp, 'absolute+exact')` — non-blocking so the Qt main thread never stalls during 4K H.265 seeks. mpv abandons stale seeks when a new one arrives.
 - Source switching: `mpv.loadfile(path)` when crossing clip boundaries (with `wait_for_property('seekable')`)
 - Gaps: black overlay widget on top of mpv (no mpv state change — avoids stutter). Overlay hidden via `QTimer.singleShot(50ms)` after seek to prevent stale frame flash.
 - mpv initialized in `showEvent()` after widget's winId() is valid
@@ -103,7 +103,6 @@ Playback uses mpv natively (`player.pause = False`). A 60Hz QTimer (`_playback_t
 - **Exporter signals** (`progress`, `status`, `finished`, `error`) emitted from a `threading.Thread` — must use `Qt.ConnectionType.QueuedConnection` when connecting to UI slots.
 - **Thread safety:** Process list guarded by `threading.Lock`, `failed` event for early abort on segment failure, `communicate()` for safe stderr handling.
 - Image sequence export uses `_iter_frames_ffmpeg()` with per-source select filter + MJPEG pipe. Parallel frame writing via 4-worker ThreadPoolExecutor.
-- Denoised export pipes decoded frames through FastDVDnet (5-frame sliding window) to FFmpeg encoder.
 
 ### EDL Export
 
@@ -116,33 +115,34 @@ CMX 3600 EDL for import into Premiere Pro, DaVinci Resolve, Avid. Options: inclu
 
 ### Thumbnail System
 
-Viewport-prioritized thumbnail generation with playhead-distance sorting. 4 parallel ffmpeg `-ss` seeks (~38ms/frame).
+Persistent, long-lived thumbnail generator with sweep-based sequential decode. Created once per session, survives timeline edits. CPU-only decode (no NVDEC) to avoid GPU contention with mpv scrubbing.
 
 - **Visible-only scope:** Only generates thumbnails for clips currently in the timeline viewport. No forward generation beyond visible area.
-- **Playhead priority:** Within the visible set, frames closest to the playhead are generated first.
+- **Playhead sweep:** From the playhead, sweeps right (forward) then left (backward) through sorted frame targets. Within each sweep, frames within `_SEQUENTIAL_THRESHOLD` (400 frames) are decoded sequentially via PyAV (`_grab_frames_sweep`) — avoids redundant re-seeks from the same keyframe. Distant frames fall back to independent ffmpeg seeks (`_grab_frame_single`).
 - **LQ proxy placeholders:** If a `.proxy` file exists (from scene detection), instantly upscales 48x27 frames to 192x108 as blurry placeholders while HQ thumbnails load.
-- **4 parallel workers:** `ThreadPoolExecutor` with per-frame `-ss` seeks. Priority re-checked before each new submission (~100ms latency on viewport change).
-- **Pause on scrub:** `_pause_event` halts generation during playhead drag. Resumes after 500ms idle (`_thumb_resume_timer`). Viewport reprioritize debounced to 300ms (`_viewport_timer`).
-- **Memory-only cache:** `_mem_cache` dict of QImage at 192x108, keyed by `{source_id}_{frame_num}`. Regenerated fresh each session. `_ndarray_to_qimage` returns `.copy()` to prevent use-after-free across thread boundaries.
-- **`communicate()`** for subprocess cleanup — prevents Windows handle leaks over hundreds of thumbnails.
+- **6 parallel workers:** Persistent `ThreadPoolExecutor`. Sweep runs and single-frame seeks are both submitted to the pool. Each sweep opens one PyAV container, seeks once, and decodes forward through all targets.
+- **Persistent coordinator thread:** Runs for the session. `notify_clips_changed()` rebuilds the clip lookup (which frames to generate) without destroying the cache or thread pool — already-cached HQ thumbnails for unchanged frames reuse instantly. `reprioritize()` updates viewport priority on scroll.
+- **Pause on scrub:** `_pause_event` halts generation during playhead drag. Resumes after 500ms idle (`_thumb_resume_timer`). `_wake_event` signals the coordinator when there's new work. Viewport reprioritize debounced to 300ms (`_viewport_timer`).
+- **Memory-only cache:** `_mem_cache` dict of QImage at 192x108, keyed by `{source_id}_{frame_num}`. Persists across clip changes (splits, deletes). `.copy()` on QImage to prevent use-after-free across thread boundaries.
+- **GPU isolation:** Thumbnails use CPU-only ffmpeg (no `-hwaccel cuda`) to leave NVDEC exclusively for mpv scrubbing. This prevents GPU contention that would stall the preview during scrubbing.
 
 ### Proxy System (Scene Detection Only)
 
-`ProxyFile` (48x27 mmap binary) is generated during scene detection for TransNetV2 input reuse. Stored at `%LOCALAPPDATA%/prismasynth/cache/proxies/`. Managed by `ProxyManager`. Also used as LQ thumbnail placeholders.
+`ProxyFile` (48x27 mmap binary) is generated during scene detection for TransNetV2 input reuse. Stored at `%LOCALAPPDATA%/prismasynth/cache/proxies/`. Managed by `ProxyManager`. Also used as LQ thumbnail placeholders. Supports `frame_offset` (stored in `.offset` sidecar file) for proxies that don't start at source frame 0 — enables partial-range detection. `get_frame(source_frame)` subtracts the offset internally.
 
 ### Import & Scene Detection (separate steps)
 
-1. **Import** (`ImportDialog` or drag-and-drop) — probes file via ffprobe, creates a single whole-file clip. No detection.
-2. **Detect Cuts** (`DetectDialog`, Ctrl+D) — runs SceneDetector on a source, replaces its clips via `ripple_delete_by_source()`. Respects in/out render range when set.
+1. **Import** (`ImportDialog` or drag-and-drop) — multi-file select, probes all files, creates one whole-file clip per source appended sequentially. All files in a batch must share the same resolution and FPS. If the timeline already has sources, new imports must match.
+2. **Detect Cuts** (`DetectDialog`, Ctrl+D) — runs SceneDetector on **all non-gap clips** on the timeline. Each clip's source segment is processed independently through TransNetV2; cuts are forced at source boundaries. Replaces analyzed clips via `TimelineModel.replace_detected()`. Partially-clamped clips (by in/out range) get prefix/suffix clips preserved. Re-detects everything in the analysis range.
 
-Scene detection uses two decode paths: parallel 4-segment ffmpeg/NVDEC (~396 fps), single CPU fallback (~245 fps). TransNetV2 GPU inference with HSV frame differencing fallback. mpv and thumbnails are paused during detection to avoid GPU contention.
+Scene detection decode fallback chain: (1) parallel 4-segment ffmpeg with `scale_cuda` (NVDEC + GPU resize), (2) parallel 4-segment ffmpeg with CPU scale (NVDEC + CPU resize, ~396 fps), (3) single ffmpeg CPU fallback (~245 fps). Each path is probed before use. TransNetV2 GPU inference with HSV frame differencing fallback. mpv and thumbnails are paused during detection to avoid GPU contention.
 
 ### Threading Model
 
 | Thread | What | Key constraint |
 |--------|------|---------------|
 | Main (Qt) | All UI, signal slots, mpv commands | QPixmap only here |
-| Thumbnail coordinator | 4 parallel ffmpeg `-ss` seeks per visible frame | Pauses during scrubbing, priority-sorted |
+| Thumbnail coordinator | Persistent thread + 6-worker pool, sweep decode via PyAV + ffmpeg | Pauses during scrubbing, playhead-distance sweep |
 | Scene detection (QThread) | Parallel ffmpeg decode + TransNetV2 inference | Stores subprocess refs for cancellation |
 | Export | Per-segment ffmpeg subprocesses (ThreadPoolExecutor) | Signals must use QueuedConnection to UI |
 
@@ -179,3 +179,7 @@ Custom-painted strip (not Qt model/view). Clip positions computed from cumulativ
 - `run.bat` sets `PYTHON_GIL=1` for Python 3.13+ free-threaded builds — required for correct threading behavior.
 - `playback_engine.py` exists in `src/core/` but is unused — mpv handles playback natively. Retained as reference only.
 - Autosave fires every 60 seconds when the project is dirty (has unsaved changes).
+- `TimelineStrip` emits `scrub_started` / `scrub_ended` signals on playhead drag. Connected to `PreviewWidget.scrub_start()` / `scrub_end()` and used to pause/resume thumbnails.
+- `TimelineModel.replace_detected(replacements)` swaps clips by ID with detected sub-clip lists — the core integration point after scene detection. Preserves gaps and non-matched clips.
+- `ThumbnailCache` is created once and lives for the session. `_start_thumbnail_cache()` creates it on first call, subsequent calls use `notify_clips_changed()` + `reprioritize()`. Only `_on_new_project()` destroys it.
+- `ProxyManager.load_or_open(source, force_reopen=True)` is used after detection to pick up newly saved proxy files. Without `force_reopen`, cached proxies from import time would be returned.

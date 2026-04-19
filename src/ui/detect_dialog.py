@@ -16,39 +16,47 @@ logger = logging.getLogger(__name__)
 
 
 class DetectDialog(QDialog):
-    """Dialog for running cut detection on an already-imported video source."""
+    """Dialog for running cut detection on all clips currently on the timeline."""
 
-    detection_complete = Signal(str, list)  # source_id, List[Clip]
+    detection_complete = Signal(dict)  # {clip_id: [Clip, ...]}
 
-    def __init__(self, source: VideoSource, frame_range: tuple = None,
-                 parent=None):
+    def __init__(self, segments: list, sources: dict,
+                 in_out_limited: bool = False, parent=None):
+        """segments: list of (source_id, source_in, source_out, clip_id).
+        sources: {source_id: VideoSource}."""
         super().__init__(parent)
-        self._source = source
-        self._frame_range = frame_range
+        self._segments = segments
+        self._sources = sources
         self.setWindowTitle("Detect Cuts")
         self.setMinimumWidth(450)
         self.setModal(True)
 
         layout = QVBoxLayout(self)
 
-        name = source.file_path.split('/')[-1].split(chr(92))[-1]
-        if frame_range:
-            start, end = frame_range
-            range_frames = end - start + 1
-            layout.addWidget(QLabel(
-                f"{name}\n"
-                f"{source.width}x{source.height}, {source.fps:.2f} fps, "
-                f"{range_frames:,} frames (in/out range of {source.total_frames:,})"
-            ))
+        # Summary info
+        total_frames = sum(seg[2] - seg[1] + 1 for seg in segments)
+        n_sources = len({seg[0] for seg in segments})
+        n_clips = len(segments)
+
+        if n_sources == 1:
+            source = sources[segments[0][0]]
+            name = source.file_path.split('/')[-1].split(chr(92))[-1]
+            info_text = (f"{name}\n"
+                         f"{source.width}x{source.height}, {source.fps:.2f} fps, "
+                         f"{total_frames:,} frames across {n_clips} clip(s)")
+        else:
+            first_source = sources[segments[0][0]]
+            info_text = (f"{n_sources} sources, {n_clips} clip(s)\n"
+                         f"{first_source.width}x{first_source.height}, "
+                         f"{first_source.fps:.2f} fps, "
+                         f"{total_frames:,} total frames")
+
+        layout.addWidget(QLabel(info_text))
+
+        if in_out_limited:
             warn = QLabel("Detection limited to in/out render range.")
             warn.setStyleSheet("color: #e8a735; font-size: 11px;")
             layout.addWidget(warn)
-        else:
-            layout.addWidget(QLabel(
-                f"{name}\n"
-                f"{source.width}x{source.height}, {source.fps:.2f} fps, "
-                f"{source.total_frames:,} frames"
-            ))
 
         # Threshold setting
         form = QFormLayout()
@@ -103,8 +111,9 @@ class DetectDialog(QDialog):
         self._phase_start_time = self._start_time
 
         threshold = self._threshold_spin.value()
-        self._detector = SceneDetector(self._source, threshold=threshold,
-                                       frame_range=self._frame_range)
+        self._detector = SceneDetector(
+            self._segments, self._sources, threshold=threshold
+        )
         self._detector.progress.connect(self._on_progress)
         self._detector.detail_progress.connect(self._on_detail_progress)
         self._detector.phase_changed.connect(self._on_phase_changed)
@@ -121,7 +130,7 @@ class DetectDialog(QDialog):
         self._detail_label.setText(f"{phase}...")
 
     def _on_detail_progress(self, frames_done: int, total_frames: int, phase: str):
-        elapsed = time.monotonic() - self._phase_start_time
+        elapsed = time.monotonic() - self._start_time
         eta_str = ""
         if frames_done > 0 and elapsed > 1.0:
             rate = frames_done / elapsed
@@ -135,13 +144,14 @@ class DetectDialog(QDialog):
             f"{phase}: {frames_done:,} / {total_frames:,} frames{eta_str}"
         )
 
-    def _on_finished(self, clips: List[Clip]):
+    def _on_finished(self, results: dict):
         elapsed = time.monotonic() - self._start_time
+        total_clips = sum(len(v) for v in results.values())
         self._progress.setValue(100)
         self._detail_label.setText(
-            f"Done — {len(clips)} cuts found in {int(elapsed)}s"
+            f"Done — {total_clips} clips from {len(results)} segment(s) in {int(elapsed)}s"
         )
-        self.detection_complete.emit(self._source.id, clips)
+        self.detection_complete.emit(results)
         self.accept()
 
     def _on_error(self, msg: str):

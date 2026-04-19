@@ -205,10 +205,6 @@ class Exporter(QObject):
             self.status.emit(f"Error: {e}")
 
     def _export_video(self, settings: dict):
-        # Route to denoised pipeline if enabled
-        if settings.get("denoise"):
-            return self._export_video_denoised(settings)
-
         # All codecs benefit from parallel segment encoding:
         # - NVENC: exploits multiple HW decode/encode units
         # - CPU codecs (ProRes, x264, etc.): multiple processes saturate all cores
@@ -645,88 +641,6 @@ class Exporter(QObject):
 
             proc.stdout.close()
             proc.wait()
-
-    def _export_video_denoised(self, settings: dict):
-        """Export with FastDVDnet temporal denoising (pipe-through path)."""
-        from collections import deque
-        from core.fastdvdnet import load_model
-        from core.fastdvdnet.denoise import denoise_frame
-
-        width = settings["width"]
-        height = settings["height"]
-        fps = settings["fps"]
-        output_path = settings["output_path"]
-        ffmpeg_args = settings["ffmpeg_args"]
-        noise_sigma = settings.get("denoise_sigma", 25)
-
-        segments = self._build_segments()
-        if not segments:
-            self.status.emit("Nothing to export")
-            return
-
-        total_frames = sum(s[2] for s in segments)
-        self.status.emit("Loading denoiser model...")
-        device = 'cuda'
-        try:
-            model = load_model(device)
-        except Exception as e:
-            self.error.emit(f"Failed to load denoiser: {e}")
-            return
-
-        self.status.emit(f"Denoising + encoding to {output_path}...")
-
-        # Encoder process: reads raw rgb24 from stdin
-        cmd = [
-            "ffmpeg", "-y", "-v", "quiet",
-            "-f", "rawvideo", "-vcodec", "rawvideo",
-            "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-            "-r", str(fps), "-i", "-",
-        ] + ffmpeg_args + [output_path]
-
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        frame_count = 0
-        window = deque(maxlen=5)
-
-        try:
-            for frame_data in self._iter_frames_ffmpeg(width, height):
-                if self._cancelled:
-                    break
-
-                window.append(frame_data)
-
-                # Fill the 5-frame window with reflection padding at start
-                if len(window) < 5:
-                    buf = list(window)
-                    while len(buf) < 5:
-                        # Mirror: for frames [f0], pad as [f0, f0, f0, f0, f0]
-                        # For [f0, f1], pad as [f1, f0, f0, f1, f1] — simplified to repeat edges
-                        idx = 5 - len(buf) - 1
-                        buf.insert(0, window[min(idx, len(window) - 1)])
-                else:
-                    buf = list(window)
-
-                denoised = denoise_frame(model, buf, noise_sigma, device)
-                proc.stdin.write(denoised.tobytes())
-
-                frame_count += 1
-                if frame_count % max(1, total_frames // 200) == 0:
-                    self.progress.emit(min(99, int(frame_count / total_frames * 100)))
-
-        except BrokenPipeError:
-            pass
-        finally:
-            if proc.stdin:
-                proc.stdin.close()
-            proc.wait()
-
-        if proc.returncode != 0 and not self._cancelled:
-            logger.error("FFmpeg exited with code %d", proc.returncode)
-            self.status.emit(f"FFmpeg error (code {proc.returncode})")
-        elif not self._cancelled:
-            self.progress.emit(100)
-            self.status.emit(f"Video saved to {output_path}")
 
     @staticmethod
     def _save_exr(frame_rgb: np.ndarray, path: str):

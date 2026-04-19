@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QFileDialog,
     QProgressBar, QGroupBox, QLineEdit, QTabWidget, QWidget,
-    QCheckBox, QSlider, QButtonGroup, QRadioButton, QFrame,
+    QSlider, QButtonGroup, QRadioButton, QFrame,
 )
 from PySide6.QtCore import Signal, Qt
 
@@ -153,22 +153,6 @@ class ExportDialog(QDialog):
         self._quality_spin.setToolTip("Quality (lower = better, 0 = lossless)")
         self._quality_label = QLabel("Quality:")
         vform.addRow(self._quality_label, self._quality_spin)
-
-        # Denoise controls
-        self._denoise_check = QCheckBox("Denoise (FastDVDnet)")
-        self._denoise_check.setToolTip("AI temporal denoiser — uses 5-frame windows for high-quality noise removal")
-        self._denoise_sigma = QSpinBox()
-        self._denoise_sigma.setRange(5, 55)
-        self._denoise_sigma.setValue(25)
-        self._denoise_sigma.setEnabled(False)
-        self._denoise_sigma.setToolTip("5-15: light (clean sources)  |  15-30: medium (film grain)  |  30-55: heavy (noisy/low light)")
-        self._denoise_check.toggled.connect(self._denoise_sigma.setEnabled)
-        denoise_layout = QHBoxLayout()
-        denoise_layout.addWidget(self._denoise_check)
-        denoise_layout.addWidget(QLabel("Strength:"))
-        denoise_layout.addWidget(self._denoise_sigma)
-        denoise_layout.addStretch()
-        vform.addRow("", denoise_layout)
 
         self._vid_width = QSpinBox()
         self._vid_width.setRange(128, 7680)
@@ -330,8 +314,6 @@ class ExportDialog(QDialog):
                 "width": self._vid_width.value(),
                 "height": self._vid_height.value(),
                 "fps": self._vid_fps.value(),
-                "denoise": self._denoise_check.isChecked(),
-                "denoise_sigma": self._denoise_sigma.value(),
             }
         else:
             # Image sequence export

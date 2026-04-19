@@ -52,6 +52,7 @@ class PreviewWidget(QWidget):
         self._showing_black = False
         self._last_seek_time = 0.0
         self._min_seek_interval = 0.033  # ~30fps max seek rate
+        self._scrubbing = False          # True during active playhead drag
 
         # Zoom / pan state (session-only, persists across clips)
         self._zoom_mode = "fit"         # "fit" or "percent"
@@ -78,6 +79,10 @@ class PreviewWidget(QWidget):
         line_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         line_edit.setCursor(Qt.CursorShape.ArrowCursor)
         line_edit.installEventFilter(self)
+        # Watch the popup's hide event so clicking the combo while the popup
+        # is open closes it instead of immediately reopening it.
+        self._zoom_combo.view().installEventFilter(self)
+        self._zoom_popup_closed_at = 0.0
         self._zoom_combo.setStyleSheet(
             "QComboBox {"
             " background-color: #3a3a3a;"
@@ -119,6 +124,7 @@ class PreviewWidget(QWidget):
             wid=wid,
             hwdec='auto',          # NVDEC when available
             hr_seek='yes',         # frame-accurate seeking
+            hr_seek_framedrop='yes',  # skip unnecessary frames during seek decode
             keep_open='yes',       # don't close at EOF
             keep_open_pause='yes',
             osd_level=0,           # no OSD
@@ -128,6 +134,8 @@ class PreviewWidget(QWidget):
             input_vo_keyboard='no',
             ao='null',             # no audio output
             video_sync='display-resample',
+            demuxer_max_bytes=str(150 * 1024 * 1024),     # 150MB forward cache
+            demuxer_max_back_bytes=str(75 * 1024 * 1024),  # 75MB backward cache
         )
         self._player.pause = True
         self._is_playing = False
@@ -182,19 +190,34 @@ class PreviewWidget(QWidget):
         # Keep the zoom combo clickable above the overlay
         self._zoom_combo.raise_()
 
+    def scrub_start(self):
+        """Called when the user begins dragging the playhead."""
+        self._scrubbing = True
+
+    def scrub_end(self):
+        """Called when the user releases the playhead drag."""
+        self._scrubbing = False
+
     def seek_to_time(self, timestamp: float):
         """Seek to an exact timestamp (seconds). GPU-accelerated.
-        Throttled to ~30fps to prevent overwhelming mpv."""
+        Uses async seeks so the Qt main thread never blocks on mpv decode.
+        Throttled to ~30fps to prevent flooding mpv's command queue."""
         if not self._ready or self._current_source is None:
             return
         now = time.monotonic()
         if now - self._last_seek_time < self._min_seek_interval:
             return
         self._last_seek_time = now
+        self._do_seek(timestamp)
+
+    def _do_seek(self, timestamp: float):
+        """Execute a non-blocking mpv seek. mpv decodes the target frame
+        in the background and displays it when ready. If a new seek arrives
+        before the previous completes, mpv abandons the old one."""
         self._ensure_video_visible()
         hiding_overlay = self._black_overlay.isVisible()
         try:
-            self._player.command('seek', str(timestamp), 'absolute+exact')
+            self._player.command_async('seek', str(timestamp), 'absolute+exact')
         except Exception:
             return
         if hiding_overlay:
@@ -378,8 +401,16 @@ class PreviewWidget(QWidget):
         self._set_zoom_from_text(text)
 
     def eventFilter(self, obj, event):
-        # Click anywhere on the read-only lineEdit opens the dropdown popup
+        # Popup just closed — record timestamp so a click on the combo within
+        # the same gesture doesn't immediately reopen it.
+        if obj is self._zoom_combo.view() and event.type() == event.Type.Hide:
+            self._zoom_popup_closed_at = time.monotonic()
+            return super().eventFilter(obj, event)
+        # Click anywhere on the read-only lineEdit opens the dropdown popup —
+        # unless the popup was just dismissed by the same click (toggle-close).
         if obj is self._zoom_combo.lineEdit() and event.type() == event.Type.MouseButtonPress:
+            if time.monotonic() - self._zoom_popup_closed_at < 0.2:
+                return True
             self._zoom_combo.showPopup()
             return True
         return super().eventFilter(obj, event)
