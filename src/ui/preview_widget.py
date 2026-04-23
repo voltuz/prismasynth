@@ -152,9 +152,11 @@ class PreviewWidget(QWidget):
         self._player.pause = True
         self._is_playing = False
         self._player.loadfile(file_path, 'replace')
-        # Wait for file to become seekable before allowing seeks
+        # Wait for file to become seekable before allowing seeks.
+        # Timeout protects the UI thread from hanging on corrupt or
+        # unreachable files where mpv never publishes 'seekable'.
         try:
-            self._player.wait_for_property('seekable')
+            self._player.wait_for_property('seekable', timeout=5.0)
         except Exception:
             pass
         self._current_source = file_path
@@ -549,6 +551,3 @@ class PreviewWidget(QWidget):
                 pass
             self._player = None
             self._ready = False
-
-    def __del__(self):
-        self.cleanup()

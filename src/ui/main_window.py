@@ -83,9 +83,13 @@ QMenu {
     background-color: #333;
     color: #ddd;
     border: 1px solid #555;
+    padding: 4px 0;
 }
 QMenu::item {
-    padding: 4px 24px;
+    padding: 5px 28px 5px 32px;
+}
+QMenu::icon {
+    padding-left: 10px;
 }
 QMenu::item:selected {
     background-color: #5577aa;
@@ -691,7 +695,8 @@ class MainWindow(QMainWindow):
                 self._timeline, self._sources,
                 proxy_manager=self._proxy_manager,
             )
-            self._thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
+            self._thumbnail_cache.thumbnail_ready.connect(
+                self._on_thumbnail_ready, Qt.ConnectionType.QueuedConnection)
             self._thumbnail_cache.set_hq_enabled(self._timeline_widget.hq_thumbnails_enabled)
             self._thumbnail_cache.start(
                 priority_clip_ids=visible, playhead_frame=playhead)
@@ -1171,8 +1176,10 @@ class MainWindow(QMainWindow):
         self._exporter.progress.connect(dialog.set_progress, Qt.ConnectionType.QueuedConnection)
         self._exporter.status.connect(dialog.set_status, Qt.ConnectionType.QueuedConnection)
         self._exporter.finished.connect(dialog.export_finished, Qt.ConnectionType.QueuedConnection)
-        self._exporter.error.connect(lambda msg: dialog.set_status(f"Error: {msg}"),
-                                     Qt.ConnectionType.QueuedConnection)
+        self._exporter.cancelled.connect(dialog.export_cancelled, Qt.ConnectionType.QueuedConnection)
+        self._exporter.error.connect(dialog.export_failed, Qt.ConnectionType.QueuedConnection)
+        # Cancel button during an active export, and the X-close fallback.
+        dialog.cancel_requested.connect(self._exporter.cancel)
         dialog.rejected.connect(self._exporter.cancel)
         self._exporter.export(settings)
 

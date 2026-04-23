@@ -66,6 +66,7 @@ class Exporter(QObject):
     progress = Signal(int)     # percentage 0-100
     status = Signal(str)
     finished = Signal()
+    cancelled = Signal()
     error = Signal(str)
 
     def __init__(self, timeline: TimelineModel, sources: Dict[str, VideoSource],
@@ -74,11 +75,23 @@ class Exporter(QObject):
         self._timeline = timeline
         self._sources = sources
         self._cancelled = False
+        self._active_procs: List[subprocess.Popen] = []
+        self._procs_lock = threading.Lock()
+
+    def _register_proc(self, proc: subprocess.Popen):
+        with self._procs_lock:
+            self._active_procs.append(proc)
+
+    def _unregister_proc(self, proc: subprocess.Popen):
+        with self._procs_lock:
+            if proc in self._active_procs:
+                self._active_procs.remove(proc)
 
     def cancel(self):
         self._cancelled = True
-        procs = getattr(self, '_active_procs', [])
-        self._active_procs = []
+        with self._procs_lock:
+            procs = list(self._active_procs)
+            self._active_procs.clear()
         for p in procs:
             try:
                 p.kill()
@@ -142,6 +155,21 @@ class Exporter(QObject):
         return groups
 
     @staticmethod
+    def _frame_to_seek_ts(frame: int, fps: float) -> float:
+        """Convert a source frame number to a safe ffmpeg seek timestamp.
+
+        Using `frame / fps` directly can round microscopically above the
+        target frame's true PTS (because fps is an IEEE 754 approximation
+        of e.g. 24000/1001). ffmpeg's accurate-seek then drops that frame
+        and emits frame+1, producing an off-by-one segment. Subtracting
+        half a frame forces the seek target mid-way between (frame-1)
+        and frame, guaranteeing `frame` is the first frame kept.
+        """
+        if frame <= 0 or fps <= 0:
+            return 0.0
+        return (frame - 0.5) / fps
+
+    @staticmethod
     def _build_select_expr(segments, seek_frame):
         """Build FFmpeg select filter expression for given segments."""
         terms = []
@@ -165,16 +193,32 @@ class Exporter(QObject):
         need_scale = not (source_width > 0 and source_height > 0
                           and width == source_width and height == source_height)
         if is_hdr:
+            # setparams forces HDR10/BT.2020 metadata on every frame so
+            # tonemap_opencl has consistent input signalling even when
+            # the seek lands on a mid-GOP P/B frame whose per-frame
+            # metadata may be missing — otherwise the first frame of
+            # that clip passes through the tonemap uncorrected.
+            parts.append(
+                "setparams=color_primaries=bt2020:"
+                "color_trc=smpte2084:colorspace=bt2020nc")
+            # Explicit peak on the tonemap filter gives a static, movie-wide
+            # curve derived from the stream's declared color space (PQ/BT.2020),
+            # instead of per-segment auto-detection from frame samples. This
+            # avoids the "tonemap ramps in" look on each clip's first frames
+            # and ignores DV's per-scene dynamic metadata. 1000 nits is the
+            # HDR10 reference peak; tonemap_opencl takes peak in cd/m² while
+            # the CPU tonemap filter takes it relative to npl (here 100),
+            # so 1000 nits → peak=10 in that chain.
             if gpu_tonemap:
                 parts.extend([
                     "format=p010le", "hwupload",
-                    "tonemap_opencl=tonemap=hable:desat=0:peak=100:format=nv12",
+                    "tonemap_opencl=tonemap=hable:desat=0:peak=1000:format=nv12",
                     "hwdownload", "format=nv12",
                 ])
             else:
                 parts.extend([
                     "zscale=t=linear:npl=100", "format=gbrpf32le",
-                    "zscale=p=bt709", "tonemap=hable:desat=0",
+                    "zscale=p=bt709", "tonemap=hable:desat=0:peak=10",
                     "zscale=t=bt709:m=bt709:r=tv", "format=yuv420p",
                 ])
             if need_scale:
@@ -197,12 +241,17 @@ class Exporter(QObject):
                 self._export_video(settings)
             elif settings["mode"] == "image_sequence":
                 self._export_image_sequence(settings)
-            if not self._cancelled:
+            if self._cancelled:
+                self.cancelled.emit()
+            else:
                 self.finished.emit()
         except Exception as e:
             logger.exception("Export failed")
-            self.error.emit(str(e))
-            self.status.emit(f"Error: {e}")
+            if self._cancelled:
+                self.cancelled.emit()
+            else:
+                self.error.emit(str(e))
+                self.status.emit(f"Error: {e}")
 
     def _export_video(self, settings: dict):
         # All codecs benefit from parallel segment encoding:
@@ -238,49 +287,83 @@ class Exporter(QObject):
         cpu_count = os.cpu_count() or 8
         max_parallel = 6 if is_nvenc else max(2, cpu_count // 4)
 
-        # Flatten coalesced segments back out with per-source VF chains
-        flat_segments = []  # [(source_path, src_in, count, fps, vf, hw_args)]
+        # Flatten coalesced segments back out with per-source VF chains.
+        # Cache HDR detection on the group dict so probe_hdr runs once per
+        # source rather than 2-3x per export.
+        flat_segments = []  # [(source_path, src_in, count, fps, vf, hw_args, is_hdr, src_w, src_h)]
         for sid, group in groups.items():
             source = self._sources.get(sid)
-            is_hdr = probe_hdr(group["path"])
+            group["is_hdr"] = probe_hdr(group["path"])
+            is_hdr = group["is_hdr"]
             use_gpu_tm = gpu_available and is_hdr
             hw = self._gpu_hw_args(opencl_device) if use_gpu_tm else []
-            vf = self._build_vf(
-                width, height, use_gpu_tm, is_hdr=is_hdr,
-                source_width=source.width if source else 0,
-                source_height=source.height if source else 0,
-            )
+            src_w = source.width if source else 0
+            src_h = source.height if source else 0
+            # For SDR + NVENC we keep the entire pipeline on the GPU
+            # (NVDEC -> scale_cuda -> NVENC, no GPU<->CPU roundtrip).
+            # _build_segment_cmd handles the scale_cuda filter when vf is
+            # None, sized from src_w/src_h vs target width/height.
+            if is_nvenc and not is_hdr:
+                vf = None
+            else:
+                vf = self._build_vf(
+                    width, height, use_gpu_tm, is_hdr=is_hdr,
+                    source_width=src_w, source_height=src_h,
+                )
             for src_in, count in group["segments"]:
                 flat_segments.append(
                     (group["path"], src_in, count, group["fps"], vf, hw,
-                     is_hdr))
+                     is_hdr, src_w, src_h))
 
         total_frames = sum(s[2] for s in flat_segments)
         suffix = ""
-        if any(probe_hdr(g["path"]) for g in groups.values()):
+        if any(g["is_hdr"] for g in groups.values()):
             suffix = " (GPU tonemap)" if gpu_available else " (CPU tonemap)"
         self.status.emit(
             f"Encoding {len(flat_segments)} segments to {output_path}...{suffix}")
 
         def _build_segment_cmd(path, src_in, count, src_fps, vf, hw, hdr,
-                               out_file):
+                               src_w, src_h, out_file):
             """Build FFmpeg command for a single segment."""
-            ss = src_in / src_fps if src_fps > 0 else 0
+            ss = self._frame_to_seek_ts(src_in, src_fps)
             hwaccel = ["-hwaccel", "cuda"]
-            # SDR + NVENC + no filters: full GPU pipeline (zero-copy)
+            # SDR + NVENC: full GPU pipeline (zero-copy). scale_cuda
+            # handles both format conversion to NVENC-compatible yuv420p
+            # and any resolution change (e.g. 4K->1080p) in one CUDA kernel,
+            # eliminating a GPU->CPU->GPU roundtrip.
             if not vf and is_nvenc:
                 hwaccel += ["-hwaccel_output_format", "cuda"]
-                gpu_vf = "scale_cuda=format=yuv420p"
+                need_scale = (src_w > 0 and src_h > 0
+                              and (src_w != width or src_h != height))
+                if need_scale:
+                    gpu_vf = f"scale_cuda={width}:{height}:format=yuv420p"
+                else:
+                    gpu_vf = "scale_cuda=format=yuv420p"
             else:
                 gpu_vf = None
-            cmd = (["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw
-                   + hwaccel + [
-                "-ss", f"{ss:.6f}",
-                "-i", path,
-                "-frames:v", str(count),
-            ])
+            # Two-stage seek: pre-input -ss jumps to ~1s before target
+            # (keyframe-accurate, cheap); post-input -ss accurately drops
+            # the final second. The post-input stage is the one that
+            # matters — it pushes ~24 frames through the filter graph
+            # BEFORE the first output frame, which warms up the OpenCL
+            # tonemap context. Without that warmup the first output frame
+            # of some clips bypasses the tonemap (raw HDR colors).
+            PRE_SEEK_MARGIN = 1.0
+            if ss > PRE_SEEK_MARGIN:
+                pre_ss, post_ss = ss - PRE_SEEK_MARGIN, PRE_SEEK_MARGIN
+            else:
+                pre_ss, post_ss = 0.0, ss
+            cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw + hwaccel
+            if pre_ss > 0:
+                cmd += ["-ss", f"{pre_ss:.6f}"]
+            cmd += ["-i", path]
+            if post_ss > 0:
+                cmd += ["-ss", f"{post_ss:.6f}"]
+            cmd += ["-frames:v", str(count)]
             if vf:
-                cmd += ["-vf", vf]
+                # setpts=PTS-STARTPTS rebases each segment's first frame to
+                # PTS=0 so the stream-copy concat can append them cleanly.
+                cmd += ["-vf", f"setpts=PTS-STARTPTS,{vf}"]
             elif gpu_vf:
                 cmd += ["-vf", gpu_vf]
             if hdr:
@@ -289,19 +372,33 @@ class Exporter(QObject):
             if not is_nvenc:
                 threads_per = max(2, cpu_count // max_parallel)
                 cmd += ["-threads", str(threads_per)]
-            cmd += ["-r", str(fps), "-an"] + ffmpeg_args + [out_file]
+            # -fps_mode passthrough: required — without it, some clips'
+            # first output frame bypasses the tonemap filter (filter-graph
+            # initialization race, likely CFR mode emitting before the
+            # OpenCL pipeline is ready).
+            # -video_track_timescale 24000000 represents 23.976 (24000/1001),
+            # 29.97 (30000/1001), 24, 30, 60 etc. as exact-integer frame
+            # durations in the MOV/MP4 muxer. Without it the default 1/16000
+            # timebase stores jittering durations (672, 656, ...) which NLEs
+            # interpret strictly and display as duplicate frames.
+            cmd += ["-fps_mode", "passthrough",
+                    "-video_track_timescale", "24000000",
+                    "-an"] + ffmpeg_args + [out_file]
             return cmd
 
         # Single segment: encode directly to output (no temp files, no concat)
         if len(flat_segments) == 1:
-            path, src_in, count, src_fps, vf, hw, hdr = flat_segments[0]
+            (path, src_in, count, src_fps, vf, hw, hdr,
+             src_w, src_h) = flat_segments[0]
             cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
-                                     hdr, output_path)
+                                     hdr, src_w, src_h, output_path)
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            self._active_procs = [proc]
-            _, stderr_data = proc.communicate()
-            self._active_procs = []
+            self._register_proc(proc)
+            try:
+                _, stderr_data = proc.communicate()
+            finally:
+                self._unregister_proc(proc)
             if proc.returncode != 0 and not self._cancelled:
                 err = (stderr_data or b"").decode(errors="replace")[-500:]
                 raise RuntimeError(f"Encoding failed: {err}")
@@ -310,23 +407,27 @@ class Exporter(QObject):
             return
 
         # Multiple segments: temp files + parallel encode + concat
-        temp_dir = tempfile.mkdtemp(prefix="prismasynth_export_",
-                                     dir=os.path.dirname(output_path))
+        # abspath first so a bare filename doesn't yield dirname="" (mkdtemp crash).
+        # Temp extension matches the output so muxer-specific options
+        # (e.g. -video_track_timescale for MOV/MP4) take effect per-segment
+        # and are preserved by the stream-copy concat.
+        temp_dir = tempfile.mkdtemp(
+            prefix="prismasynth_export_",
+            dir=os.path.dirname(os.path.abspath(output_path)))
+        temp_ext = os.path.splitext(output_path)[1] or ".mkv"
         try:
             temp_files = []
             commands = []
-            for i, (path, src_in, count, src_fps, vf, hw, hdr) in enumerate(
-                    flat_segments):
-                tmp = os.path.join(temp_dir, f"seg_{i:04d}.mkv")
+            for i, (path, src_in, count, src_fps, vf, hw, hdr,
+                    src_w, src_h) in enumerate(flat_segments):
+                tmp = os.path.join(temp_dir, f"seg_{i:04d}{temp_ext}")
                 temp_files.append(tmp)
                 cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
-                                         hdr, tmp)
+                                         hdr, src_w, src_h, tmp)
                 commands.append((cmd, count))
 
             # Thread pool: as-soon-as-done scheduling (no batch-wait)
             frames_done = 0
-            procs_lock = threading.Lock()
-            active_procs = []
             failed = threading.Event()
 
             def _encode_segment(idx):
@@ -335,45 +436,40 @@ class Exporter(QObject):
                 cmd, _ = commands[idx]
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                with procs_lock:
-                    active_procs.append(proc)
-                _, stderr_data = proc.communicate()
-                with procs_lock:
-                    if proc in active_procs:
-                        active_procs.remove(proc)
+                self._register_proc(proc)
+                try:
+                    _, stderr_data = proc.communicate()
+                finally:
+                    self._unregister_proc(proc)
                 return idx, proc.returncode, stderr_data or b""
 
             def _kill_active():
-                with procs_lock:
-                    for p in active_procs:
-                        try:
-                            p.kill()
-                        except OSError:
-                            pass
-                    active_procs.clear()
+                with self._procs_lock:
+                    procs = list(self._active_procs)
+                for p in procs:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
 
             with ThreadPoolExecutor(max_workers=max_parallel) as pool:
                 futures = {pool.submit(_encode_segment, i): i
                            for i in range(len(commands))}
-                try:
-                    for future in as_completed(futures):
-                        if self._cancelled:
-                            _kill_active()
-                            return
-                        idx, rc, stderr = future.result()
-                        if rc != 0 and not self._cancelled:
-                            failed.set()
-                            _kill_active()
-                            err = stderr.decode(errors="replace")[-500:]
-                            logger.error("Segment %d failed (code %d): %s",
-                                         idx, rc, err)
-                            raise RuntimeError(
-                                f"Segment {idx} encoding failed: {err}")
-                        frames_done += commands[idx][1]
-                        self.progress.emit(
-                            min(90, int(frames_done / total_frames * 90)))
-                finally:
-                    self._active_procs = []
+                for future in as_completed(futures):
+                    if self._cancelled:
+                        return  # cancel() already killed procs
+                    idx, rc, stderr = future.result()
+                    if rc != 0 and not self._cancelled:
+                        failed.set()
+                        _kill_active()
+                        err = stderr.decode(errors="replace")[-500:]
+                        logger.error("Segment %d failed (code %d): %s",
+                                     idx, rc, err)
+                        raise RuntimeError(
+                            f"Segment {idx} encoding failed: {err}")
+                    frames_done += commands[idx][1]
+                    self.progress.emit(
+                        min(90, int(frames_done / total_frames * 90)))
 
             if self._cancelled:
                 return
@@ -385,10 +481,15 @@ class Exporter(QObject):
                 for tmp in temp_files:
                     escaped = tmp.replace("\\", "/").replace("'", "'\\''")
                     f.write(f"file '{escaped}'\n")
+            # -video_track_timescale applies to the final MOV/MP4 muxer;
+            # keep it on concat (not per-segment) because temp files are
+            # .mkv which would ignore it.
             concat_cmd = [
                 "ffmpeg", "-y", "-nostdin", "-v", "error",
                 "-f", "concat", "-safe", "0", "-i", concat_list,
-                "-c", "copy", output_path,
+                "-c", "copy",
+                "-video_track_timescale", "24000000",
+                output_path,
             ]
             result = subprocess.run(concat_cmd, capture_output=True)
             if result.returncode != 0 and not self._cancelled:
@@ -398,7 +499,6 @@ class Exporter(QObject):
             self.progress.emit(100)
             self.status.emit(f"Video saved to {output_path}")
         finally:
-            self._active_procs = []
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _export_video_concat_legacy(self, settings: dict):
@@ -432,8 +532,10 @@ class Exporter(QObject):
         self.status.emit(f"Encoding to {output_path} (legacy)..." +
                          (" (GPU tonemap)" if gpu_available else ""))
 
-        temp_dir = tempfile.mkdtemp(prefix="prismasynth_export_",
-                                     dir=os.path.dirname(output_path))
+        # abspath first so a bare filename doesn't yield dirname="" (mkdtemp crash).
+        temp_dir = tempfile.mkdtemp(
+            prefix="prismasynth_export_",
+            dir=os.path.dirname(os.path.abspath(output_path)))
         try:
             self._export_video_concat(
                 segments, temp_dir, output_path, fps,
@@ -447,20 +549,35 @@ class Exporter(QObject):
         """Encode each segment to a temp file, then concat."""
         temp_files = []
         commands = []
+        # Temp extension matches output (see _export_video_parallel comment).
+        temp_ext = os.path.splitext(output_path)[1] or ".mkv"
 
         for i, (source_path, src_in, duration, src_fps, _sid) in enumerate(segments):
-            ss = src_in / src_fps if src_fps > 0 else 0
-            tmp = os.path.join(temp_dir, f"seg_{i:04d}.mkv")
+            ss = self._frame_to_seek_ts(src_in, src_fps)
+            tmp = os.path.join(temp_dir, f"seg_{i:04d}{temp_ext}")
             temp_files.append(tmp)
 
+            # Two-stage seek — see _build_segment_cmd above for rationale.
+            PRE_SEEK_MARGIN = 1.0
+            if ss > PRE_SEEK_MARGIN:
+                pre_ss, post_ss = ss - PRE_SEEK_MARGIN, PRE_SEEK_MARGIN
+            else:
+                pre_ss, post_ss = 0.0, ss
+            vf_chain = f"setpts=PTS-STARTPTS,{vf}" if vf else None
             cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw_args + [
                 "-hwaccel", "cuda",
-                "-ss", f"{ss:.6f}",
-                "-i", source_path,
-                "-frames:v", str(duration),
-                "-vf", vf,
-                "-r", str(fps), "-an",
-            ] + ffmpeg_args + [tmp]
+            ]
+            if pre_ss > 0:
+                cmd += ["-ss", f"{pre_ss:.6f}"]
+            cmd += ["-i", source_path]
+            if post_ss > 0:
+                cmd += ["-ss", f"{post_ss:.6f}"]
+            cmd += ["-frames:v", str(duration)]
+            if vf_chain:
+                cmd += ["-vf", vf_chain]
+            cmd += ["-fps_mode", "passthrough",
+                    "-video_track_timescale", "24000000",
+                    "-an"] + ffmpeg_args + [tmp]
             commands.append((cmd, duration))
 
         # Execute in batches
@@ -471,34 +588,56 @@ class Exporter(QObject):
             batch = commands[batch_start:batch_start + max_parallel]
             procs = []
             for cmd, _ in batch:
-                procs.append(subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                ))
-            self._active_procs = list(procs)
+                p = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                procs.append(p)
+                self._register_proc(p)
 
-            # Wait for batch, checking for cancellation
+            # Drain stderr concurrently. Previously this path used
+            # p.wait() + p.stderr.read() after — which deadlocks when ffmpeg
+            # fills the stderr pipe buffer (~64KB) before terminating.
+            stderr_data = [b""] * len(procs)
+
+            def _drain(idx: int, proc: subprocess.Popen):
+                try:
+                    _, err = proc.communicate()
+                    stderr_data[idx] = err or b""
+                except Exception:
+                    stderr_data[idx] = b""
+
+            threads = [
+                threading.Thread(target=_drain, args=(i, p), daemon=True)
+                for i, p in enumerate(procs)
+            ]
+            for t in threads:
+                t.start()
+
+            while any(t.is_alive() for t in threads):
+                if self._cancelled:
+                    for pp in procs:
+                        try:
+                            pp.kill()
+                        except OSError:
+                            pass
+                    for t in threads:
+                        t.join(timeout=2.0)
+                    for pp in procs:
+                        self._unregister_proc(pp)
+                    return
+                for t in threads:
+                    t.join(timeout=0.25)
+
             for p in procs:
-                while p.poll() is None:
-                    if self._cancelled:
-                        for pp in procs:
-                            try:
-                                pp.kill()
-                            except OSError:
-                                pass
-                        self._active_procs = []
-                        return
-                    try:
-                        p.wait(timeout=0.5)
-                    except subprocess.TimeoutExpired:
-                        pass
-            self._active_procs = []
+                self._unregister_proc(p)
 
             # Check for segment failures
             for idx_in_batch, p in enumerate(procs):
                 if p.returncode != 0:
                     seg_idx = batch_start + idx_in_batch
-                    stderr = p.stderr.read().decode(errors="replace")[-500:]
-                    logger.error("Segment %d failed (code %d): %s", seg_idx, p.returncode, stderr)
+                    err = stderr_data[idx_in_batch].decode(
+                        errors="replace")[-500:]
+                    logger.error("Segment %d failed (code %d): %s",
+                                 seg_idx, p.returncode, err)
                     self.error.emit(f"Segment {seg_idx} encoding failed")
                     return
 
@@ -520,7 +659,9 @@ class Exporter(QObject):
         concat_cmd = [
             "ffmpeg", "-y", "-nostdin", "-v", "error",
             "-f", "concat", "-safe", "0", "-i", concat_list,
-            "-c", "copy", output_path,
+            "-c", "copy",
+            "-video_track_timescale", "24000000",
+            output_path,
         ]
         result = subprocess.run(concat_cmd, capture_output=True)
         if result.returncode != 0 and not self._cancelled:
@@ -607,7 +748,7 @@ class Exporter(QObject):
                 select_expr=select_expr, fps=group["fps"],
             )
 
-            ss = seek_frame / group["fps"] if group["fps"] > 0 else 0
+            ss = self._frame_to_seek_ts(seek_frame, group["fps"])
             dur = (last_frame - seek_frame) / group["fps"] if group["fps"] > 0 else 0
 
             decode_cmd = ["ffmpeg", "-nostdin", "-v", "quiet"] + hw_args + [
@@ -621,26 +762,44 @@ class Exporter(QObject):
 
             proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL)
-            buf = bytearray()
-            expected = group["total_frames"]
-            frames_read = 0
-            while frames_read < expected and not self._cancelled:
-                raw = proc.stdout.read(frame_size * 10)
-                if not raw:
-                    break
-                buf.extend(raw)
-                while len(buf) >= frame_size and frames_read < expected:
-                    frame = np.frombuffer(bytes(buf[:frame_size]),
-                                          np.uint8).reshape(height, width, 3)
-                    del buf[:frame_size]
-                    yield frame
-                    frames_read += 1
-                    frame_count += 1
-                    if total > 0 and frame_count % max(1, total // 200) == 0:
-                        self.progress.emit(min(99, int(frame_count / total * 100)))
-
-            proc.stdout.close()
-            proc.wait()
+            self._register_proc(proc)
+            try:
+                buf = bytearray()
+                expected = group["total_frames"]
+                frames_read = 0
+                while frames_read < expected and not self._cancelled:
+                    raw = proc.stdout.read(frame_size * 10)
+                    if not raw:
+                        break
+                    buf.extend(raw)
+                    while len(buf) >= frame_size and frames_read < expected:
+                        frame = np.frombuffer(bytes(buf[:frame_size]),
+                                              np.uint8).reshape(height, width, 3)
+                        del buf[:frame_size]
+                        yield frame
+                        frames_read += 1
+                        frame_count += 1
+                        if total > 0 and frame_count % max(1, total // 200) == 0:
+                            self.progress.emit(min(99, int(frame_count / total * 100)))
+            finally:
+                # Always clean up, even if the consumer raised or we broke
+                # out early. Kill first so proc.wait() returns promptly;
+                # closing stdout on its own can hang when ffmpeg is still
+                # writing frames.
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                self._unregister_proc(proc)
 
     @staticmethod
     def _save_exr(frame_rgb: np.ndarray, path: str):

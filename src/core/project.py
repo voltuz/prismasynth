@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -47,8 +48,13 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
     for c in clips:
         data["clips"].append(c.to_dict())
 
-    with open(filepath, "w", encoding="utf-8") as f:
+    # Write to a temp file then atomically rename, so a crash or power loss
+    # mid-write (especially under the 60s autosave) cannot destroy the
+    # existing project file.
+    tmp_path = filepath + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_path, filepath)
     logger.info("Project saved to %s", filepath)
 
 

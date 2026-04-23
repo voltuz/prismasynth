@@ -77,6 +77,7 @@ class ExportDialog(QDialog):
     """Export settings dialog for video and image sequence export."""
 
     export_requested = Signal(dict)  # settings dict
+    cancel_requested = Signal()      # user hit Cancel during an active export
 
     def __init__(self, default_width: int = 1920, default_height: int = 1080,
                  default_fps: float = 24.0, total_frames: int = 0,
@@ -265,10 +266,14 @@ class ExportDialog(QDialog):
         self._export_btn = QPushButton("Export")
         self._export_btn.clicked.connect(self._start_export)
         btn_layout.addWidget(self._export_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+        btn_layout.addWidget(self._cancel_btn)
         layout.addLayout(btn_layout)
+
+        # Dialog state: "idle" (before run), "running", "done" (finished or
+        # cancelled). The cancel button's label and action depend on this.
+        self._state = "idle"
 
     def _selected_codec_key(self):
         btn = self._codec_group.checkedButton()
@@ -336,6 +341,7 @@ class ExportDialog(QDialog):
         self._progress_label.setVisible(True)
         import time
         self._export_start_time = time.monotonic()
+        self._set_state("running")
         self.export_requested.emit(settings)
 
     def set_progress(self, pct: int):
@@ -380,3 +386,36 @@ class ExportDialog(QDialog):
         self._status_label.setText("Export complete!")
         self._export_btn.setEnabled(True)
         self._progress.setValue(100)
+        self._set_state("done")
+
+    def export_cancelled(self):
+        self._status_label.setText("Export cancelled.")
+        self._export_btn.setEnabled(True)
+        self._set_state("done")
+
+    def export_failed(self, msg: str):
+        # Stay in idle so the user can retry without reopening the dialog.
+        self._status_label.setText(f"Error: {msg}")
+        self._export_btn.setEnabled(True)
+        self._set_state("idle")
+
+    def _on_cancel_clicked(self):
+        if self._state == "running":
+            # Cancel the active export, keep the dialog open so the user
+            # sees the "Cancelling…" / "Export cancelled." status update.
+            self._status_label.setText("Cancelling...")
+            self._cancel_btn.setEnabled(False)
+            self.cancel_requested.emit()
+        else:
+            # Idle or done — just close.
+            self.reject()
+
+    def _set_state(self, state: str):
+        self._state = state
+        if state == "idle":
+            self._cancel_btn.setText("Cancel")
+        elif state == "running":
+            self._cancel_btn.setText("Cancel Export")
+        elif state == "done":
+            self._cancel_btn.setText("Close")
+        self._cancel_btn.setEnabled(True)

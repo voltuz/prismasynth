@@ -22,7 +22,14 @@ venv\Scripts\python src\main.py
 
 Requires FFmpeg + ffprobe on PATH, `libmpv-2.dll` in `src/` (from mpv.io builds). Python 3.11+.
 
-**No tests or CI.** There is no test suite — verify changes by running the app.
+## Development tooling (`scripts/`)
+
+No unit-test framework, but three dev scripts exercise real code paths for correctness and perf regression tracking. All take `--video PATH` (repeatable) and support `--skip SECTION`.
+
+- **`scripts/system_check.py`** — correctness harness. Runs the real `Exporter` class via a `QCoreApplication` event loop, checks frame-accuracy against source, CMX 3600 EDL structure, MOV timebase integrity, NVENC `scale_cuda` output dims, data-model fuzz invariants. Hard-fails on regression. ~70s end-to-end with two sample videos. **Run before committing export-pipeline changes.**
+- **`scripts/perf_benchmark.py`** — perf timing harness. Exercises decode / thumbnail / scene-detection / export speed via hand-rolled FFmpeg commands (NOT through `Exporter`, so doesn't validate production correctness — use `system_check.py` for that). ~110s.
+- **`scripts/cut_inspect.py`** — mpv-embedded Qt GUI. Load an exported video, visually mark cut boundaries with the scrubber, extract ±2 frames around each cut for frame-by-frame inspection. Useful for diagnosing visual anomalies at clip transitions.
+- **`scripts/export_diag.py`** — one-shot CLI that runs a single segment through multiple ffmpeg config variants (two-stage seek, single seek, CPU decode, NVENC, etc.) and reports first-frame hashes. Useful for isolating ffmpeg-config-specific export issues.
 
 ## Architecture
 
@@ -94,15 +101,21 @@ Playback uses mpv natively (`player.pause = False`). A 60Hz QTimer (`_playback_t
 - **Segment coalescing:** `_build_source_groups()` groups clips by source and merges contiguous clips into single segments, reducing FFmpeg process count.
 - **Parallel encoding:** `ThreadPoolExecutor` with as-soon-as-done scheduling. NVENC: 6 workers. CPU codecs: scales with `cpu_count // 4`, each with `-threads` for internal parallelism.
 - **Single-segment bypass:** When coalescing produces 1 segment, encodes directly to output file (no temp dir, no concat).
-- **HDR detection:** `probe_hdr()` in `ffprobe.py` checks `color_transfer` + `color_primaries`. SDR sources skip tonemap entirely.
-- **SDR zero-copy (NVENC):** `-hwaccel_output_format cuda` + `scale_cuda=format=yuv420p` — frames never touch CPU.
-- **HDR tonemap:** GPU path uses `tonemap_opencl=hable`, CPU fallback uses `zscale` chain. Output tagged with `-colorspace bt709 -color_trc bt709 -color_primaries bt709`.
+- **HDR detection:** `probe_hdr()` in `ffprobe.py` checks `color_transfer` + `color_primaries`. SDR sources skip tonemap entirely. Cached on the group dict (`group["is_hdr"]`) so it runs once per source, not per segment.
+- **SDR zero-copy (NVENC):** `-hwaccel_output_format cuda` + `scale_cuda={w}:{h}:format=yuv420p` — the entire pipeline (NVDEC → scale_cuda → NVENC) stays on GPU, including downscales like 4K→1080p. `_build_vf` returns `None` for SDR+NVENC so the GPU filter chain in `_build_segment_cmd` takes over.
+- **HDR tonemap:** GPU path uses `tonemap_opencl=hable:desat=0:peak=1000` (peak in cd/m²), CPU fallback uses `zscale` chain with `tonemap=hable:desat=0:peak=10` (peak relative to npl=100). Output tagged with `-colorspace bt709 -color_trc bt709 -color_primaries bt709`. Explicit `peak` avoids per-segment auto-detection "ramp-up" — curve is movie-wide, derived from the stream's declared color space.
+- **HDR metadata safety:** Filter chain prepends `setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc` so `tonemap_opencl` has consistent signalling even when the seek lands on a mid-GOP P/B frame whose per-frame metadata is missing — otherwise the first frame of that clip can bypass the tonemap.
 - **Skip-same-res scale:** When output dimensions match source, the CPU `scale` filter is omitted entirely.
-- **Frame accuracy:** `-frames:v N` (integer frame count) replaces time-based `-t` to eliminate float rounding. Pre-input `-ss` with `-accurate_seek` (default) for seek precision.
+- **Frame accuracy:** `-frames:v N` (integer frame count) replaces time-based `-t` to eliminate float rounding. Seek timestamps go through `Exporter._frame_to_seek_ts(frame, fps)` which returns `(frame - 0.5) / fps` — the half-frame margin defeats IEEE 754 off-by-one when `src_in / fps` rounds microscopically above the target frame's true PTS, causing ffmpeg's accurate-seek to drop the target frame and emit `target+1`.
+- **Two-stage seek:** pre-input `-ss` lands ~1s before target (keyframe-accurate, cheap via NVDEC); post-input `-ss 1.0` does the final second accurately. The post-input stage is load-bearing — it pushes ~24 frames through the filter graph before the first output frame, warming up the OpenCL tonemap context. Without it, the first frame of some clips bypasses tonemap entirely.
+- **`-fps_mode passthrough` is required** — without it, a filter-graph init race causes some clips' first output frame to skip the tonemap filter.
+- **`-video_track_timescale 24000000`** on both per-segment encode AND the concat command — gives clean integer frame durations for all broadcast/cinema rates (23.976: 1001000 ticks, 29.97: 800800, 24/30/60: also integer). The default 1/16000 timebase stores jittering 672/656 durations that NLEs like Resolve interpret strictly and display as duplicate frames. Temp-file extension matches the output extension so the muxer option actually lands (MKV ignores it).
+- **`setpts=PTS-STARTPTS`** at the top of CPU filter chains — rebases each segment's first frame to PTS=0 so the stream-copy concat appends cleanly. Not used on the zero-copy GPU path (scale_cuda chain).
 - **Codec presets:** H.264, H.265 (CPU + NVENC), ProRes 422 (`prores_aw` for profiles 0-3, `prores_ks` for 4444), FFV1 lossless (`-slices 4`). NVENC uses `-rc vbr -cq` (not `-crf`).
-- **Exporter signals** (`progress`, `status`, `finished`, `error`) emitted from a `threading.Thread` — must use `Qt.ConnectionType.QueuedConnection` when connecting to UI slots.
-- **Thread safety:** Process list guarded by `threading.Lock`, `failed` event for early abort on segment failure, `communicate()` for safe stderr handling.
-- Image sequence export uses `_iter_frames_ffmpeg()` with per-source select filter + MJPEG pipe. Parallel frame writing via 4-worker ThreadPoolExecutor.
+- **Exporter signals** (`progress`, `status`, `finished`, `cancelled`, `error`) emitted from a `threading.Thread` — must use `Qt.ConnectionType.QueuedConnection` when connecting to UI slots. `cancelled` distinguishes user-abort from exception so the dialog shows "Export cancelled" instead of "Error".
+- **Subprocess tracking:** All `Popen` instances go through `Exporter._register_proc()` / `_unregister_proc()` under `self._procs_lock`. `cancel()` reads the list under lock and kills every live process — safe across parallel, single-segment, legacy-concat, and image-sequence paths. The image-sequence decoder wraps its loop in `try/finally` to kill+wait the subprocess even if the consumer raises mid-iteration.
+- **Concat drain threads:** legacy path spawns a thread per segment that calls `proc.communicate()` — drains stderr concurrently to prevent the classic `wait() + stderr.read()` deadlock when ffmpeg fills a stderr pipe buffer.
+- Image sequence export uses `_iter_frames_ffmpeg()` with per-source select filter + rawvideo pipe. Parallel frame writing via 4-worker ThreadPoolExecutor.
 
 ### EDL Export
 
@@ -173,8 +186,15 @@ Custom-painted strip (not Qt model/view). Clip positions computed from cumulativ
 - `load_source()` calls `_ensure_video_visible()` first — without this, `wait_for_property('seekable')` hangs if `vid='no'` was set by `clear_frame()`.
 - Pause mpv and thumbnail cache before scene detection to prevent GPU contention crashes.
 - All FFmpeg commands should include `-nostdin` (prevents stdin reads on Windows) and `-v error` (consistent error capture).
-- Export uses `-frames:v N` (not `-t`) for frame-accurate output. Pre-input `-ss` for fast seeking.
+- Export uses `-frames:v N` (not `-t`) for frame-accurate output. Pre-input `-ss` timestamps go through `Exporter._frame_to_seek_ts()` (half-frame margin) — never use `src_in / fps` directly.
+- Export temp-file extension matches the output extension (`.mov` for ProRes, `.mp4` for H.264/5, `.mkv` for FFV1). Hardcoding `.mkv` would silently drop muxer options like `-video_track_timescale` on non-Matroska outputs.
+- Export subprocesses MUST be registered via `Exporter._register_proc()`. Never write to `self._active_procs` directly.
+- `ExportDialog` cancel button is state-driven: "Cancel" (idle, closes dialog) → "Cancel Export" (running, emits `cancel_requested` signal) → "Close" (done/finished, closes). `Exporter.cancelled` signal transitions the dialog to the "done" state with "Export cancelled." status.
 - EDL timecodes use time-based conversion (`frame/fps`) with `round()`, not frame-counting (`frame // fps_int`). SRC_OUT is anchored to SRC_IN + duration for exact frame counts.
+- `TimelineModel.set_in_point()` / `set_out_point()` reject invalid inputs (would make In >= Out) instead of silently wiping the opposite marker — in/out changes are not undoable, so a silent wipe destroys data.
+- `TimelineModel.add_clips([])` and `replace_detected({})` early-return without pushing undo (would clobber the redo stack on empty ops like a failed import).
+- `save_project()` writes to `filepath + ".tmp"` then `os.replace()` — atomic, so the 60s autosave can't destroy the project mid-write.
+- `PreviewWidget.load_source()` passes `timeout=5.0` to `wait_for_property('seekable')` — without a timeout, a corrupt or unreachable file would hang the UI thread.
 - Thumbnail subprocess must use `communicate()` (not `stdout.read()` + `wait()`) to prevent Windows handle leaks.
 - `run.bat` sets `PYTHON_GIL=1` for Python 3.13+ free-threaded builds — required for correct threading behavior.
 - `playback_engine.py` exists in `src/core/` but is unused — mpv handles playback natively. Retained as reference only.

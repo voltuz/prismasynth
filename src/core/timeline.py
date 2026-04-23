@@ -125,6 +125,8 @@ class TimelineModel(QObject):
     # --- Mutations ---
 
     def add_clips(self, clips: List[Clip], assign_colors: bool = True):
+        if not clips:
+            return
         self._push_undo()
         if assign_colors:
             for c in clips:
@@ -247,17 +249,24 @@ class TimelineModel(QObject):
         return self._out_point
 
     def set_in_point(self, frame: Optional[int]):
+        # Reject values that would invalidate the pair instead of silently
+        # wiping the opposite marker (in/out is not undoable, so a wipe
+        # destroys data the user cannot recover).
+        if (frame is not None and self._out_point is not None
+                and frame >= self._out_point):
+            return
+        if self._in_point == frame:
+            return
         self._in_point = frame
-        if self._in_point is not None and self._out_point is not None:
-            if self._in_point >= self._out_point:
-                self._out_point = None
         self.in_out_changed.emit()
 
     def set_out_point(self, frame: Optional[int]):
+        if (frame is not None and self._in_point is not None
+                and frame <= self._in_point):
+            return
+        if self._out_point == frame:
+            return
         self._out_point = frame
-        if self._in_point is not None and self._out_point is not None:
-            if self._out_point <= self._in_point:
-                self._in_point = None
         self.in_out_changed.emit()
 
     def clear_in_out(self):
@@ -380,6 +389,11 @@ class TimelineModel(QObject):
     def replace_detected(self, replacements: dict, assign_colors: bool = True):
         """Replace clips by ID with lists of detected sub-clips.
         replacements: {clip_id: [Clip, ...]}. Gaps and non-matched clips are preserved."""
+        # Drop entries with empty sub-clips — would silently delete the original
+        # without leaving a gap, violating the "non-matched clips preserved" rule.
+        replacements = {k: v for k, v in replacements.items() if v}
+        if not replacements:
+            return
         self._push_undo()
         new_list = []
         for c in self._clips:
