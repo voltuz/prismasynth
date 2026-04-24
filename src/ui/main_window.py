@@ -11,11 +11,12 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 
+from version import __version__
 from core.timeline import TimelineModel
 from core.clip import Clip
 from core.video_source import VideoSource
 from core.video_reader import VideoReaderPool
-from core.edl_exporter import export_edl
+from core.xml_exporter import export_fcpxml
 from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
 from core.proxy_cache import ProxyManager
@@ -180,7 +181,7 @@ QTabBar::tab:selected {
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PrismaSynth")
+        self.setWindowTitle(f"PrismaSynth v{__version__}")
         self.setMinimumSize(1024, 600)
         self.resize(1400, 800)
         self.setAcceptDrops(True)
@@ -437,9 +438,9 @@ class MainWindow(QMainWindow):
         export_img_action.triggered.connect(self._on_export_images)
         timeline_menu.addAction(export_img_action)
 
-        edl_action = QAction(icon("document"), "Export EDL...", self)
-        edl_action.triggered.connect(self._on_export_edl)
-        timeline_menu.addAction(edl_action)
+        xml_action = QAction(icon("document"), "Export XML (FCPXML)...", self)
+        xml_action.triggered.connect(self._on_export_xml)
+        timeline_menu.addAction(xml_action)
 
         timeline_menu.addSeparator()
 
@@ -1116,11 +1117,11 @@ class MainWindow(QMainWindow):
     def _on_export_images(self):
         self._show_export_dialog(tab=1)
 
-    def _on_export_edl(self):
+    def _on_export_xml(self):
         if self._timeline.clip_count == 0:
-            QMessageBox.information(self, "Export EDL", "No clips to export.")
+            QMessageBox.information(self, "Export XML", "No clips to export.")
             return
-        from ui.edl_dialog import EdlDialog
+        from ui.xml_dialog import XmlDialog
         clip_count = self._timeline.real_clip_count
         total_frames = sum(c.duration_frames for c in self._timeline.clips
                            if not c.is_gap)
@@ -1128,16 +1129,16 @@ class MainWindow(QMainWindow):
         fps = first_source.fps if first_source else 24.0
         has_range = (self._timeline.in_point is not None
                      or self._timeline.out_point is not None)
-        dialog = EdlDialog(clip_count, total_frames, fps,
+        dialog = XmlDialog(clip_count, total_frames, fps,
                            has_render_range=has_range, parent=self)
         dialog.export_requested.connect(
-            lambda s: self._run_edl_export(s, dialog))
+            lambda s: self._run_xml_export(s, dialog))
         dialog.exec()
 
-    def _run_edl_export(self, settings: dict, dialog):
+    def _run_xml_export(self, settings: dict, dialog):
         first_source = next(iter(self._sources.values()), None)
         fps = first_source.fps if first_source else 24.0
-        export_edl(
+        export_fcpxml(
             self._timeline, self._sources, settings["output_path"],
             include_gaps=settings["include_gaps"],
             use_render_range=settings["use_render_range"],
@@ -1196,7 +1197,7 @@ class MainWindow(QMainWindow):
         if self._project_path:
             name = os.path.basename(self._project_path)
         dirty = " *" if self._dirty else ""
-        self.setWindowTitle(f"PrismaSynth — {name}{dirty}")
+        self.setWindowTitle(f"PrismaSynth v{__version__} — {name}{dirty}")
 
     def _on_new_project(self):
         if not self._confirm_discard():

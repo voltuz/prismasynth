@@ -52,8 +52,10 @@ def main():
         except Exception:
             pass
 
+    from version import __version__
     app = QApplication(sys.argv)
     app.setApplicationName("PrismaSynth")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
 
     icon_path = os.path.join(_src_dir, "app.ico")

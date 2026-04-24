@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with TransNetV2 (GPU neural network), review/delete/split clips on a timeline, export as video, image sequence, or EDL. Single-track editor — no layers, no compositing.
+PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with TransNetV2 (GPU neural network), review/delete/split clips on a timeline, export as video, image sequence, or FCPXML. Single-track editor — no layers, no compositing.
 
 ## Running
 
@@ -26,7 +26,7 @@ Requires FFmpeg + ffprobe on PATH, `libmpv-2.dll` in `src/` (from mpv.io builds)
 
 No unit-test framework, but three dev scripts exercise real code paths for correctness and perf regression tracking. All take `--video PATH` (repeatable) and support `--skip SECTION`.
 
-- **`scripts/system_check.py`** — correctness harness. Runs the real `Exporter` class via a `QCoreApplication` event loop, checks frame-accuracy against source, CMX 3600 EDL structure, MOV timebase integrity, NVENC `scale_cuda` output dims, data-model fuzz invariants. Hard-fails on regression. ~70s end-to-end with two sample videos. **Run before committing export-pipeline changes.**
+- **`scripts/system_check.py`** — correctness harness. Runs the real `Exporter` class via a `QCoreApplication` event loop, checks frame-accuracy against source, FCPXML frame-exact fractions, MOV timebase integrity, NVENC `scale_cuda` output dims, data-model fuzz invariants. Hard-fails on regression. ~70s end-to-end with two sample videos. **Run before committing export-pipeline changes.**
 - **`scripts/perf_benchmark.py`** — perf timing harness. Exercises decode / thumbnail / scene-detection / export speed via hand-rolled FFmpeg commands (NOT through `Exporter`, so doesn't validate production correctness — use `system_check.py` for that). ~110s.
 - **`scripts/cut_inspect.py`** — mpv-embedded Qt GUI. Load an exported video, visually mark cut boundaries with the scrubber, extract ±2 frames around each cut for frame-by-frame inspection. Useful for diagnosing visual anomalies at clip transitions.
 - **`scripts/export_diag.py`** — one-shot CLI that runs a single segment through multiple ffmpeg config variants (two-stage seek, single seek, CPU decode, NVENC, etc.) and reports first-frame hashes. Useful for isolating ffmpeg-config-specific export issues.
@@ -37,7 +37,7 @@ Three-layer design: `src/ui/` (PySide6 widgets) → `src/core/` (business logic,
 
 **Entry point:** `src/main.py` → `MainWindow` in `src/ui/main_window.py` (the orchestrator that wires everything together). `main.py` adds `src/` to `sys.path`, sets dark Fusion theme, and installs an exception hook that writes to `src/crash.log`.
 
-**Menu bar:** File, Edit, Timeline. Timeline menu contains Import, Export Video/Image/EDL, Detect Cuts, Play/Pause.
+**Menu bar:** File, Edit, Timeline. Timeline menu contains Import, Export Video/Image/XML, Detect Cuts, Play/Pause.
 
 ### Data Model
 
@@ -117,14 +117,18 @@ Playback uses mpv natively (`player.pause = False`). A 60Hz QTimer (`_playback_t
 - **Concat drain threads:** legacy path spawns a thread per segment that calls `proc.communicate()` — drains stderr concurrently to prevent the classic `wait() + stderr.read()` deadlock when ffmpeg fills a stderr pipe buffer.
 - Image sequence export uses `_iter_frames_ffmpeg()` with per-source select filter + rawvideo pipe. Parallel frame writing via 4-worker ThreadPoolExecutor.
 
-### EDL Export
+### XML Export (FCPXML 1.9)
 
-CMX 3600 EDL for import into Premiere Pro, DaVinci Resolve, Avid. Options: include/exclude gaps, use in/out render range.
+Only supported timeline-interchange format. FCPXML encodes positions as rational fractions (`frames * 1001/24000s` for NTSC 23.976), so there is no timecode-to-frame conversion on the importer side. Resolve seeks the source file by time, and an accurate time maps 1:1 to the correct source frame. EDL was removed — its CMX 3600 timecode strings forced Resolve through a lossy NDF interpretation that drifted ±1 frame with no reliable client-side fix.
 
-- **Time-based timecode conversion:** `frame/fps → actual time → NDF TC` using `round()`. This matches how Resolve derives timecodes from source PTS. Frame-counting (`frame // fps_int`) diverges at non-integer FPS (23.976, 29.97) by ~1 frame per 1000 frames.
-- **Anchored durations:** SRC_OUT = SRC_IN_tc + duration (frame-counting from anchor). This preserves exact frame counts while SRC_IN uses time-based positioning.
-- **Chained record timecodes:** REC_IN/OUT chain as a running TC total — no gaps between clips.
-- Source path comments (`* SOURCE FILE:`) for NLE relinking.
+- **Use the TRUE frame duration per rate:** `_rate_to_frame_duration(fps)` returns `(1001, 24000)` for 23.976, `(1001, 30000)` for 29.97, `(1, 25)` for 25, etc. We briefly tried emitting `(1, 24)` for 23.976 to "match" Resolve's internal 23.976/24 naming conflation — this broke the frame mapping: `start="2769/24s"` = 115.375s, but true frame 2769 is at 115.490s, so Resolve's time-based seek loaded file frame 2766 (−3 drift). The correct fraction is `2769*1001/24000s` which Resolve time-seeks to exactly file frame 2769. Confirmed empirically — see `scripts/system_check.py::section_export_xml`.
+- **Asset-clip `start` nudge (`_src_seek_str`):** every asset-clip `start` gets a `+frame_num/2` added to its numerator — for NTSC 23.976 that's `(N*1001 + 500)/24000s` instead of `(N*1001)/24000s`. *Why:* Resolve rewrites imported NTSC assets as `frameDuration="1/24s"` internally and rounds our `start` to the nearest `1/24` tick. For `N mod 1000 < 500`, that tick falls just below frame N's PTS, and Resolve's time-based seek loads frame N−1 ("first frame from previous clip" drift, observed on ~half the clips of test_08.psynth). The +500 numerator lands `start` mid-way through frame N's PTS range — well inside the range for either rounding direction. Duration and offset do NOT get nudged (they're timeline positions/lengths, not source seeks). Verified drift-free on all 16 clips of test_08.psynth.
+- **Frame-exact fractions:** `_time_str(frames, num, den)` emits `(frames*num)/den s` with a common denominator so every time in the document is an integer multiple of the frame duration. Asset-clip `start` uses `_src_seek_str` which adds the NTSC-rounding nudge above.
+- **`<media-rep>` child:** source URI goes in a `<media-rep kind="original-media" src="..."/>` child element on the asset, not an `src` attribute — matches Resolve's own export convention.
+- **File URIs:** `pathlib.Path.as_uri()` produces percent-encoded `file:///C:/...` URLs — already safe for direct XML embedding (no `&`, `<`, `>`, or `"` after encoding).
+- **Spine layout:** one `<asset-clip>` per real clip. `offset` = cumulative timeline position (packed if `include_gaps=False`, absolute-in-render-range if `True`). `start` = source in-point as a fraction. Gaps (when included) emit `<gap>` elements.
+- **Asset reuse:** one `<asset>` per *source* file (not per clip), IDs assigned in discovery order as `r2`, `r3`, etc. (`r1` is reserved for the `<format>`).
+- **Remaining ±1 drift trace:** source-file container timebase, not this exporter. MOVs exported with pre-v0.2.0 PrismaSynth use `time_base=1/16000`, which can't represent 23.976 exactly (667 vs 668 tick frames averaging). Re-export the source with current PrismaSynth (`-video_track_timescale 24000000`) for clean frame math end-to-end.
 
 ### Thumbnail System
 
@@ -190,7 +194,7 @@ Custom-painted strip (not Qt model/view). Clip positions computed from cumulativ
 - Export temp-file extension matches the output extension (`.mov` for ProRes, `.mp4` for H.264/5, `.mkv` for FFV1). Hardcoding `.mkv` would silently drop muxer options like `-video_track_timescale` on non-Matroska outputs.
 - Export subprocesses MUST be registered via `Exporter._register_proc()`. Never write to `self._active_procs` directly.
 - `ExportDialog` cancel button is state-driven: "Cancel" (idle, closes dialog) → "Cancel Export" (running, emits `cancel_requested` signal) → "Close" (done/finished, closes). `Exporter.cancelled` signal transitions the dialog to the "done" state with "Export cancelled." status.
-- EDL timecodes use time-based conversion (`frame/fps`) with `round()`, not frame-counting (`frame // fps_int`). SRC_OUT is anchored to SRC_IN + duration for exact frame counts.
+- Timeline interchange is FCPXML only (`core.xml_exporter.export_fcpxml`). Asset-clip `start` uses `_src_seek_str` which adds a `+frame_num/2` nudge to the numerator for NTSC rates — without it Resolve's internal `1/24` rounding drops half the clips to frame N−1. Don't revert to plain `_time_str` for the `start` attribute.
 - `TimelineModel.set_in_point()` / `set_out_point()` reject invalid inputs (would make In >= Out) instead of silently wiping the opposite marker — in/out changes are not undoable, so a silent wipe destroys data.
 - `TimelineModel.add_clips([])` and `replace_detected({})` early-return without pushing undo (would clobber the redo stack on empty ops like a failed import).
 - `save_project()` writes to `filepath + ".tmp"` then `os.replace()` — atomic, so the 60s autosave can't destroy the project mid-write.

@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.WARNING)
 
 SECTIONS = ("env", "compile", "model", "project", "thumb_accuracy",
             "export_accuracy", "export_timebase", "export_multi_segment",
-            "export_hdr", "export_image_sequence", "export_edl",
+            "export_hdr", "export_image_sequence", "export_xml",
             "export_nvenc")
 
 
@@ -1004,114 +1004,138 @@ def section_export_image_sequence(videos: List[Path]) -> SectionResult:
                          failures=failures)
 
 
-# -------------------- section: export_edl -------------------------------
+# -------------------- section: export_xml -------------------------------
 
-def section_export_edl() -> SectionResult:
-    """Build a timeline and verify the generated EDL is valid CMX 3600:
-    sequential events, chained REC timecodes, correct duration math."""
-    header("Export: EDL (CMX 3600)")
+def section_export_xml() -> SectionResult:
+    """Build a timeline, export FCPXML, and verify:
+      * file parses as XML
+      * root is <fcpxml version="1.9">
+      * one <format> with expected frameDuration for NTSC 23.976
+      * one <asset> per source used, with correct per-asset duration
+      * spine has N asset-clips with frame-exact start/duration fractions
+    Frame-exact == no floating-point drift from source frame number to the
+    XML time fraction. This was the motivating fix for the EDL → XML pivot."""
+    header("Export: XML (FCPXML 1.9)")
     failures = 0
 
     from core.clip import Clip
     from core.video_source import VideoSource
     from core.timeline import TimelineModel
-    from core.edl_exporter import export_edl
+    from core.xml_exporter import export_fcpxml
+    import xml.etree.ElementTree as ET
 
-    fps = 23.976023976023978
+    fps = 24000 / 1001  # exact NTSC 23.976
     vs = VideoSource(id="s0", file_path="fake_source.mov",
                      total_frames=100000, fps=fps,
                      width=1920, height=1080, codec="h264")
     tl = TimelineModel()
-    # 3 clips, each 48 frames (2s at 23.976)
     plan = [(1000, 48), (5000, 48), (10000, 48)]
     tl.add_clips([Clip(source_id="s0", source_in=s, source_out=s + n - 1)
                   for s, n in plan], assign_colors=False)
 
-    td = Path(tempfile.mkdtemp(prefix="psynth_sys_edl_"))
+    td = Path(tempfile.mkdtemp(prefix="psynth_sys_xml_"))
     try:
-        edl = td / "out.edl"
-        export_edl(tl, {"s0": vs}, str(edl), fps=fps)
-        if not edl.exists() or edl.stat().st_size == 0:
-            fail("EDL file missing or empty")
-            return SectionResult("export_edl", passed=False, failures=1)
-        ok(f"EDL written ({edl.stat().st_size} bytes)")
+        xml_path = td / "out.fcpxml"
+        export_fcpxml(tl, {"s0": vs}, str(xml_path), fps=fps)
+        if not xml_path.exists() or xml_path.stat().st_size == 0:
+            fail("FCPXML file missing or empty")
+            return SectionResult("export_xml", passed=False, failures=1)
+        ok(f"FCPXML written ({xml_path.stat().st_size} bytes)")
 
-        content = edl.read_text(encoding="utf-8", errors="replace").splitlines()
+        try:
+            tree = ET.parse(xml_path)
+        except ET.ParseError as e:
+            fail(f"FCPXML parse error: {e}")
+            return SectionResult("export_xml", passed=False, failures=1)
+        root = tree.getroot()
 
-        # Header: TITLE and FCM NON-DROP FRAME
-        header_has_title = any(l.startswith("TITLE:") for l in content[:5])
-        header_has_fcm = any("NON-DROP FRAME" in l for l in content[:5])
-        if header_has_title:
-            ok("header: TITLE present")
+        if root.tag == "fcpxml" and root.get("version") == "1.9":
+            ok("root element <fcpxml version=\"1.9\">")
         else:
-            fail("header: TITLE missing")
-            failures += 1
-        if header_has_fcm:
-            ok("header: FCM NON-DROP FRAME present")
-        else:
-            fail("header: FCM line missing")
+            fail(f"unexpected root: {root.tag} version={root.get('version')}")
             failures += 1
 
-        # Parse event lines (format: NNN reel V C SRC_IN SRC_OUT REC_IN REC_OUT)
-        import re
-        tc_re = r"(\d{2}):(\d{2}):(\d{2}):(\d{2})"
-        evt_re = re.compile(
-            rf"^(\d{{3}})\s+\S+\s+V\s+C\s+{tc_re}\s+{tc_re}\s+{tc_re}\s+{tc_re}$")
-        events = []
-        for line in content:
-            m = evt_re.match(line.strip())
-            if m:
-                parts = [int(x) for x in m.groups()]
-                events.append({
-                    "n": parts[0],
-                    "src_in": tuple(parts[1:5]),
-                    "src_out": tuple(parts[5:9]),
-                    "rec_in": tuple(parts[9:13]),
-                    "rec_out": tuple(parts[13:17]),
-                })
-
-        if len(events) == 3:
-            ok(f"3 events parsed")
-        else:
-            fail(f"expected 3 events, got {len(events)}")
+        # NTSC 23.976 uses the accurate 1001/24000s frame duration.
+        # Time-based seek in Resolve: XML start "N*1001/24000s" -> seek to
+        # exact source-time N/23.976s -> file frame N. We briefly tried 1/24s
+        # to dodge Resolve's 23.976/24 naming conflation and it broke the
+        # frame mapping for well-formed files; the correct fraction is
+        # 1001/24000s. Remaining drift in Resolve imports traces to the
+        # source file's container time_base, not this XML.
+        fmt = root.find("resources/format")
+        if fmt is None:
+            fail("no <format> in resources")
             failures += 1
-
-        # Events are numbered 001, 002, 003
-        if events and [e["n"] for e in events] == [1, 2, 3]:
-            ok("event numbers are sequential 001-003")
-        else:
-            fail(f"event numbering: {[e['n'] for e in events]}")
+        elif fmt.get("frameDuration") != "1001/24000s":
+            fail(f"frameDuration = {fmt.get('frameDuration')}, "
+                 f"expected 1001/24000s")
             failures += 1
+        else:
+            ok("format frameDuration = 1001/24000s (NTSC 23.976)")
 
-        # REC timecodes chain: event N's rec_out == event N+1's rec_in
-        if len(events) >= 2:
-            for i in range(len(events) - 1):
-                if events[i]["rec_out"] != events[i + 1]["rec_in"]:
-                    fail(f"event {events[i]['n']} REC_OUT {events[i]['rec_out']} "
-                         f"!= event {events[i+1]['n']} REC_IN "
-                         f"{events[i+1]['rec_in']}")
-                    failures += 1
-                    break
+        assets = root.findall("resources/asset")
+        if len(assets) == 1:
+            ok("1 <asset> (one source used)")
+            asset_dur = assets[0].get("duration")
+            expected = f"{100000 * 1001}/24000s"
+            if asset_dur == expected:
+                ok(f"asset duration exact: {asset_dur}")
             else:
-                ok("REC timecodes chain correctly between events")
-
-        # Duration math: REC_OUT - REC_IN of event 0 should be 48 frames (2s)
-        if events:
-            fps_int = 24
-            def tc_to_frames(tc):
-                h, m, s, f = tc
-                return ((h * 3600 + m * 60 + s) * fps_int) + f
-            dur_frames = tc_to_frames(events[0]["rec_out"]) - \
-                         tc_to_frames(events[0]["rec_in"])
-            if dur_frames == 48:
-                ok(f"event 1 duration = 48 frames (REC)")
-            else:
-                fail(f"event 1 REC duration = {dur_frames} frames, expected 48")
+                fail(f"asset duration = {asset_dur}, expected {expected}")
                 failures += 1
+            # media-rep child carries the src URI (Resolve's preferred syntax).
+            mr = assets[0].find("media-rep")
+            if mr is not None and mr.get("src", "").startswith("file:"):
+                ok("asset has <media-rep> child with file:// src")
+            else:
+                fail("asset missing <media-rep> child with file:// src")
+                failures += 1
+        else:
+            fail(f"expected 1 asset, got {len(assets)}")
+            failures += 1
+
+        spine = root.find("library/event/project/sequence/spine")
+        if spine is None:
+            fail("no spine element")
+            return SectionResult("export_xml", passed=False, failures=failures + 1)
+        asset_clips = spine.findall("asset-clip")
+        if len(asset_clips) == 3:
+            ok("3 asset-clips in spine")
+        else:
+            fail(f"expected 3 asset-clips, got {len(asset_clips)}")
+            failures += 1
+
+        # Asset-clip `start` gets a +frame_num/2 nudge to defeat Resolve's
+        # 23.976->24 snap-rounding drift; duration/offset do not.
+        # For NTSC 23.976: start numerator = N*1001 + 500.
+        nudge = 1001 // 2  # 500
+        expected_starts = [1000, 5000, 10000]
+        for i, ac in enumerate(asset_clips):
+            expected_start = f"{expected_starts[i] * 1001 + nudge}/24000s"
+            expected_dur = f"{48 * 1001}/24000s"
+            if ac.get("start") != expected_start:
+                fail(f"clip {i} start = {ac.get('start')}, "
+                     f"expected {expected_start}")
+                failures += 1
+            if ac.get("duration") != expected_dur:
+                fail(f"clip {i} duration = {ac.get('duration')}, "
+                     f"expected {expected_dur}")
+                failures += 1
+        if failures == 0:
+            ok("all clip start (nudged) / duration fractions frame-exact")
+
+        # Compact layout: clips back-to-back via cumulative offset.
+        offsets = [ac.get("offset") for ac in asset_clips]
+        expected_offsets = ["0s", "48048/24000s", "96096/24000s"]
+        if offsets == expected_offsets:
+            ok("clip offsets packed back-to-back (compact)")
+        else:
+            fail(f"offsets = {offsets}, expected {expected_offsets}")
+            failures += 1
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
-    return SectionResult("export_edl", passed=failures == 0, failures=failures)
+    return SectionResult("export_xml", passed=failures == 0, failures=failures)
 
 
 # -------------------- section: export_nvenc -----------------------------
@@ -1259,9 +1283,9 @@ def main():
         run_section("model", section_model)
     if "project" not in skip:
         run_section("project", section_project)
-    # EDL export uses a fake source, no --video needed.
-    if "export_edl" not in skip:
-        run_section("export_edl", section_export_edl)
+    # XML export uses a fake source, no --video needed.
+    if "export_xml" not in skip:
+        run_section("export_xml", section_export_xml)
 
     if videos:
         if "thumb_accuracy" not in skip:

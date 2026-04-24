@@ -32,6 +32,37 @@ from PySide6.QtWidgets import (
 import mpv
 
 
+class FrameSlider(QSlider):
+    """Horizontal slider that scrubs by frame count on mouse wheel.
+
+    Default QSlider wheel behaviour jumps by pageStep (often ~10% of
+    range) — here we want exactly 1 frame per wheel notch so users can
+    fine-scrub through cuts. Shift + wheel = 10 frames per notch.
+    Emits sliderReleased after a wheel change so the existing seek
+    handler fires."""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        # Invert: wheel UP = earlier frames, wheel DOWN = later frames
+        # (matches reading direction / most NLE scrub conventions).
+        steps = -(delta // 120) or (-1 if delta > 0 else 1)
+        mult = 10 if (event.modifiers()
+                      & Qt.KeyboardModifier.ShiftModifier) else 1
+        new_val = max(self.minimum(),
+                      min(self.maximum(), self.value() + steps * mult))
+        if new_val == self.value():
+            event.accept()
+            return
+        self.setValue(new_val)
+        event.accept()
+
+
 class VideoPreview(QWidget):
     """Minimal mpv-embedded preview for frame-accurate inspection."""
 
@@ -178,9 +209,14 @@ class CutInspect(QMainWindow):
         nav_row.addWidget(btn_back)
         nav_row.addWidget(btn_play)
         nav_row.addWidget(btn_fwd)
-        self._slider = QSlider(Qt.Orientation.Horizontal)
-        self._slider.setTracking(False)
-        self._slider.sliderReleased.connect(self._on_slider_released)
+        self._slider = FrameSlider()
+        # Live scrubbing while dragging, like a normal NLE timeline.
+        # tracking=True makes valueChanged fire during drag; the _tick
+        # method's blockSignals call prevents a feedback loop with the
+        # playback-position updater.
+        self._slider.setTracking(True)
+        self._slider.valueChanged.connect(self._on_slider_value_changed)
+        self._slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         nav_row.addWidget(self._slider, 1)
         self._frame_label = QLabel("Frame: 0 / 0")
         self._frame_label.setMinimumWidth(140)
@@ -261,8 +297,56 @@ class CutInspect(QMainWindow):
         if path:
             self._out_edit.setText(path)
 
-    def _on_slider_released(self):
-        self._preview.seek_frame(self._slider.value())
+    def _on_slider_value_changed(self, value: int):
+        self._preview.seek_frame(value)
+
+    def _seek_by(self, delta: int):
+        """Step the playhead by `delta` frames, clamped to the video's range."""
+        if self._video_path is None or self._preview.total_frames <= 0:
+            return
+        target = self._preview.current_frame() + delta
+        target = max(0, min(self._preview.total_frames - 1, target))
+        self._slider.blockSignals(True)
+        self._slider.setValue(target)
+        self._slider.blockSignals(False)
+        self._preview.seek_frame(target)
+
+    def keyPressEvent(self, event):
+        """Arrow keys = ±1 frame. Shift + arrow = ±10. Home/End = jump.
+
+        keyPressEvent on the main window fires only when no child has
+        consumed the event, so text input in the line-edits still works
+        normally (cursor left/right edits the text)."""
+        key = event.key()
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        step = 10 if shift else 1
+        if key == Qt.Key.Key_Left:
+            self._seek_by(-step)
+            event.accept(); return
+        if key == Qt.Key.Key_Right:
+            self._seek_by(step)
+            event.accept(); return
+        if key == Qt.Key.Key_Home:
+            self._seek_by(-self._preview.total_frames)
+            event.accept(); return
+        if key == Qt.Key.Key_End:
+            self._seek_by(self._preview.total_frames)
+            event.accept(); return
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event):
+        """Wheel over the video area scrubs frames too (so users don't
+        have to aim for the slider). Same inverted convention as the
+        FrameSlider: wheel UP = earlier, wheel DOWN = later."""
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        steps = -(delta // 120) or (-1 if delta > 0 else 1)
+        mult = 10 if (event.modifiers()
+                      & Qt.KeyboardModifier.ShiftModifier) else 1
+        self._seek_by(steps * mult)
+        event.accept()
 
     def _tick(self):
         if self._video_path is None:

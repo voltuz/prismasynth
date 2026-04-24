@@ -1,6 +1,6 @@
 # PrismaSynth
 
-A PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with a GPU neural network, review/trim/split clips on a timeline, and export as video, image sequence, or EDL.
+A PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with a GPU neural network, review/trim/split clips on a timeline, and export as video, image sequence, or FCPXML.
 
 Single-track editor — no layers, no compositing. Built for speed: the entire preview pipeline stays on GPU (NVDEC decode → GPU buffer → mpv display), and export runs parallel FFmpeg segments with zero-copy NVENC for SDR sources.
 
@@ -15,7 +15,7 @@ Single-track editor — no layers, no compositing. Built for speed: the entire p
   - Image sequence (PNG/JPEG)
 - **HDR handling** — `probe_hdr()` detects HDR sources and routes through GPU `tonemap_opencl=hable` or a CPU `zscale` fallback. SDR sources skip tonemap entirely.
 - **Frame-accurate** — export uses `-frames:v N` (integer frame count) to eliminate float rounding from time-based durations.
-- **CMX 3600 EDL export** — time-based timecode conversion matching DaVinci Resolve's PTS derivation. Compatible with Premiere Pro, Resolve, and Avid.
+- **FCPXML 1.9 timeline export** — frame-exact rational fractions (e.g. `N*1001/24000s` for NTSC 23.976) with an NTSC rounding nudge that lands every clip on its intended source frame in DaVinci Resolve. Also imports into Premiere Pro and Final Cut Pro.
 - **Viewport-prioritized thumbnails** — only visible clips get HQ thumbnails, sorted by playhead distance. 48x27 proxy placeholders upscale instantly while HQ loads.
 - **In/Out render range** — cyan markers define the export and scene-detection window.
 - **Undo/redo** — 50-level snapshot stack on the timeline model.
@@ -71,7 +71,7 @@ Or double-click `run.bat`.
 1. **Import** a video (File → Import, drag-and-drop, or Ctrl+I) — creates one whole-file clip.
 2. **Detect Cuts** (Ctrl+D) — replaces the clip with one clip per shot. Respects the in/out render range when set.
 3. **Review** — scrub, delete bad shots with `W`, ripple-delete with `D`, split with `S`, set cut mode with `C`.
-4. **Export** — Timeline menu → Export Video / Image Sequence / EDL.
+4. **Export** — Timeline menu → Export Video / Image Sequence / XML.
 
 ## Architecture
 

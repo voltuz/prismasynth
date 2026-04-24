@@ -5,8 +5,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal
 
 
-class EdlDialog(QDialog):
-    """Dialog for EDL export settings."""
+class XmlDialog(QDialog):
+    """Dialog for FCPXML export settings (Final Cut Pro XML 1.9).
+
+    Single output format — EDL was removed from PrismaSynth because
+    Resolve's NDF timecode interpretation drifts multi-clip EDL imports
+    by ±1 frame with no reliable server-side fix. FCPXML uses rational
+    time fractions and, with the NTSC nudge in ``xml_exporter``, lands
+    every clip frame-exact.
+    """
 
     export_requested = Signal(dict)  # settings dict
 
@@ -14,13 +21,12 @@ class EdlDialog(QDialog):
                  fps: float = 24.0, has_render_range: bool = False,
                  parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Export EDL")
+        self.setWindowTitle("Export XML (FCPXML)")
         self.setMinimumWidth(450)
         self.setModal(True)
 
         layout = QVBoxLayout(self)
 
-        # Info
         duration_secs = total_frames / fps if fps > 0 else 0
         mins, secs = divmod(int(duration_secs), 60)
         info = f"{clip_count} clips  |  {total_frames:,} frames  |  {mins}:{secs:02d}"
@@ -28,7 +34,6 @@ class EdlDialog(QDialog):
         info_label.setStyleSheet("color: #aaa;")
         layout.addWidget(info_label)
 
-        # Options
         self._gaps_check = QCheckBox("Include gaps between clips")
         self._gaps_check.setToolTip(
             "Checked: gaps appear as empty space in the NLE timeline.\n"
@@ -43,7 +48,6 @@ class EdlDialog(QDialog):
         self._range_check.setEnabled(has_render_range)
         layout.addWidget(self._range_check)
 
-        # Output path
         form = QFormLayout()
         self._output = QLineEdit()
         browse_btn = QPushButton("Browse...")
@@ -54,11 +58,9 @@ class EdlDialog(QDialog):
         form.addRow("Output:", out_layout)
         layout.addLayout(form)
 
-        # Status
         self._status = QLabel("")
         layout.addWidget(self._status)
 
-        # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         export_btn = QPushButton("Export")
@@ -71,7 +73,7 @@ class EdlDialog(QDialog):
 
     def _browse(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save EDL", "", "EDL Files (*.edl)")
+            self, "Save FCPXML", "", "Final Cut Pro XML (*.fcpxml)")
         if path:
             self._output.setText(path)
 
@@ -85,4 +87,4 @@ class EdlDialog(QDialog):
             "include_gaps": self._gaps_check.isChecked(),
             "use_render_range": self._range_check.isChecked(),
         })
-        self._status.setText("EDL exported!")
+        self._status.setText("FCPXML exported!")
