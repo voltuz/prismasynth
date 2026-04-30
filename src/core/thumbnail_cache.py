@@ -3,6 +3,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import av
@@ -14,6 +15,7 @@ from PySide6.QtGui import QImage
 from core.proxy_cache import ProxyManager
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
+from utils.paths import get_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +163,21 @@ class ThumbnailCache(QObject):
                     if results is None:
                         continue
                     # Map results back to clip_id/position for emission
+                    saved_to_disk: Set[Tuple[str, int]] = set()
                     for frame_num, qimage in results:
                         for source_id, fn, clip_id, position in entries:
                             if fn == frame_num:
                                 cache_key = f"{source_id}_{frame_num}"
                                 self._mem_cache[cache_key] = qimage
                                 self.thumbnail_ready.emit(clip_id, position, qimage)
+                                # Persist once per (source, frame), not once
+                                # per emission (multiple clips may reference
+                                # the same source frame).
+                                key = (source_id, frame_num)
+                                if key not in saved_to_disk:
+                                    self._save_disk_thumbnail(
+                                        source_id, frame_num, qimage)
+                                    saved_to_disk.add(key)
 
                 # Plan and submit sweep batches
                 if len(in_flight) < _MAX_WORKERS and not self._stopped:
@@ -211,6 +222,13 @@ class ThumbnailCache(QObject):
                 if cache_key in self._mem_cache:
                     self.thumbnail_ready.emit(
                         clip_id, position, self._mem_cache[cache_key])
+                    continue
+                # Disk hit: load JPEG, populate mem cache, emit. Skips both
+                # LQ placeholder and HQ generation entirely.
+                disk_qimg = self._load_disk_thumbnail(source_id, frame_num)
+                if disk_qimg is not None:
+                    self._mem_cache[cache_key] = disk_qimg
+                    self.thumbnail_ready.emit(clip_id, position, disk_qimg)
                     continue
                 # Emit LQ placeholder
                 if (cache_key not in self._lq_emitted
@@ -418,3 +436,170 @@ class ThumbnailCache(QObject):
     def clear(self):
         self._mem_cache.clear()
         self._lq_emitted.clear()
+
+    def emit_for_frame(self, source_id: str, frame_num: int,
+                       qimage: QImage):
+        """Emit thumbnail_ready for every clip currently referencing this
+        (source_id, frame_num). Used by bulk-cache to surface results
+        without waiting for the next coordinator sweep."""
+        with self._lookup_lock:
+            clip_lookup = dict(self._clip_lookup)
+        for clip_id, entries in clip_lookup.items():
+            for sid, fn, position in entries:
+                if sid == source_id and fn == frame_num:
+                    self.thumbnail_ready.emit(clip_id, position, qimage)
+
+    def start_bulk_cache(self,
+                         render_range: Optional[Tuple[int, int]] = None
+                         ) -> "BulkCacheJob":
+        """Build a list of (source_id, frame_num) targets for the first and
+        last frame of every non-gap clip within render_range (inclusive),
+        skip ones already in memory or on disk, and start a background
+        BulkCacheJob to fill them. Returns the job; caller wires its
+        progress/finished/cancelled signals to UI."""
+        # Make sure emit_for_frame can find clips even if start() was never
+        # called (e.g. master thumbnails toggle is off).
+        self._rebuild_clip_lookup()
+        targets: List[Tuple[str, int]] = []
+        seen: Set[Tuple[str, int]] = set()
+        pos = 0
+        for clip in self._timeline.clips:
+            clip_start = pos
+            clip_end = pos + clip.duration_frames - 1
+            pos += clip.duration_frames
+            if clip.is_gap:
+                continue
+            if render_range is not None:
+                r_start, r_end = render_range
+                if clip_end < r_start or clip_start > r_end:
+                    continue
+            for frame_num in (clip.source_in, clip.source_out):
+                key = (clip.source_id, frame_num)
+                if key in seen:
+                    continue
+                seen.add(key)
+                cache_key = f"{clip.source_id}_{frame_num}"
+                if cache_key in self._mem_cache:
+                    continue
+                if self._disk_thumb_path(clip.source_id, frame_num).exists():
+                    continue
+                targets.append(key)
+        job = BulkCacheJob(self, targets)
+        return job
+
+    @staticmethod
+    def _disk_thumb_path(source_id: str, frame_num: int) -> Path:
+        return get_cache_dir() / "thumbs" / source_id / f"{frame_num}.jpg"
+
+    @classmethod
+    def _load_disk_thumbnail(cls, source_id: str,
+                             frame_num: int) -> Optional[QImage]:
+        path = cls._disk_thumb_path(source_id, frame_num)
+        if not path.exists():
+            return None
+        qimg = QImage()
+        if not qimg.load(str(path), "JPEG"):
+            return None
+        return qimg
+
+    @classmethod
+    def _save_disk_thumbnail(cls, source_id: str, frame_num: int,
+                             qimage: QImage) -> bool:
+        path = cls._disk_thumb_path(source_id, frame_num)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return qimage.save(str(path), "JPEG", 85)
+        except OSError:
+            return False
+
+
+class BulkCacheJob(QObject):
+    """Background task that fills the thumbnail disk cache for a fixed list
+    of (source_id, frame_num) targets. Runs PyAV sweeps per source; results
+    are saved to disk, populated into the parent cache's memory, and
+    emitted to any visible clip referencing the same source frame."""
+
+    progress = Signal(int, int)  # done, total
+    finished = Signal()
+    cancelled = Signal()
+
+    def __init__(self, cache: ThumbnailCache,
+                 targets: List[Tuple[str, int]], parent=None):
+        super().__init__(parent)
+        self._cache = cache
+        self._targets = targets
+        self._cancelled = False
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def total(self) -> int:
+        return len(self._targets)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        if not self._targets:
+            self.progress.emit(0, 0)
+            self.finished.emit()
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _run(self):
+        # Group targets by source so we can sweep-decode each source once
+        by_source: Dict[str, List[int]] = {}
+        for source_id, frame_num in self._targets:
+            by_source.setdefault(source_id, []).append(frame_num)
+
+        total = len(self._targets)
+        done = 0
+        self.progress.emit(0, total)
+
+        for source_id, frames in by_source.items():
+            if self._cancelled:
+                self.cancelled.emit()
+                return
+            source = self._cache._sources.get(source_id)
+            if source is None:
+                done += len(frames)
+                self.progress.emit(done, total)
+                continue
+            frames.sort()
+            # Use the same sweep grouping as the viewport-driven coordinator
+            # so far-apart targets become independent seeks instead of one
+            # giant decode-from-zero. Cap each run at MAX_RUN frames so a
+            # cancel request lands within ~one chunk's decode time instead
+            # of waiting for a giant sweep to finish.
+            MAX_RUN = 16
+            raw_runs = ThumbnailCache._build_runs(
+                [(f, "", "") for f in frames])
+            runs = []
+            for r in raw_runs:
+                for i in range(0, len(r), MAX_RUN):
+                    runs.append(r[i:i + MAX_RUN])
+            for run in runs:
+                if self._cancelled:
+                    self.cancelled.emit()
+                    return
+                run_frames = [f[0] for f in run]
+                if len(run_frames) == 1:
+                    results = self._cache._grab_frame_single(
+                        source, run_frames[0])
+                else:
+                    results = self._cache._grab_frames_sweep(
+                        source, run_frames)
+                if results:
+                    for frame_num, qimage in results:
+                        cache_key = f"{source_id}_{frame_num}"
+                        self._cache._mem_cache[cache_key] = qimage
+                        ThumbnailCache._save_disk_thumbnail(
+                            source_id, frame_num, qimage)
+                        self._cache.emit_for_frame(
+                            source_id, frame_num, qimage)
+                done += len(run_frames)
+                self.progress.emit(done, total)
+
+        self.finished.emit()

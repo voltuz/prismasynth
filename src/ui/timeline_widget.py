@@ -38,7 +38,8 @@ CLIP_HEIGHT_MAX = 200
 HEADER_HEIGHT = 48
 TIMELINE_H_PADDING = 4  # small internal padding for playhead clearance
 RESIZE_HANDLE_HEIGHT = 5  # pixels at bottom edge for drag resize
-THUMB_HIDE_THRESHOLD = 30  # px clip width — below this, skip thumbnail paint and generation
+THUMB_HIDE_THRESHOLD = 15  # px clip width — below this, skip thumbnail paint and generation
+                            # (hard floor is ~13px: 6px color border on each side)
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
 GAP_COLOR = QColor(30, 30, 30)
@@ -673,6 +674,7 @@ class TimelineWidget(QWidget):
     cut_requested = Signal(int)
     thumbnails_toggled = Signal(bool)
     hq_thumbnails_toggled = Signal(bool)
+    cache_thumbnails_clicked = Signal()  # button hit; main_window decides start vs cancel
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -713,6 +715,33 @@ class TimelineWidget(QWidget):
         self._thumb_toggle.toggled.connect(self._on_thumb_toggled)
         self._thumb_toggle.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._thumb_toggle.customContextMenuRequested.connect(self._show_thumb_menu)
+
+        # Cache-thumbnails button — left of the toggle. Click runs a bulk
+        # disk-cache pass for clip-boundary frames; click again while
+        # running cancels.
+        self._cache_thumb_btn = QToolButton(self._strip)
+        self._cache_thumb_btn.setIcon(icon("save"))
+        self._cache_thumb_btn.setIconSize(QSize(14, 14))
+        self._cache_thumb_btn.setToolTip(
+            "Cache clip-boundary thumbnails to disk\n"
+            "Respects in/out range if set")
+        self._cache_thumb_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cache_thumb_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._cache_thumb_btn.setFixedSize(22, 22)
+        self._cache_thumb_btn.setStyleSheet(
+            "QToolButton {"
+            " background-color: rgba(58, 58, 58, 220);"
+            " border: 1px solid #555;"
+            " border-radius: 3px;"
+            "}"
+            "QToolButton:hover { background-color: rgba(85, 85, 85, 230); }"
+            "QToolButton[caching=\"true\"] {"
+            " background-color: #5577aa;"
+            " border-color: #6688bb;"
+            "}"
+        )
+        self._cache_thumb_btn.clicked.connect(self.cache_thumbnails_clicked.emit)
+
         self._strip.installEventFilter(self)
         self._position_thumb_toggle()
 
@@ -770,10 +799,25 @@ class TimelineWidget(QWidget):
 
     def _position_thumb_toggle(self):
         margin = 6
+        gap = 4
         x = self._strip.width() - self._thumb_toggle.width() - margin
         y = margin
         self._thumb_toggle.move(x, y)
         self._thumb_toggle.raise_()
+        cx = x - gap - self._cache_thumb_btn.width()
+        self._cache_thumb_btn.move(cx, y)
+        self._cache_thumb_btn.raise_()
+
+    def set_cache_thumbnails_running(self, running: bool):
+        """Toggle the cache button's visual state. While running, the button
+        shows the active-blue style and its tooltip becomes 'Cancel'."""
+        self._cache_thumb_btn.setProperty("caching", "true" if running else "false")
+        self._cache_thumb_btn.style().unpolish(self._cache_thumb_btn)
+        self._cache_thumb_btn.style().polish(self._cache_thumb_btn)
+        self._cache_thumb_btn.setToolTip(
+            "Cancel thumbnail caching" if running
+            else "Cache clip-boundary thumbnails to disk\n"
+                 "Respects in/out range if set")
 
     def eventFilter(self, obj, event):
         if obj is self._strip and event.type() == event.Type.Resize:

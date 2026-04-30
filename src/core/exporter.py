@@ -17,6 +17,15 @@ from utils.ffprobe import probe_hdr
 
 logger = logging.getLogger(__name__)
 
+# Per-segment audio is re-encoded to a uniform codec/rate/channels so the
+# downstream `-c copy` concat step survives across mixed sources. PCM for
+# ProRes/FFV1 containers, AAC for MP4. Map keyed on output extension.
+_AUDIO_CODEC_FOR_EXT = {
+    ".mov": ("pcm_s16le", []),
+    ".mkv": ("pcm_s16le", []),
+    ".mp4": ("aac", ["-b:a", "320k"]),
+}
+
 # Cached GPU probe result (None = not yet probed)
 _gpu_tonemap_available: Optional[bool] = None
 _opencl_device: Optional[str] = None
@@ -290,7 +299,7 @@ class Exporter(QObject):
         # Flatten coalesced segments back out with per-source VF chains.
         # Cache HDR detection on the group dict so probe_hdr runs once per
         # source rather than 2-3x per export.
-        flat_segments = []  # [(source_path, src_in, count, fps, vf, hw_args, is_hdr, src_w, src_h)]
+        flat_segments = []  # [(source_path, src_in, count, fps, vf, hw_args, is_hdr, src_w, src_h, has_audio)]
         for sid, group in groups.items():
             source = self._sources.get(sid)
             group["is_hdr"] = probe_hdr(group["path"])
@@ -299,6 +308,7 @@ class Exporter(QObject):
             hw = self._gpu_hw_args(opencl_device) if use_gpu_tm else []
             src_w = source.width if source else 0
             src_h = source.height if source else 0
+            has_audio = bool(source and source.audio_channels > 0)
             # For SDR + NVENC we keep the entire pipeline on the GPU
             # (NVDEC -> scale_cuda -> NVENC, no GPU<->CPU roundtrip).
             # _build_segment_cmd handles the scale_cuda filter when vf is
@@ -313,7 +323,7 @@ class Exporter(QObject):
             for src_in, count in group["segments"]:
                 flat_segments.append(
                     (group["path"], src_in, count, group["fps"], vf, hw,
-                     is_hdr, src_w, src_h))
+                     is_hdr, src_w, src_h, has_audio))
 
         total_frames = sum(s[2] for s in flat_segments)
         suffix = ""
@@ -323,7 +333,7 @@ class Exporter(QObject):
             f"Encoding {len(flat_segments)} segments to {output_path}...{suffix}")
 
         def _build_segment_cmd(path, src_in, count, src_fps, vf, hw, hdr,
-                               src_w, src_h, out_file):
+                               src_w, src_h, has_audio, out_file):
             """Build FFmpeg command for a single segment."""
             ss = self._frame_to_seek_ts(src_in, src_fps)
             hwaccel = ["-hwaccel", "cuda"]
@@ -354,6 +364,22 @@ class Exporter(QObject):
             else:
                 pre_ss, post_ss = 0.0, ss
             cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw + hwaccel
+            # Source has no audio: feed in a silent stereo lavfi input sized
+            # to the segment's video duration. It MUST be added BEFORE the
+            # video input so that the post-input -ss below stays in
+            # output-option position (no -i follows it). Putting anullsrc
+            # AFTER the video would cause ffmpeg to reinterpret the post-
+            # input -ss as input options for anullsrc, breaking the video's
+            # accurate-seek and the OpenCL tonemap warmup. Maps below flip
+            # accordingly: video=input1:v, silent-audio=input0:a.
+            # The lavfi -t includes post_ss because output -ss drops post_ss
+            # seconds from ALL output streams (audio included), so the
+            # anullsrc must over-produce by post_ss to leave audio_dur after.
+            audio_dur = count / src_fps
+            if not has_audio:
+                cmd += ["-f", "lavfi", "-t", f"{audio_dur + post_ss:.6f}",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+            video_idx = 1 if not has_audio else 0
             if pre_ss > 0:
                 cmd += ["-ss", f"{pre_ss:.6f}"]
             cmd += ["-i", path]
@@ -381,17 +407,46 @@ class Exporter(QObject):
             # durations in the MOV/MP4 muxer. Without it the default 1/16000
             # timebase stores jittering durations (672, 656, ...) which NLEs
             # interpret strictly and display as duplicate frames.
+            out_ext = os.path.splitext(out_file)[1].lower()
+            audio_codec, audio_extra = _AUDIO_CODEC_FOR_EXT.get(
+                out_ext, ("pcm_s16le", []))
+            cmd += ["-map", f"{video_idx}:v:0"]
+            if has_audio:
+                # asetpts=PTS-STARTPTS is the audio analogue of setpts above.
+                # atrim bounds the audio to the same window as -frames:v so
+                # decoder-tail packets can't bleed past the video's last frame.
+                # The atrim runs INSIDE the -af filter graph, which executes
+                # BEFORE the output-side -ss discard, so we must add post_ss
+                # to the duration — the trim then keeps (audio_dur + post_ss)
+                # seconds, output -ss drops the first post_ss, leaving exactly
+                # audio_dur to match the video. Without this compensation,
+                # audio would be (audio_dur - post_ss) — a 1s shortfall.
+                # aresample=async=1:first_pts=0 flushes leading samples that
+                # fell before the seek point and resets PTS to 0.
+                trim_dur = audio_dur + post_ss
+                cmd += [
+                    "-map", f"{video_idx}:a:0?",
+                    "-af",
+                    "asetpts=PTS-STARTPTS,"
+                    f"atrim=duration={trim_dur:.6f},"
+                    "aresample=async=1:first_pts=0,"
+                    "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
+                ]
+            else:
+                cmd += ["-map", "0:a:0"]
+            cmd += ["-c:a", audio_codec, *audio_extra,
+                    "-ar", "48000", "-ac", "2"]
             cmd += ["-fps_mode", "passthrough",
-                    "-video_track_timescale", "24000000",
-                    "-an"] + ffmpeg_args + [out_file]
+                    "-video_track_timescale", "24000000"]
+            cmd += ffmpeg_args + [out_file]
             return cmd
 
         # Single segment: encode directly to output (no temp files, no concat)
         if len(flat_segments) == 1:
             (path, src_in, count, src_fps, vf, hw, hdr,
-             src_w, src_h) = flat_segments[0]
+             src_w, src_h, has_audio) = flat_segments[0]
             cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
-                                     hdr, src_w, src_h, output_path)
+                                     hdr, src_w, src_h, has_audio, output_path)
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             self._register_proc(proc)
@@ -419,11 +474,11 @@ class Exporter(QObject):
             temp_files = []
             commands = []
             for i, (path, src_in, count, src_fps, vf, hw, hdr,
-                    src_w, src_h) in enumerate(flat_segments):
+                    src_w, src_h, has_audio) in enumerate(flat_segments):
                 tmp = os.path.join(temp_dir, f"seg_{i:04d}{temp_ext}")
                 temp_files.append(tmp)
                 cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
-                                         hdr, src_w, src_h, tmp)
+                                         hdr, src_w, src_h, has_audio, tmp)
                 commands.append((cmd, count))
 
             # Thread pool: as-soon-as-done scheduling (no batch-wait)
@@ -552,10 +607,16 @@ class Exporter(QObject):
         # Temp extension matches output (see _export_video_parallel comment).
         temp_ext = os.path.splitext(output_path)[1] or ".mkv"
 
+        audio_codec, audio_extra = _AUDIO_CODEC_FOR_EXT.get(
+            temp_ext.lower(), ("pcm_s16le", []))
+
         for i, (source_path, src_in, duration, src_fps, _sid) in enumerate(segments):
             ss = self._frame_to_seek_ts(src_in, src_fps)
             tmp = os.path.join(temp_dir, f"seg_{i:04d}{temp_ext}")
             temp_files.append(tmp)
+            src = self._sources.get(_sid)
+            has_audio = bool(src and src.audio_channels > 0)
+            audio_dur = duration / src_fps
 
             # Two-stage seek — see _build_segment_cmd above for rationale.
             PRE_SEEK_MARGIN = 1.0
@@ -567,6 +628,12 @@ class Exporter(QObject):
             cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"] + hw_args + [
                 "-hwaccel", "cuda",
             ]
+            # See _build_segment_cmd for why anullsrc must be input #0 and
+            # why -t must include post_ss.
+            if not has_audio:
+                cmd += ["-f", "lavfi", "-t", f"{audio_dur + post_ss:.6f}",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+            video_idx = 1 if not has_audio else 0
             if pre_ss > 0:
                 cmd += ["-ss", f"{pre_ss:.6f}"]
             cmd += ["-i", source_path]
@@ -575,9 +642,24 @@ class Exporter(QObject):
             cmd += ["-frames:v", str(duration)]
             if vf_chain:
                 cmd += ["-vf", vf_chain]
+            cmd += ["-map", f"{video_idx}:v:0"]
+            if has_audio:
+                trim_dur = audio_dur + post_ss
+                cmd += [
+                    "-map", f"{video_idx}:a:0?",
+                    "-af",
+                    "asetpts=PTS-STARTPTS,"
+                    f"atrim=duration={trim_dur:.6f},"
+                    "aresample=async=1:first_pts=0,"
+                    "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
+                ]
+            else:
+                cmd += ["-map", "0:a:0"]
+            cmd += ["-c:a", audio_codec, *audio_extra,
+                    "-ar", "48000", "-ac", "2"]
             cmd += ["-fps_mode", "passthrough",
-                    "-video_track_timescale", "24000000",
-                    "-an"] + ffmpeg_args + [tmp]
+                    "-video_track_timescale", "24000000"]
+            cmd += ffmpeg_args + [tmp]
             commands.append((cmd, duration))
 
         # Execute in batches

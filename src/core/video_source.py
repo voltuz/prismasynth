@@ -10,6 +10,9 @@ class VideoSource:
     width: int
     height: int
     codec: str
+    audio_codec: str = ""
+    audio_sample_rate: int = 0
+    audio_channels: int = 0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     @property

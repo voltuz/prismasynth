@@ -197,6 +197,7 @@ class MainWindow(QMainWindow):
         self._detect_partials: dict = {}
         self._last_clicked_clip_id: Optional[str] = None
         self._thumbnail_cache: Optional[ThumbnailCache] = None
+        self._bulk_thumb_job = None  # set while a BulkCacheJob is running
         self._selection_follows_playhead = True
         self._playback_updating = False
 
@@ -290,6 +291,7 @@ class MainWindow(QMainWindow):
         self._timeline_widget.cut_requested.connect(self._on_cut_at_frame)
         self._timeline_widget.thumbnails_toggled.connect(self._on_thumbnails_toggled)
         self._timeline_widget.hq_thumbnails_toggled.connect(self._on_hq_thumbnails_toggled)
+        self._timeline_widget.cache_thumbnails_clicked.connect(self._on_cache_thumbnails_clicked)
         self._timeline_widget.strip.scroll_changed.connect(self._on_viewport_changed)
         self._timeline.selection_changed.connect(self._on_selection_changed)
 
@@ -542,6 +544,9 @@ class MainWindow(QMainWindow):
                 width=info.width,
                 height=info.height,
                 codec=info.codec,
+                audio_codec=info.audio_codec,
+                audio_sample_rate=info.audio_sample_rate,
+                audio_channels=info.audio_channels,
             )
             clip = Clip(source_id=source.id, source_in=0,
                         source_out=source.total_frames - 1)
@@ -738,6 +743,53 @@ class MainWindow(QMainWindow):
         # applied next time the cache is started.
         if self._thumbnail_cache is not None:
             self._thumbnail_cache.set_hq_enabled(enabled)
+
+    def _on_cache_thumbnails_clicked(self):
+        """Toolbar/timeline button: start a bulk thumbnail cache pass for
+        clip-boundary frames in the current render range. If a job is
+        already running, the second click cancels it."""
+        if self._bulk_thumb_job is not None:
+            self._bulk_thumb_job.cancel()
+            return
+        if not self._timeline.clips:
+            self._status_bar.showMessage("No clips to cache", 3000)
+            return
+        # Master toggle off → start the cache so disk writes still emit.
+        if self._thumbnail_cache is None:
+            self._start_thumbnail_cache()
+        if self._thumbnail_cache is None:
+            return
+        render_range = self._timeline.get_render_range()
+        job = self._thumbnail_cache.start_bulk_cache(render_range)
+        if job.total == 0:
+            self._status_bar.showMessage("Thumbnails already cached", 3000)
+            # Fire-and-forget — `start()` will emit finished synchronously.
+            job.start()
+            return
+        self._bulk_thumb_job = job
+        from PySide6.QtCore import Qt as _Qt
+        job.progress.connect(self._on_bulk_thumb_progress,
+                             _Qt.ConnectionType.QueuedConnection)
+        job.finished.connect(self._on_bulk_thumb_done,
+                             _Qt.ConnectionType.QueuedConnection)
+        job.cancelled.connect(self._on_bulk_thumb_cancelled,
+                              _Qt.ConnectionType.QueuedConnection)
+        self._timeline_widget.set_cache_thumbnails_running(True)
+        self._status_bar.showMessage(f"Caching thumbnails 0/{job.total}")
+        job.start()
+
+    def _on_bulk_thumb_progress(self, done: int, total: int):
+        self._status_bar.showMessage(f"Caching thumbnails {done}/{total}")
+
+    def _on_bulk_thumb_done(self):
+        self._bulk_thumb_job = None
+        self._timeline_widget.set_cache_thumbnails_running(False)
+        self._status_bar.showMessage("Thumbnails cached", 4000)
+
+    def _on_bulk_thumb_cancelled(self):
+        self._bulk_thumb_job = None
+        self._timeline_widget.set_cache_thumbnails_running(False)
+        self._status_bar.showMessage("Thumbnail caching cancelled", 4000)
 
     def _on_thumbnail_ready(self, clip_id: str, position: str, qimage):
         from PySide6.QtGui import QPixmap

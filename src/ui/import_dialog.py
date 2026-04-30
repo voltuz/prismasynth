@@ -119,6 +119,9 @@ class ImportDialog(QDialog):
                 width=info.width,
                 height=info.height,
                 codec=info.codec,
+                audio_codec=info.audio_codec,
+                audio_sample_rate=info.audio_sample_rate,
+                audio_channels=info.audio_channels,
             )
             clip = Clip(
                 source_id=source.id,

@@ -12,6 +12,9 @@ class VideoInfo:
     fps: float
     duration_seconds: float
     codec: str
+    audio_codec: str = ""
+    audio_sample_rate: int = 0
+    audio_channels: int = 0
 
 
 def probe_video(file_path: str) -> Optional[VideoInfo]:
@@ -70,6 +73,22 @@ def probe_video(file_path: str) -> Optional[VideoInfo]:
     if total_frames == 0 and fps > 0 and duration_seconds > 0:
         total_frames = int(duration_seconds * fps)
 
+    audio_codec = ""
+    audio_sample_rate = 0
+    audio_channels = 0
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            audio_codec = stream.get("codec_name", "") or ""
+            try:
+                audio_sample_rate = int(stream.get("sample_rate") or 0)
+            except (TypeError, ValueError):
+                audio_sample_rate = 0
+            try:
+                audio_channels = int(stream.get("channels") or 0)
+            except (TypeError, ValueError):
+                audio_channels = 0
+            break
+
     return VideoInfo(
         width=width,
         height=height,
@@ -77,6 +96,9 @@ def probe_video(file_path: str) -> Optional[VideoInfo]:
         fps=fps,
         duration_seconds=duration_seconds,
         codec=codec,
+        audio_codec=audio_codec,
+        audio_sample_rate=audio_sample_rate,
+        audio_channels=audio_channels,
     )
 
 

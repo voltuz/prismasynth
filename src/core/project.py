@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from core.clip import Clip
 from core.video_source import VideoSource
+from utils.ffprobe import probe_video
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,9 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
             "width": s.width,
             "height": s.height,
             "codec": s.codec,
+            "audio_codec": s.audio_codec,
+            "audio_sample_rate": s.audio_sample_rate,
+            "audio_channels": s.audio_channels,
         })
     for c in clips:
         data["clips"].append(c.to_dict())
@@ -72,7 +76,22 @@ def load_project(filepath: str):
             width=sd["width"],
             height=sd["height"],
             codec=sd["codec"],
+            audio_codec=sd.get("audio_codec", ""),
+            audio_sample_rate=sd.get("audio_sample_rate", 0),
+            audio_channels=sd.get("audio_channels", 0),
         )
+        # Retroactive audio probe: legacy projects (saved before audio support)
+        # have no audio fields. Re-probe so the project becomes audio-aware on
+        # first load — no manual migration step.
+        if not s.audio_codec and s.audio_channels == 0:
+            try:
+                info = probe_video(s.file_path)
+            except Exception:
+                info = None
+            if info is not None:
+                s.audio_codec = info.audio_codec
+                s.audio_sample_rate = info.audio_sample_rate
+                s.audio_channels = info.audio_channels
         sources[s.id] = s
 
     clips = []

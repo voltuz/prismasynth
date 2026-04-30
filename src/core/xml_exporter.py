@@ -212,6 +212,19 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
         asset_duration = _time_str(src.total_frames, frame_num, frame_den)
         name = os.path.splitext(os.path.basename(src.file_path))[0]
         uri = _file_uri(src.file_path)
+        # Asset-level audio attributes. Resolve's <asset> wants raw integer
+        # Hz for audioRate (not the "48k" form used on <sequence>). With these
+        # set, the spine asset-clip auto-includes audio without any extra
+        # <audio-channel-source> child.
+        if src.audio_channels > 0:
+            audio_rate = src.audio_sample_rate or 48000
+            audio_attrs = (
+                f' hasAudio="1" audioSources="1"'
+                f' audioChannels="{src.audio_channels}"'
+                f' audioRate="{audio_rate}"'
+            )
+        else:
+            audio_attrs = ""
         # Resolve's preferred asset-source syntax is a <media-rep> child element
         # rather than an `src=` attribute. Matches what Resolve writes on export
         # and is more likely to be respected round-trip.
@@ -221,7 +234,7 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
             f'    <asset id="{aid}" name="{xml_escape(name)}" '
             f'start="0s" duration="{asset_duration}" '
             f'hasVideo="1" format="{format_id}" '
-            f'videoSources="1">'
+            f'videoSources="1"{audio_attrs}>'
         )
         lines.append(
             f'      <media-rep kind="original-media" src="{uri}"/>'

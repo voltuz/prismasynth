@@ -20,6 +20,8 @@ class DetectDialog(QDialog):
 
     detection_complete = Signal(dict)  # {clip_id: [Clip, ...]}
 
+    _PHASE_STEPS = {"Decoding": 1, "Analyzing": 2}
+
     def __init__(self, segments: list, sources: dict,
                  in_out_limited: bool = False, parent=None):
         """segments: list of (source_id, source_in, source_out, clip_id).
@@ -72,6 +74,12 @@ class DetectDialog(QDialog):
         form.addRow("Cut Detection Sensitivity:", self._threshold_spin)
         layout.addLayout(form)
 
+        # Step indicator (above the progress bar) — "Step 1 of 2 — Decoding" etc.
+        self._step_label = QLabel("")
+        self._step_label.setStyleSheet("font-weight: bold; color: #ddd;")
+        self._step_label.setVisible(False)
+        layout.addWidget(self._step_label)
+
         # Progress bar
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
@@ -103,6 +111,8 @@ class DetectDialog(QDialog):
     def _start_detection(self):
         self._start_btn.setEnabled(False)
         self._threshold_spin.setEnabled(False)
+        self._step_label.setVisible(True)
+        self._step_label.setText("Starting...")
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._detail_label.setVisible(True)
@@ -128,6 +138,11 @@ class DetectDialog(QDialog):
         """Reset the phase timer when switching stages (decode → inference)."""
         self._phase_start_time = time.monotonic()
         self._detail_label.setText(f"{phase}...")
+        step = self._PHASE_STEPS.get(phase)
+        if step:
+            self._step_label.setText(f"Step {step} of 2 — {phase}")
+        else:
+            self._step_label.setText(phase)
 
     def _on_detail_progress(self, frames_done: int, total_frames: int, phase: str):
         elapsed = time.monotonic() - self._start_time
@@ -148,6 +163,7 @@ class DetectDialog(QDialog):
         elapsed = time.monotonic() - self._start_time
         total_clips = sum(len(v) for v in results.values())
         self._progress.setValue(100)
+        self._step_label.setText("Done")
         self._detail_label.setText(
             f"Done — {total_clips} clips from {len(results)} segment(s) in {int(elapsed)}s"
         )
@@ -158,6 +174,7 @@ class DetectDialog(QDialog):
         self._start_btn.setEnabled(True)
         self._threshold_spin.setEnabled(True)
         self._progress.setVisible(False)
+        self._step_label.setVisible(False)
         self._detail_label.setText(f"Error: {msg}")
         logger.error("Detection failed: %s", msg)
 
