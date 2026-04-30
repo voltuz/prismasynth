@@ -38,6 +38,7 @@ CLIP_HEIGHT_MAX = 200
 HEADER_HEIGHT = 48
 TIMELINE_H_PADDING = 4  # small internal padding for playhead clearance
 RESIZE_HANDLE_HEIGHT = 5  # pixels at bottom edge for drag resize
+THUMB_HIDE_THRESHOLD = 30  # px clip width — below this, skip thumbnail paint and generation
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
 GAP_COLOR = QColor(30, 30, 30)
@@ -214,9 +215,12 @@ class TimelineStrip(QWidget):
         seconds_per_pixel = 1.0 / (self._pixels_per_frame * self._fps) if self._fps > 0 else 1.0
         # Target roughly 80 pixels between major ticks
         target_seconds = seconds_per_pixel * 80
-        # Snap to nice intervals
-        nice_intervals = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
-        interval = nice_intervals[0]
+        # Snap to nice intervals. Fallback to the largest entry when target_seconds
+        # exceeds them all — without this, deep zoom-out smears thousands of 0.5s
+        # ticks into a solid bar across the ruler.
+        nice_intervals = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600,
+                          1200, 1800, 3600, 7200, 14400]
+        interval = nice_intervals[-1]
         for ni in nice_intervals:
             if ni >= target_seconds:
                 interval = ni
@@ -229,9 +233,11 @@ class TimelineStrip(QWidget):
             x = self._frame_to_pixel(int(t * self._fps)) - self._scroll_offset
             if 0 <= x <= width:
                 painter.drawLine(x, HEADER_HEIGHT - 6, x, HEADER_HEIGHT)
-                minutes = int(t) // 60
-                secs = int(t) % 60
-                label = f"{minutes}:{secs:02d}"
+                ti = int(t)
+                if interval >= 3600:
+                    label = f"{ti // 3600}:{(ti % 3600) // 60:02d}:{ti % 60:02d}"
+                else:
+                    label = f"{ti // 60}:{ti % 60:02d}"
                 painter.drawText(x + 3, HEADER_HEIGHT - 8, label)
             t += interval
 
@@ -252,7 +258,11 @@ class TimelineStrip(QWidget):
                           / self._pixels_per_frame))
 
     def get_visible_clip_ids(self):
-        """Return IDs of non-gap clips currently visible in the viewport."""
+        """Return IDs of non-gap clips currently visible in the viewport.
+
+        Clips narrower than THUMB_HIDE_THRESHOLD are excluded so the thumbnail
+        cache doesn't burn workers generating frames that won't be painted.
+        """
         visible = []
         cumulative = 0
         vw = self.width()
@@ -260,8 +270,11 @@ class TimelineStrip(QWidget):
             start_px = self._frame_to_pixel(cumulative)
             cumulative += clip.duration_frames
             end_px = self._frame_to_pixel(cumulative)
+            clip_w = end_px - start_px
             screen_x = start_px - self._scroll_offset
-            if screen_x + (end_px - start_px) < 0 or screen_x > vw:
+            if screen_x + clip_w < 0 or screen_x > vw:
+                continue
+            if clip_w < THUMB_HIDE_THRESHOLD:
                 continue
             if not clip.is_gap:
                 visible.append(clip.id)
@@ -318,7 +331,7 @@ class TimelineStrip(QWidget):
             th = self._clip_height - pad * 2
             tw = int(th * 16 / 9)
 
-            if self._thumbnails_enabled:
+            if self._thumbnails_enabled and clip_w >= THUMB_HIDE_THRESHOLD:
                 # First frame thumbnail — always shown, cropped to clip bounds with border
                 thumb_first = self._thumbnails.get((clip.id, "first"))
                 if thumb_first and clip_w > pad * 2 and th > 0:
@@ -581,7 +594,7 @@ class TimelineStrip(QWidget):
             frame_under_mouse = (mouse_x + self._scroll_offset - TIMELINE_H_PADDING) / self._pixels_per_frame
 
             factor = 1.15 if delta > 0 else 1 / 1.15
-            self._pixels_per_frame = max(0.01, min(20.0, self._pixels_per_frame * factor))
+            self._pixels_per_frame = max(0.001, min(20.0, self._pixels_per_frame * factor))
 
             # Adjust scroll so the frame under mouse stays in place
             new_px = TIMELINE_H_PADDING + frame_under_mouse * self._pixels_per_frame

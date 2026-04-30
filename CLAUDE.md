@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with TransNetV2 (GPU neural network), review/delete/split clips on a timeline, export as video, image sequence, or FCPXML. Single-track editor — no layers, no compositing.
+PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with TransNetV2 (GPU neural network), review/delete/split clips on a timeline, export as video, image sequence, FCPXML, or OpenTimelineIO. Single-track editor — no layers, no compositing.
 
 ## Running
 
@@ -130,6 +130,18 @@ Only supported timeline-interchange format. FCPXML encodes positions as rational
 - **Asset reuse:** one `<asset>` per *source* file (not per clip), IDs assigned in discovery order as `r2`, `r3`, etc. (`r1` is reserved for the `<format>`).
 - **Remaining ±1 drift trace:** source-file container timebase, not this exporter. MOVs exported with pre-v0.2.0 PrismaSynth use `time_base=1/16000`, which can't represent 23.976 exactly (667 vs 668 tick frames averaging). Re-export the source with current PrismaSynth (`-video_track_timescale 24000000`) for clean frame math end-to-end.
 
+### OTIO Export (OpenTimelineIO native JSON)
+
+`core.otio_exporter.export_otio` writes an `.otio` document matching the public OTIO schema (Timeline.1 / Stack.1 / Track.1 / Clip.2 / Gap.1 / ExternalReference.1 / TimeRange.1 / RationalTime.1). Resolve Studio imports it natively; Premiere goes through an external OTIO adapter.
+
+- **No `opentimelineio` Python dep:** we emit the JSON directly (same pattern as `xml_exporter.py`). OTIO 0.18.1 has a packaging bug on Python 3.14 — wheel tagged `cp314` but ships `cp313` `.pyd` files — and we only ever wrote files, so the library was a nicety, not a requirement.
+- **`source_range.start_time` nudge (`_SRC_SEEK_NUDGE = 0.25`):** every clip's `source_range.start_time.value` is written as `frame + 0.25`. *Why:* at rates like 24000/1001, the round-trip `time = value / our_rate; frame = floor(time * reader_rate)` drifts by ±1 ULP and can land `N.0` at `N-1.9999999...`. Verified empirically against Resolve (test_09.otio, clip 5 source_start 3543 → 3542 drift with no nudge). Sweeping frames 0-10000 with Resolve's rate (`23.976023976023979` vs our `23.976023976023978`) drifts 692 frames (~7%). A `+0.25` nudge eliminates all drift under `floor()`, `trunc()`, and `round()` reader modes. FCPXML uses `+0.5` (mid-1/24-tick for its different rounding mechanism); OTIO needs `+0.25` because `+0.5` breaks readers using `round()` — residues just over 0.5 snap to N+1. Only `source_range.start_time` is nudged: duration, `available_range`, and `Gap.source_range` stay integer.
+- **Clip.2 schema:** `media_references` dict + `active_media_reference_key="DEFAULT_MEDIA"`. Clip.1 (`media_reference` singular) is also legal but older; Clip.2 is shipped since OTIO 0.15 (2021) and supported by every current adapter.
+- **`available_range`** on each `ExternalReference` = `(start=0, duration=source.total_frames)` at sequence rate. Asserts source length so OTIO-aware tools can display source handles without re-probing the file.
+- **Asset reuse:** one `ExternalReference` *dict* per source file shared by dict identity across clips. After JSON round-trip those become equal-but-distinct dicts — still semantically correct, just no longer pointer-shared.
+- **Metadata round-trip:** `metadata["prismasynth"]` stores `source_id` / `clip_id` / `color_index` / `label` so a future OTIO importer could reconstruct a .psynth project with no loss. `metadata["Resolve_OTIO"]` (effects, locks, timeline TC offset) is never written by us — Resolve fills it on its own round-trip.
+- **Smoke test:** `scripts/otio_smoke.py` builds a minimal in-memory timeline and asserts schema shape, nudge presence, integer counts for duration/available_range/gaps, metadata round-trip, packed-layout behaviour, render-range clipping, and the empty-timeline guard.
+
 ### Thumbnail System
 
 Persistent, long-lived thumbnail generator with sweep-based sequential decode. Created once per session, survives timeline edits. CPU-only decode (no NVDEC) to avoid GPU contention with mpv scrubbing.
@@ -194,7 +206,7 @@ Custom-painted strip (not Qt model/view). Clip positions computed from cumulativ
 - Export temp-file extension matches the output extension (`.mov` for ProRes, `.mp4` for H.264/5, `.mkv` for FFV1). Hardcoding `.mkv` would silently drop muxer options like `-video_track_timescale` on non-Matroska outputs.
 - Export subprocesses MUST be registered via `Exporter._register_proc()`. Never write to `self._active_procs` directly.
 - `ExportDialog` cancel button is state-driven: "Cancel" (idle, closes dialog) → "Cancel Export" (running, emits `cancel_requested` signal) → "Close" (done/finished, closes). `Exporter.cancelled` signal transitions the dialog to the "done" state with "Export cancelled." status.
-- Timeline interchange is FCPXML only (`core.xml_exporter.export_fcpxml`). Asset-clip `start` uses `_src_seek_str` which adds a `+frame_num/2` nudge to the numerator for NTSC rates — without it Resolve's internal `1/24` rounding drops half the clips to frame N−1. Don't revert to plain `_time_str` for the `start` attribute.
+- Timeline interchange: FCPXML (`core.xml_exporter.export_fcpxml`) and OTIO (`core.otio_exporter.export_otio`). FCPXML asset-clip `start` uses `_src_seek_str` with a `+frame_num/2` numerator nudge (NTSC `1/24` tick rounding). OTIO `source_range.start_time.value` uses `+_SRC_SEEK_NUDGE (0.25)` (float ULP round-trip drift). Different root causes, different nudge values — don't cross-port. Don't revert either to unnudged seek positions.
 - `TimelineModel.set_in_point()` / `set_out_point()` reject invalid inputs (would make In >= Out) instead of silently wiping the opposite marker — in/out changes are not undoable, so a silent wipe destroys data.
 - `TimelineModel.add_clips([])` and `replace_detected({})` early-return without pushing undo (would clobber the redo stack on empty ops like a failed import).
 - `save_project()` writes to `filepath + ".tmp"` then `os.replace()` — atomic, so the 60s autosave can't destroy the project mid-write.

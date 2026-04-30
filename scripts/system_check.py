@@ -1132,6 +1132,67 @@ def section_export_xml() -> SectionResult:
         else:
             fail(f"offsets = {offsets}, expected {expected_offsets}")
             failures += 1
+
+        # ---- Stress-gap subcase: explicitly tests gap-deletion math ----
+        # User concern: "gaps should get automatically deleted in the export
+        # ... be sure that the gap deletion logic works correctly and
+        # doesn't add one off frames". We build a timeline with multiple
+        # non-trivial gaps interspersed with clips at non-aligned source_in
+        # values and verify each <asset-clip> lands on (a) its true source
+        # in-frame via the +frame_num/2 nudge, and (b) the cumulative
+        # non-gap offset, with no gap-duration leak.
+        stress_clips = [
+            Clip(source_id="s0", source_in=50,   source_out=50  + 70  - 1),
+            Clip.make_gap(13),
+            Clip(source_id="s0", source_in=4444, source_out=4444 + 40  - 1),
+            Clip.make_gap(7),
+            Clip(source_id="s0", source_in=211,  source_out=211  + 123 - 1),
+            Clip.make_gap(31),
+            Clip(source_id="s0", source_in=9001, source_out=9001 + 50  - 1),
+        ]
+        expected_in = [50, 4444, 211, 9001]
+        expected_dur = [70, 40, 123, 50]
+        stress_tl = TimelineModel()
+        stress_tl.add_clips(stress_clips, assign_colors=False)
+        stress_path = td / "stress.fcpxml"
+        export_fcpxml(stress_tl, {"s0": vs}, str(stress_path), fps=fps)
+        stress_root = ET.parse(stress_path).getroot()
+        stress_acs = stress_root.findall(
+            "library/event/project/sequence/spine/asset-clip")
+        if len(stress_acs) != 4:
+            fail(f"stress-gap: expected 4 asset-clips (gaps dropped), "
+                 f"got {len(stress_acs)}")
+            failures += 1
+        else:
+            ok("stress-gap: 4 asset-clips, gaps dropped")
+
+        nudge = 1001 // 2  # 500
+        running_offset = 0
+        stress_failures = 0
+        for i, ac in enumerate(stress_acs):
+            n = expected_in[i]
+            d = expected_dur[i]
+            exp_start = f"{n * 1001 + nudge}/24000s"
+            exp_dur = f"{d * 1001}/24000s"
+            exp_off = ("0s" if running_offset == 0
+                       else f"{running_offset * 1001}/24000s")
+            if ac.get("start") != exp_start:
+                fail(f"stress clip {i} start = {ac.get('start')}, "
+                     f"expected {exp_start} (no gap leak)")
+                stress_failures += 1
+            if ac.get("duration") != exp_dur:
+                fail(f"stress clip {i} duration = {ac.get('duration')}, "
+                     f"expected {exp_dur}")
+                stress_failures += 1
+            if ac.get("offset") != exp_off:
+                fail(f"stress clip {i} offset = {ac.get('offset')}, "
+                     f"expected {exp_off} (gap-deletion off-by-one?)")
+                stress_failures += 1
+            running_offset += d
+        if stress_failures == 0:
+            ok("stress-gap: all 4 clips have nudged starts + packed "
+               "offsets (no off-by-one leak)")
+        failures += stress_failures
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
