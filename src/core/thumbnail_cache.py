@@ -1,10 +1,12 @@
 import logging
+import os
+import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import av
 import cv2
@@ -450,13 +452,15 @@ class ThumbnailCache(QObject):
                     self.thumbnail_ready.emit(clip_id, position, qimage)
 
     def start_bulk_cache(self,
-                         render_range: Optional[Tuple[int, int]] = None
+                         render_range: Optional[Tuple[int, int]] = None,
+                         force_overwrite: bool = False,
                          ) -> "BulkCacheJob":
         """Build a list of (source_id, frame_num) targets for the first and
-        last frame of every non-gap clip within render_range (inclusive),
-        skip ones already in memory or on disk, and start a background
-        BulkCacheJob to fill them. Returns the job; caller wires its
-        progress/finished/cancelled signals to UI."""
+        last frame of every non-gap clip within render_range (inclusive)
+        and start a background BulkCacheJob to fill them. By default frames
+        already in memory or on disk are skipped; pass force_overwrite=True
+        to queue every in-scope frame for re-decode (existing JPEGs are
+        overwritten in place by the bulk job's write-on-result path)."""
         # Make sure emit_for_frame can find clips even if start() was never
         # called (e.g. master thumbnails toggle is off).
         self._rebuild_clip_lookup()
@@ -478,14 +482,52 @@ class ThumbnailCache(QObject):
                 if key in seen:
                     continue
                 seen.add(key)
-                cache_key = f"{clip.source_id}_{frame_num}"
-                if cache_key in self._mem_cache:
-                    continue
-                if self._disk_thumb_path(clip.source_id, frame_num).exists():
-                    continue
+                if not force_overwrite:
+                    cache_key = f"{clip.source_id}_{frame_num}"
+                    if cache_key in self._mem_cache:
+                        continue
+                    if self._disk_thumb_path(clip.source_id,
+                                             frame_num).exists():
+                        continue
                 targets.append(key)
         job = BulkCacheJob(self, targets)
         return job
+
+    def disk_thumbnail_stats(self, source_ids: Iterable[str]
+                             ) -> Tuple[int, int]:
+        """Return (file_count, total_bytes) of cached JPEGs on disk for
+        the given source IDs. Used to power the Clear-button confirm."""
+        n = 0
+        total = 0
+        for sid in source_ids:
+            d = get_cache_dir() / "thumbs" / sid
+            if not d.exists():
+                continue
+            for entry in d.iterdir():
+                if entry.is_file():
+                    try:
+                        total += entry.stat().st_size
+                        n += 1
+                    except OSError:
+                        pass
+        return n, total
+
+    def clear_disk_thumbnails(self, source_ids: Iterable[str]
+                              ) -> Tuple[int, int]:
+        """Delete the cached-thumbnail directories for the given source IDs
+        and clear matching in-memory entries. Returns the (file_count,
+        total_bytes) freed. Tolerates missing dirs and partial failures."""
+        ids = list(source_ids)
+        n, total = self.disk_thumbnail_stats(ids)
+        for sid in ids:
+            d = get_cache_dir() / "thumbs" / sid
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+            # Clear matching mem-cache + lq_emitted markers so the next
+            # viewport request actually triggers a fresh decode instead of
+            # serving the stale in-memory thumbnail.
+            self.invalidate_source(sid)
+        return n, total
 
     @staticmethod
     def _disk_thumb_path(source_id: str, frame_num: int) -> Path:
@@ -558,39 +600,67 @@ class BulkCacheJob(QObject):
         done = 0
         self.progress.emit(0, total)
 
+        # Build every chunk up front, across all sources, so the worker pool
+        # has a flat list of independent units of work to consume.
+        # Use the same sweep grouping as the viewport-driven coordinator so
+        # far-apart targets become independent seeks instead of one giant
+        # decode-from-zero. Cap each chunk at MAX_RUN frames so a cancel
+        # request lands within ~one chunk's decode time.
+        MAX_RUN = 16
+        chunks: List[Tuple[VideoSource, str, List[int]]] = []
         for source_id, frames in by_source.items():
-            if self._cancelled:
-                self.cancelled.emit()
-                return
             source = self._cache._sources.get(source_id)
             if source is None:
                 done += len(frames)
-                self.progress.emit(done, total)
                 continue
             frames.sort()
-            # Use the same sweep grouping as the viewport-driven coordinator
-            # so far-apart targets become independent seeks instead of one
-            # giant decode-from-zero. Cap each run at MAX_RUN frames so a
-            # cancel request lands within ~one chunk's decode time instead
-            # of waiting for a giant sweep to finish.
-            MAX_RUN = 16
             raw_runs = ThumbnailCache._build_runs(
                 [(f, "", "") for f in frames])
-            runs = []
             for r in raw_runs:
                 for i in range(0, len(r), MAX_RUN):
-                    runs.append(r[i:i + MAX_RUN])
-            for run in runs:
+                    chunk_frames = [f[0] for f in r[i:i + MAX_RUN]]
+                    chunks.append((source, source_id, chunk_frames))
+        if done > 0:
+            self.progress.emit(done, total)
+
+        if not chunks:
+            self.finished.emit()
+            return
+
+        # Parallel decode: a dedicated pool sized to the CPU. Each chunk is
+        # an independent ffmpeg/PyAV invocation, so they scale near-linearly
+        # with worker count up to the point disk I/O or memory bandwidth
+        # saturates. Cap at 8 to avoid thrashing on big machines.
+        workers = max(2, min(os.cpu_count() or 4, 8))
+        pool = ThreadPoolExecutor(max_workers=workers,
+                                  thread_name_prefix="bulk-thumb")
+        try:
+            futures: Dict[Future, Tuple[str, int]] = {}
+            for source, source_id, chunk_frames in chunks:
                 if self._cancelled:
-                    self.cancelled.emit()
-                    return
-                run_frames = [f[0] for f in run]
-                if len(run_frames) == 1:
-                    results = self._cache._grab_frame_single(
-                        source, run_frames[0])
+                    break
+                if len(chunk_frames) == 1:
+                    fut = pool.submit(
+                        self._cache._grab_frame_single,
+                        source, chunk_frames[0])
                 else:
-                    results = self._cache._grab_frames_sweep(
-                        source, run_frames)
+                    fut = pool.submit(
+                        self._cache._grab_frames_sweep,
+                        source, chunk_frames)
+                futures[fut] = (source_id, len(chunk_frames))
+
+            for fut in as_completed(futures):
+                if self._cancelled:
+                    # Stop scheduling new work; in-flight chunks finish on
+                    # their own. Already-submitted-but-not-started futures
+                    # will be cancelled by the shutdown in `finally`.
+                    break
+                source_id, chunk_size = futures[fut]
+                try:
+                    results = fut.result()
+                except Exception as e:
+                    logger.debug("bulk chunk failed: %s", e)
+                    results = None
                 if results:
                     for frame_num, qimage in results:
                         cache_key = f"{source_id}_{frame_num}"
@@ -599,7 +669,15 @@ class BulkCacheJob(QObject):
                             source_id, frame_num, qimage)
                         self._cache.emit_for_frame(
                             source_id, frame_num, qimage)
-                done += len(run_frames)
+                done += chunk_size
                 self.progress.emit(done, total)
+        finally:
+            # cancel_futures cancels pending-but-not-running futures.
+            # In-flight chunks are not interruptible mid-decode, but they
+            # finish in O(one chunk) time (~hundreds of ms).
+            pool.shutdown(wait=True, cancel_futures=True)
 
-        self.finished.emit()
+        if self._cancelled:
+            self.cancelled.emit()
+        else:
+            self.finished.emit()
