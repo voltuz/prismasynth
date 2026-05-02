@@ -18,6 +18,7 @@ from core.proxy_cache import ProxyManager
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
 from utils.diag import diag
+from utils.ffprobe import probe_hdr
 from utils.paths import get_cache_dir
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,83 @@ THUMB_WIDTH = 192
 THUMB_HEIGHT = 108
 THUMB_FRAME_SIZE = THUMB_WIDTH * THUMB_HEIGHT * 3
 _MAX_WORKERS = 6
+
+# Bulk-decode parallelism. Two pools because the two paths scale very
+# differently:
+#   - LIGHT (PyAV sweep, single-threaded decode per container) is bound
+#     by Windows file-handle contention + per-chunk open/seek overhead,
+#     not by CPU. Empirical sweep on a 32-thread machine showed the
+#     throughput peak is at 8 workers; 12 is comparable; 16+ regresses
+#     because too many simultaneous av.open() calls thrash the kernel.
+#   - HEAVY (per-frame NVDEC ffmpeg subprocess) is GPU-bound. Consumer
+#     NVIDIA cards typically allow 5-8 concurrent NVDEC sessions; 6 is
+#     the safe baseline.
+_BULK_LIGHT_WORKERS = max(4, min(os.cpu_count() or 6, 8))
+_BULK_HEAVY_WORKERS = 6
+
+
+def _build_bulk_cmd_gpu_scale(file_path: str, timestamp: float) -> list:
+    """NVDEC decode + GPU scale via scale_cuda. Fastest for HEVC/HDR sources.
+    Mirrors scene_detector._build_ffmpeg_cmd_gpu_scale."""
+    return [
+        "ffmpeg", "-nostdin", "-v", "quiet",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-ss", f"{timestamp:.4f}",
+        "-i", file_path,
+        "-frames:v", "1",
+        "-vf",
+        f"scale_cuda={THUMB_WIDTH}:{THUMB_HEIGHT}:format=nv12,"
+        "hwdownload,format=nv12,format=rgb24",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "pipe:1",
+    ]
+
+
+def _build_bulk_cmd_gpu_decode(file_path: str, timestamp: float) -> list:
+    """NVDEC decode + CPU scale. Fallback when scale_cuda is unavailable
+    (older drivers / unsupported pixel formats)."""
+    return [
+        "ffmpeg", "-nostdin", "-v", "quiet",
+        "-hwaccel", "cuda",
+        "-ss", f"{timestamp:.4f}",
+        "-i", file_path,
+        "-frames:v", "1",
+        "-vf", f"scale={THUMB_WIDTH}:{THUMB_HEIGHT}:flags=fast_bilinear",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "pipe:1",
+    ]
+
+
+def _build_bulk_cmd_cpu(file_path: str, timestamp: float) -> list:
+    """Pure-CPU fallback. Used only when no NVDEC path probes successfully
+    (no NVIDIA GPU, missing CUDA driver, or codec unsupported by NVDEC)."""
+    return [
+        "ffmpeg", "-nostdin", "-v", "quiet",
+        "-ss", f"{timestamp:.4f}",
+        "-i", file_path,
+        "-frames:v", "1",
+        "-vf", f"scale={THUMB_WIDTH}:{THUMB_HEIGHT}:flags=fast_bilinear",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "pipe:1",
+    ]
+
+
+def _probe_decode_cmd(cmd: list) -> bool:
+    """Run an ffmpeg cmd briefly and check it produces a full thumbnail
+    frame's worth of bytes. Mirrors scene_detector._probe_ffmpeg_cmd."""
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            data = proc.stdout.read(THUMB_FRAME_SIZE)
+        finally:
+            proc.stdout.close()
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception:
+        return False
+    return len(data) >= THUMB_FRAME_SIZE
+
 
 # If the next target is within this many frames, keep decoding forward
 # instead of re-seeking. Roughly 2x typical H.265 GOP size.
@@ -80,6 +158,21 @@ class ThumbnailCache(QObject):
         # instead of waiting for per-frame communicate() timeouts.
         self._active_procs: Set[subprocess.Popen] = set()
         self._procs_lock = threading.Lock()
+
+        # Bulk decode method per source-id, populated lazily by
+        # _get_bulk_decode_method on first use. Cached for the cache's
+        # lifetime since the source file's codec doesn't change. Value is
+        # one of the _build_bulk_cmd_* functions or None for "no method
+        # works for this source".
+        self._bulk_decode: Dict[str, Optional[callable]] = {}
+        self._bulk_decode_lock = threading.Lock()
+
+        # Set while a BulkCacheJob is running. The coordinator's
+        # _submit_sweeps short-circuits when this is set so it doesn't
+        # spawn parallel PyAV containers on the same source — preventing
+        # native-side resource exhaustion (file handles + libav decode
+        # threads) that crashed Run 1 of the Fantasy Island bake.
+        self._bulk_in_progress = threading.Event()
 
     def set_hq_enabled(self, enabled: bool):
         """Toggle HQ thumbnail generation. LQ proxy placeholders keep emitting
@@ -199,6 +292,13 @@ class ThumbnailCache(QObject):
 
     def _submit_sweeps(self, in_flight):
         """Build sweep batches from visible frames and submit to pool."""
+        # Stand down while a bulk bake is running — multiple PyAV containers
+        # on the same source from coordinator + bulk pools simultaneously
+        # was the root cause of the silent native crash on the Fantasy
+        # Island reproducer. The bulk job calls _wake_event.set() when it
+        # finishes so the coordinator picks back up immediately.
+        if self._bulk_in_progress.is_set():
+            return
         with self._priority_lock:
             visible_ids = set(self._priority_clip_ids)
             playhead = self._playhead_frame
@@ -309,6 +409,145 @@ class ThumbnailCache(QObject):
                 runs.append([f])
         return runs
 
+    @staticmethod
+    def _is_heavy_source(source: VideoSource) -> bool:
+        """Pick the right bulk-decode path for this source.
+
+        Light = H.264 SDR ≤1080p — PyAV sweep handles it fast and reliably;
+        amortizes one decoder context across many target frames per call.
+
+        Heavy = HEVC, AV1, ≥4K, or HDR — software libav decode is either
+        slow (4K/HEVC) or unreliable (Dolby Vision metadata can fail
+        decode entirely, observed crash on Monster S01E08). Each frame
+        becomes its own ffmpeg subprocess with NVDEC, so a libav segfault
+        on one frame can't take down the others.
+        """
+        codec = (source.codec or "").lower()
+        if codec not in ("h264", "avc", "avc1"):
+            return True
+        if source.width >= 3000 or source.height >= 1800:
+            return True
+        # HDR detection requires its own ffprobe call (cached in
+        # ffprobe._hdr_cache after first lookup, so cheap on repeat).
+        if probe_hdr(source.file_path):
+            return True
+        return False
+
+    def _get_bulk_decode_method(self, source: VideoSource):
+        """Return a `_build_bulk_cmd_*` builder appropriate for this source,
+        probing the NVDEC → NVDEC-decode → CPU cascade once per source-id.
+        Returns None if no method produces output (very rare: missing
+        ffmpeg / corrupt file). Cached across the cache's lifetime."""
+        with self._bulk_decode_lock:
+            if source.id in self._bulk_decode:
+                return self._bulk_decode[source.id]
+        # Probe outside the lock so concurrent first-use on different sources
+        # doesn't serialize. Worst case two threads probe the same source
+        # simultaneously and both write the same result.
+        # Probe at frame 0 — codec capability is per-stream, not per-frame.
+        diag(f"bulk    probe sid={source.id[:6]} {source.codec} "
+             f"{source.width}x{source.height}")
+        for builder, label in (
+            (_build_bulk_cmd_gpu_scale, "scale_cuda"),
+            (_build_bulk_cmd_gpu_decode, "nvdec+cpu_scale"),
+            (_build_bulk_cmd_cpu, "cpu"),
+        ):
+            cmd = builder(source.file_path, 0.0)
+            if _probe_decode_cmd(cmd):
+                diag(f"bulk    probe-ok sid={source.id[:6]} method={label}")
+                with self._bulk_decode_lock:
+                    self._bulk_decode[source.id] = builder
+                return builder
+        diag(f"bulk    probe-FAIL sid={source.id[:6]}")
+        with self._bulk_decode_lock:
+            self._bulk_decode[source.id] = None
+        return None
+
+    def _bulk_worker_light(self, source: VideoSource, source_id: str,
+                           chunk_frames: List[int]) -> int:
+        """Worker function for the LIGHT bulk path. Decodes a chunk, then
+        does ALL post-processing (disk save + mem-cache + signal emit) on
+        the worker thread itself. Returns frame count for progress.
+
+        Moving post-processing into the worker is what lets the bulk pool
+        scale past ~8 workers. Otherwise the orchestrator thread serializes
+        ~3-5 ms of save+emit per frame, which becomes the wall-time floor.
+        """
+        results = self._grab_frames_sweep(source, chunk_frames)
+        if results:
+            for frame_num, qimage in results:
+                cache_key = f"{source_id}_{frame_num}"
+                self._mem_cache[cache_key] = qimage
+                ThumbnailCache._save_disk_thumbnail(
+                    source_id, frame_num, qimage)
+                self.emit_for_frame(source_id, frame_num, qimage)
+        return len(chunk_frames)
+
+    def _bulk_worker_heavy(self, source: VideoSource, source_id: str,
+                           frame_num: int) -> int:
+        """Worker function for the HEAVY bulk path. Same parallel-post-
+        processing pattern as _bulk_worker_light. Returns 1 for progress."""
+        results = self._grab_frame_bulk(source, frame_num)
+        if results:
+            for fn, qimage in results:
+                cache_key = f"{source_id}_{fn}"
+                self._mem_cache[cache_key] = qimage
+                ThumbnailCache._save_disk_thumbnail(source_id, fn, qimage)
+                self.emit_for_frame(source_id, fn, qimage)
+        return 1
+
+    def _grab_frame_bulk(self, source: VideoSource,
+                         frame_num: int) -> Optional[List[Tuple[int, QImage]]]:
+        """Grab one frame via the per-source-cached bulk decode method.
+        Each call is a fully isolated ffmpeg subprocess: a crash in one
+        subprocess (libav segfault, NVDEC error) doesn't affect other
+        workers. Used by BulkCacheJob; not used by the viewport-driven
+        coordinator (which intentionally avoids GPU contention with mpv)."""
+        if self._stopped or not self._pause_event.is_set():
+            return None
+        builder = self._get_bulk_decode_method(source)
+        if builder is None:
+            return None
+        timestamp = frame_num / source.fps if source.fps > 0 else 0.0
+        cmd = builder(source.file_path, timestamp)
+        diag(f"bulk    grab sid={source.id[:6]} f={frame_num}")
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            with self._procs_lock:
+                if self._stopped:
+                    proc.kill()
+                    return None
+                self._active_procs.add(proc)
+            try:
+                data, _ = proc.communicate(timeout=30)
+            finally:
+                with self._procs_lock:
+                    self._active_procs.discard(proc)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            diag(f"bulk    grab-ERR sid={source.id[:6]} f={frame_num} "
+                 f"{type(e).__name__}")
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+            return None
+
+        if self._stopped or len(data) < THUMB_FRAME_SIZE:
+            diag(f"bulk    grab-empty sid={source.id[:6]} f={frame_num} "
+                 f"bytes={len(data) if data else 0}")
+            return None
+
+        rgb = np.frombuffer(data[:THUMB_FRAME_SIZE], dtype=np.uint8).reshape(
+            THUMB_HEIGHT, THUMB_WIDTH, 3)
+        h, w, ch = rgb.shape
+        qimg = QImage(bytes(rgb.data), w, h, ch * w,
+                      QImage.Format.Format_RGB888).copy()
+        return [(frame_num, qimg)]
+
     def _grab_frame_single(self, source: VideoSource,
                            frame_num: int) -> Optional[List[Tuple[int, QImage]]]:
         """Grab one frame via ffmpeg seek. Used for isolated frames."""
@@ -379,7 +618,12 @@ class ThumbnailCache(QObject):
             container = av.open(source.file_path)
             diag(f"sweep   av.open-done sid={source.id[:6]}")
             stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
+            # Single-threaded decode per container. Pool-level parallelism
+            # already provides throughput; AUTO on top of 6 parallel
+            # containers blew past native resource limits and silently
+            # segfaulted on the 1153-frame Fantasy Island bake (see plan:
+            # "Bulk Cache crash on light-path bake").
+            stream.thread_type = "NONE"
             tb = float(stream.time_base)
 
             targets = list(target_frames)
@@ -572,9 +816,11 @@ class ThumbnailCache(QObject):
 
 class BulkCacheJob(QObject):
     """Background task that fills the thumbnail disk cache for a fixed list
-    of (source_id, frame_num) targets. Runs PyAV sweeps per source; results
-    are saved to disk, populated into the parent cache's memory, and
-    emitted to any visible clip referencing the same source frame."""
+    of (source_id, frame_num) targets. Each target is decoded by an
+    isolated ffmpeg subprocess (NVDEC where available, CPU fallback) so a
+    single bad frame can't crash the whole bake. Results are saved to disk,
+    populated into the parent cache's memory, and emitted to any visible
+    clip referencing the same source frame."""
 
     progress = Signal(int, int)  # done, total
     finished = Signal()
@@ -607,98 +853,138 @@ class BulkCacheJob(QObject):
 
     def _run(self):
         diag(f"bulk    _run start total={len(self._targets)}")
-        # Group targets by source so we can sweep-decode each source once
-        by_source: Dict[str, List[int]] = {}
-        for source_id, frame_num in self._targets:
-            by_source.setdefault(source_id, []).append(frame_num)
-
+        # Tell the coordinator to back off for the duration of this bake so
+        # we don't end up with both pools opening PyAV containers on the
+        # same source. Cleared in `finally`; the wake_event nudge re-arms
+        # the coordinator immediately after.
+        self._cache._bulk_in_progress.set()
         total = len(self._targets)
         done = 0
         self.progress.emit(0, total)
 
-        # Build every chunk up front, across all sources, so the worker pool
-        # has a flat list of independent units of work to consume.
-        # Use the same sweep grouping as the viewport-driven coordinator so
-        # far-apart targets become independent seeks instead of one giant
-        # decode-from-zero. Cap each chunk at MAX_RUN frames so a cancel
-        # request lands within ~one chunk's decode time.
-        MAX_RUN = 16
-        chunks: List[Tuple[VideoSource, str, List[int]]] = []
-        for source_id, frames in by_source.items():
+        # Group targets by source and resolve sources up front. We split
+        # later by light/heavy: light sources stay on the fast PyAV sweep
+        # path (one decoder context, many frames per call); heavy sources
+        # go through per-frame NVDEC subprocesses for crash isolation.
+        by_source: Dict[str, List[int]] = {}
+        sources_by_id: Dict[str, VideoSource] = {}
+        for source_id, frame_num in self._targets:
             source = self._cache._sources.get(source_id)
             if source is None:
-                done += len(frames)
+                done += 1
                 continue
-            frames.sort()
-            raw_runs = ThumbnailCache._build_runs(
-                [(f, "", "") for f in frames])
-            for r in raw_runs:
-                for i in range(0, len(r), MAX_RUN):
-                    chunk_frames = [f[0] for f in r[i:i + MAX_RUN]]
-                    chunks.append((source, source_id, chunk_frames))
+            sources_by_id[source_id] = source
+            by_source.setdefault(source_id, []).append(frame_num)
         if done > 0:
             self.progress.emit(done, total)
-
-        if not chunks:
+        if not by_source:
             self.finished.emit()
             return
 
-        # Parallel decode: a dedicated pool sized to the CPU. Each chunk is
-        # an independent ffmpeg/PyAV invocation, so they scale near-linearly
-        # with worker count up to the point disk I/O or memory bandwidth
-        # saturates. Cap at 8 to avoid thrashing on big machines.
-        workers = max(2, min(os.cpu_count() or 4, 8))
-        diag(f"bulk    pool create workers={workers} chunks={len(chunks)}")
-        pool = ThreadPoolExecutor(max_workers=workers,
-                                  thread_name_prefix="bulk-thumb")
+        # Build futures of two kinds, both dispatched to the same pool:
+        # - LIGHT: PyAV sweep on a chunk of nearby frames (fast, scales
+        #          via amortized decode + GIL release).
+        # - HEAVY: NVDEC subprocess per frame (slower per call but isolated
+        #          and reliable on HEVC/HDR/4K).
+        # Each future records how many frames it covers so progress and
+        # the result loop stay correct regardless of mode.
+        sweep_chunks: List[Tuple[VideoSource, str, List[int]]] = []
+        heavy_units: List[Tuple[VideoSource, str, int]] = []
+        for sid, frames in by_source.items():
+            source = sources_by_id[sid]
+            if ThumbnailCache._is_heavy_source(source):
+                # Probe NVDEC method up front so 6 workers don't race for
+                # the same probe. Cheap (one ~50 ms ffmpeg call per source,
+                # cached for the cache's lifetime).
+                self._cache._get_bulk_decode_method(source)
+                for fn in frames:
+                    heavy_units.append((source, sid, fn))
+            else:
+                # PyAV sweep grouping: only chain frames within a typical
+                # GOP (SEQUENTIAL_THRESHOLD); cap each chunk so cancel
+                # lands within ~one chunk's decode time.
+                MAX_RUN = 16
+                frames_sorted = sorted(frames)
+                raw_runs = ThumbnailCache._build_runs(
+                    [(f, "", "") for f in frames_sorted])
+                for r in raw_runs:
+                    for i in range(0, len(r), MAX_RUN):
+                        chunk_frames = [f[0] for f in r[i:i + MAX_RUN]]
+                        sweep_chunks.append((source, sid, chunk_frames))
+
+        n_light = sum(len(c) for _, _, c in sweep_chunks)
+        n_heavy = len(heavy_units)
+        diag(f"bulk    pool create light_workers={_BULK_LIGHT_WORKERS} "
+             f"light_chunks={len(sweep_chunks)} (frames={n_light}) "
+             f"heavy_workers={_BULK_HEAVY_WORKERS} "
+             f"heavy_units={n_heavy}")
+        # Two pools: light gets up to cpu_count workers (PyAV scales with
+        # CPU), heavy stays capped (NVDEC concurrent-stream limit). Only
+        # spin up a pool if we actually have work for it, so a pure-light
+        # or pure-heavy bake doesn't carry an unused executor's overhead.
+        light_pool = (
+            ThreadPoolExecutor(max_workers=_BULK_LIGHT_WORKERS,
+                               thread_name_prefix="bulk-light")
+            if sweep_chunks else None)
+        heavy_pool = (
+            ThreadPoolExecutor(max_workers=_BULK_HEAVY_WORKERS,
+                               thread_name_prefix="bulk-heavy")
+            if heavy_units else None)
         try:
-            futures: Dict[Future, Tuple[str, int]] = {}
-            for source, source_id, chunk_frames in chunks:
-                if self._cancelled:
-                    break
-                if len(chunk_frames) == 1:
-                    fut = pool.submit(
-                        self._cache._grab_frame_single,
-                        source, chunk_frames[0])
-                else:
-                    fut = pool.submit(
-                        self._cache._grab_frames_sweep,
-                        source, chunk_frames)
-                futures[fut] = (source_id, len(chunk_frames))
+            # futures[fut] = (source_id, frame_count). The count lets
+            # progress increment correctly whether the future was a one-
+            # frame heavy unit or a multi-frame light chunk.
+            # Workers do their own post-processing (save + cache + emit)
+            # so the orchestrator stays a thin progress sink. With the old
+            # design the orchestrator was the wall-time floor (~3-5 ms/
+            # frame of serialized save+emit); now the bulk pool actually
+            # scales with workers.
+            futures: Dict[Future, int] = {}
+            if light_pool is not None:
+                for source, sid, chunk_frames in sweep_chunks:
+                    if self._cancelled:
+                        break
+                    fut = light_pool.submit(
+                        self._cache._bulk_worker_light,
+                        source, sid, chunk_frames)
+                    futures[fut] = len(chunk_frames)
+            if heavy_pool is not None:
+                for source, sid, frame_num in heavy_units:
+                    if self._cancelled:
+                        break
+                    fut = heavy_pool.submit(
+                        self._cache._bulk_worker_heavy,
+                        source, sid, frame_num)
+                    futures[fut] = 1
             diag(f"bulk    submitted {len(futures)} futures, draining…")
 
             for fut in as_completed(futures):
                 if self._cancelled:
-                    # Stop scheduling new work; in-flight chunks finish on
-                    # their own. Already-submitted-but-not-started futures
-                    # will be cancelled by the shutdown in `finally`.
                     diag("bulk    cancel detected mid-drain, breaking")
                     break
-                source_id, chunk_size = futures[fut]
+                n = futures[fut]
                 try:
-                    results = fut.result()
+                    fut.result()  # propagate worker exception, ignore value
                 except Exception as e:
-                    diag(f"bulk    chunk EXC {type(e).__name__}: {e}")
-                    logger.debug("bulk chunk failed: %s", e)
-                    results = None
-                if results:
-                    for frame_num, qimage in results:
-                        cache_key = f"{source_id}_{frame_num}"
-                        self._cache._mem_cache[cache_key] = qimage
-                        ThumbnailCache._save_disk_thumbnail(
-                            source_id, frame_num, qimage)
-                        self._cache.emit_for_frame(
-                            source_id, frame_num, qimage)
-                done += chunk_size
+                    diag(f"bulk    worker EXC {type(e).__name__}: {e}")
+                    logger.debug("bulk worker failed: %s", e)
+                done += n
                 self.progress.emit(done, total)
             diag(f"bulk    drain done={done}/{total}")
         finally:
-            # cancel_futures cancels pending-but-not-running futures.
-            # In-flight chunks are not interruptible mid-decode, but they
-            # finish in O(one chunk) time (~hundreds of ms).
+            # cancel_futures cancels pending-but-not-running futures. In-
+            # flight subprocesses aren't interruptible from here; cancel()
+            # on the dialog already issued kills on registered procs.
             diag("bulk    pool shutdown begin (wait=True)")
-            pool.shutdown(wait=True, cancel_futures=True)
+            if light_pool is not None:
+                light_pool.shutdown(wait=True, cancel_futures=True)
+            if heavy_pool is not None:
+                heavy_pool.shutdown(wait=True, cancel_futures=True)
             diag("bulk    pool shutdown done")
+            # Re-arm the coordinator: clear the quiesce flag and nudge its
+            # wake event so it picks up viewport work immediately.
+            self._cache._bulk_in_progress.clear()
+            self._cache._wake_event.set()
 
         if self._cancelled:
             diag("bulk    emit cancelled")
