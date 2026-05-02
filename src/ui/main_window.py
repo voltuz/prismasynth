@@ -7,7 +7,7 @@ from typing import Dict, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QStatusBar, QMessageBox, QFileDialog, QProgressBar,
-    QApplication,
+    QApplication, QDialog,
 )
 from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtGui import QAction, QKeySequence
@@ -32,6 +32,7 @@ from ui.clip_info_panel import ClipInfoPanel
 from ui.import_dialog import ImportDialog
 from ui.detect_dialog import DetectDialog
 from ui.export_dialog import ExportDialog
+from ui.relink_dialog import RelinkDialog
 
 logger = logging.getLogger(__name__)
 
@@ -1362,7 +1363,62 @@ class MainWindow(QMainWindow):
             logger.exception("Load failed")
             return
 
-        # Clear current state
+        # Detect missing sources after the load_project relative-path fallback.
+        # If the user cancels the relink dialog, abort BEFORE clearing state so
+        # the previously-open project remains intact.
+        relinks_applied = False
+        missing = {sid: s for sid, s in data["sources"].items()
+                   if not os.path.exists(s.file_path)}
+        if missing:
+            dlg = RelinkDialog(missing, parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            resolved = dlg.resolved_paths()
+            probe_cache = dlg.probe_cache()
+            shrunk_sources: set = set()
+            for sid, new_path in resolved.items():
+                if not new_path:
+                    continue
+                src = data["sources"][sid]
+                info = probe_cache.get(sid)
+                old_total_frames = src.total_frames
+                src.file_path = new_path
+                if info is not None:
+                    src.width = info.width
+                    src.height = info.height
+                    src.fps = info.fps
+                    src.total_frames = info.total_frames
+                    src.codec = info.codec
+                    src.audio_codec = info.audio_codec
+                    src.audio_sample_rate = info.audio_sample_rate
+                    src.audio_channels = info.audio_channels
+                    if info.total_frames < old_total_frames:
+                        shrunk_sources.add(sid)
+                relinks_applied = True
+
+            # Clamp any clip whose source_out exceeds the new (smaller) frame count.
+            clamped = 0
+            for c in data["clips"]:
+                if c.source_id in shrunk_sources:
+                    new_max = data["sources"][c.source_id].total_frames - 1
+                    if new_max < 0:
+                        continue
+                    if c.source_in > new_max:
+                        c.source_in = new_max
+                        c.source_out = new_max
+                        clamped += 1
+                    elif c.source_out > new_max:
+                        c.source_out = new_max
+                        clamped += 1
+            if clamped:
+                QMessageBox.warning(
+                    self, "Clips Clamped",
+                    f"{clamped} clip(s) had their out-points trimmed because "
+                    "the relinked source has fewer frames.",
+                )
+
+        # Clear current state (only after the relink dialog has accepted, so
+        # cancelling the dialog leaves the previous project intact).
         self._stop_playback()
 
         self._timeline.clear()
@@ -1375,6 +1431,11 @@ class MainWindow(QMainWindow):
         self._sources.clear()
         self._sources.update(data["sources"])
         for source in self._sources.values():
+            # Skipped/broken sources have non-existent paths; don't spin up
+            # readers or proxies for them. Clips referencing them will still
+            # render (black preview, no thumbnails) — matches existing behaviour.
+            if not os.path.exists(source.file_path):
+                continue
             self._reader_pool.register_source(source)
             self._proxy_manager.load_or_open(source)
 
@@ -1407,8 +1468,12 @@ class MainWindow(QMainWindow):
 
         # Update state
         self._project_path = path
-        self._dirty = False
-        self._autosave_timer.stop()
+        self._dirty = relinks_applied
+        if relinks_applied:
+            # Restart autosave so the new paths get persisted within 60s.
+            self._autosave_timer.start()
+        else:
+            self._autosave_timer.stop()
         self._add_recent_file(path)
         self._update_title()
         self._update_status()

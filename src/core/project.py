@@ -36,10 +36,17 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
         "sources": [],
         "clips": [],
     }
+    project_dir = os.path.dirname(filepath)
     for s in sources.values():
+        try:
+            relative_path = os.path.relpath(s.file_path, start=project_dir)
+        except ValueError:
+            # Cross-drive on Windows raises ValueError — no relative path possible.
+            relative_path = None
         data["sources"].append({
             "id": s.id,
             "file_path": s.file_path,
+            "relative_path": relative_path,
             "total_frames": s.total_frames,
             "fps": s.fps,
             "width": s.width,
@@ -66,6 +73,7 @@ def load_project(filepath: str):
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    project_dir = os.path.dirname(filepath)
     sources = {}
     for sd in data.get("sources", []):
         s = VideoSource(
@@ -80,6 +88,14 @@ def load_project(filepath: str):
             audio_sample_rate=sd.get("audio_sample_rate", 0),
             audio_channels=sd.get("audio_channels", 0),
         )
+        # If the absolute path is gone, try the relative path (project + sources
+        # transferred together). Only the relink dialog handles the rest.
+        if not os.path.exists(s.file_path):
+            rel = sd.get("relative_path")
+            if rel:
+                candidate = os.path.normpath(os.path.join(project_dir, rel))
+                if os.path.exists(candidate):
+                    s.file_path = candidate
         # Retroactive audio probe: legacy projects (saved before audio support)
         # have no audio fields. Re-probe so the project becomes audio-aware on
         # first load — no manual migration step.
