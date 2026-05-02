@@ -17,6 +17,7 @@ from PySide6.QtGui import QImage
 from core.proxy_cache import ProxyManager
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
+from utils.diag import diag
 from utils.paths import get_cache_dir
 
 logger = logging.getLogger(__name__)
@@ -313,6 +314,7 @@ class ThumbnailCache(QObject):
         """Grab one frame via ffmpeg seek. Used for isolated frames."""
         if self._stopped or not self._pause_event.is_set():
             return None
+        diag(f"single  enter sid={source.id[:6]} f={frame_num}")
         timestamp = frame_num / source.fps if source.fps > 0 else 0.0
         cmd = [
             "ffmpeg", "-nostdin", "-v", "quiet",
@@ -325,19 +327,24 @@ class ThumbnailCache(QObject):
         ]
         proc = None
         try:
+            diag(f"single  popen f={frame_num}")
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            diag(f"single  popen-done f={frame_num} pid={proc.pid}")
             with self._procs_lock:
                 if self._stopped:
                     proc.kill()
                     return None
                 self._active_procs.add(proc)
             try:
+                diag(f"single  communicate f={frame_num} pid={proc.pid}")
                 data, _ = proc.communicate(timeout=15)
+                diag(f"single  comm-done   f={frame_num} pid={proc.pid} bytes={len(data) if data else 0}")
             finally:
                 with self._procs_lock:
                     self._active_procs.discard(proc)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as e:
+            diag(f"single  ERR f={frame_num} {type(e).__name__}: {e}")
             if proc:
                 try:
                     proc.kill()
@@ -363,10 +370,14 @@ class ThumbnailCache(QObject):
         then decodes forward through all targets."""
         if self._stopped or not self._pause_event.is_set():
             return None
+        diag(f"sweep   enter sid={source.id[:6]} n={len(target_frames)} "
+             f"first={target_frames[0]} last={target_frames[-1]}")
         fps = source.fps if source.fps > 0 else 24.0
         results = []
         try:
+            diag(f"sweep   av.open sid={source.id[:6]}")
             container = av.open(source.file_path)
+            diag(f"sweep   av.open-done sid={source.id[:6]}")
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
             tb = float(stream.time_base)
@@ -376,7 +387,9 @@ class ThumbnailCache(QObject):
             idx = 0  # next target to find
 
             # Seek to just before first target
+            diag(f"sweep   seek sid={source.id[:6]} pts={target_pts[0]}")
             container.seek(target_pts[0], stream=stream)
+            diag(f"sweep   seek-done sid={source.id[:6]}")
 
             for frame in container.decode(stream):
                 # Abort mid-sweep when the user is scrubbing — frees CPU
@@ -399,7 +412,9 @@ class ThumbnailCache(QObject):
                     break
 
             container.close()
+            diag(f"sweep   exit sid={source.id[:6]} got={len(results)}")
         except Exception as e:
+            diag(f"sweep   ERR sid={source.id[:6]} {type(e).__name__}: {e}")
             logger.debug("Sweep decode error: %s", e)
 
         return results if results else None
@@ -591,6 +606,7 @@ class BulkCacheJob(QObject):
         self._cancelled = True
 
     def _run(self):
+        diag(f"bulk    _run start total={len(self._targets)}")
         # Group targets by source so we can sweep-decode each source once
         by_source: Dict[str, List[int]] = {}
         for source_id, frame_num in self._targets:
@@ -632,6 +648,7 @@ class BulkCacheJob(QObject):
         # with worker count up to the point disk I/O or memory bandwidth
         # saturates. Cap at 8 to avoid thrashing on big machines.
         workers = max(2, min(os.cpu_count() or 4, 8))
+        diag(f"bulk    pool create workers={workers} chunks={len(chunks)}")
         pool = ThreadPoolExecutor(max_workers=workers,
                                   thread_name_prefix="bulk-thumb")
         try:
@@ -648,17 +665,20 @@ class BulkCacheJob(QObject):
                         self._cache._grab_frames_sweep,
                         source, chunk_frames)
                 futures[fut] = (source_id, len(chunk_frames))
+            diag(f"bulk    submitted {len(futures)} futures, draining…")
 
             for fut in as_completed(futures):
                 if self._cancelled:
                     # Stop scheduling new work; in-flight chunks finish on
                     # their own. Already-submitted-but-not-started futures
                     # will be cancelled by the shutdown in `finally`.
+                    diag("bulk    cancel detected mid-drain, breaking")
                     break
                 source_id, chunk_size = futures[fut]
                 try:
                     results = fut.result()
                 except Exception as e:
+                    diag(f"bulk    chunk EXC {type(e).__name__}: {e}")
                     logger.debug("bulk chunk failed: %s", e)
                     results = None
                 if results:
@@ -671,13 +691,18 @@ class BulkCacheJob(QObject):
                             source_id, frame_num, qimage)
                 done += chunk_size
                 self.progress.emit(done, total)
+            diag(f"bulk    drain done={done}/{total}")
         finally:
             # cancel_futures cancels pending-but-not-running futures.
             # In-flight chunks are not interruptible mid-decode, but they
             # finish in O(one chunk) time (~hundreds of ms).
+            diag("bulk    pool shutdown begin (wait=True)")
             pool.shutdown(wait=True, cancel_futures=True)
+            diag("bulk    pool shutdown done")
 
         if self._cancelled:
+            diag("bulk    emit cancelled")
             self.cancelled.emit()
         else:
+            diag("bulk    emit finished")
             self.finished.emit()

@@ -312,9 +312,29 @@ class MainWindow(QMainWindow):
         self._setup_menus()
         self._update_title()
 
+        # Ctrl+Shift+D — diagnostic thread-stack dump to src/diag.log.
+        # Use during a hang to capture every Python thread's current stack.
+        # Cheap and side-effect-free; safe to leave enabled.
+        diag_action = QAction("Dump diagnostic threads", self)
+        diag_action.setShortcut(QKeySequence("Ctrl+Shift+D"))
+        diag_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        diag_action.triggered.connect(self._dump_diag)
+        self.addAction(diag_action)
+
         # App-wide capture of mouse Back/Forward buttons for undo/redo,
         # so a mouse-driven workflow doesn't have to bounce to the keyboard.
         QApplication.instance().installEventFilter(self)
+
+    def _dump_diag(self):
+        """Diagnostic shortcut handler — writes a thread dump to diag.log."""
+        from utils.diag import diag, dump_all_thread_stacks
+        diag("[user] Ctrl+Shift+D pressed, dumping thread stacks")
+        dump_all_thread_stacks(reason="user pressed Ctrl+Shift+D")
+        try:
+            self._status_bar.showMessage(
+                "Diagnostic thread dump written to src/diag.log", 4000)
+        except Exception:
+            pass
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseButtonPress:
