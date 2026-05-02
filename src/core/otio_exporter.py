@@ -50,7 +50,7 @@ NTSC / fractional-rate seek nudge:
 import json
 import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
@@ -123,7 +123,7 @@ def _gap_element(duration: int, rate: float) -> dict:
 
 def export_otio(timeline: TimelineModel, sources: Dict[str, VideoSource],
                 output_path: str, include_gaps: bool = False,
-                use_render_range: bool = False, title: str = "PrismaSynth",
+                use_render_range: bool = False, title: Optional[str] = None,
                 fps: float = None):
     """Export timeline as an OpenTimelineIO (.otio) JSON file.
 
@@ -135,12 +135,16 @@ def export_otio(timeline: TimelineModel, sources: Dict[str, VideoSource],
                       If False, clips are packed back-to-back.
         use_render_range: If True, only clips inside the in/out range are
                           exported.
-        title: Timeline name stored in the OTIO file.
+        title: Timeline name stored in the OTIO file. If None, derived from
+               output_path basename so importers default to the file's name.
         fps: Sequence frame rate. If None, uses first source's FPS.
     """
     clips = timeline.clips
     if not clips:
         return
+
+    if not title:
+        title = os.path.splitext(os.path.basename(output_path))[0] or "PrismaSynth"
 
     if fps is None:
         first_source = next(iter(sources.values()), None)

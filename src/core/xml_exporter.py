@@ -10,7 +10,7 @@ exact source frame we intended, with no NDF/drift ambiguity.
 
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
 
 from core.timeline import TimelineModel
@@ -120,7 +120,7 @@ def _tc_format(fps: float) -> str:
 
 def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
                   output_path: str, include_gaps: bool = False,
-                  use_render_range: bool = False, title: str = "PrismaSynth",
+                  use_render_range: bool = False, title: Optional[str] = None,
                   fps: float = None):
     """Export timeline as an FCPXML 1.9 file.
 
@@ -131,12 +131,16 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
         include_gaps: If True, gaps appear as ``<gap>`` elements on the spine.
                       If False, clips are placed back-to-back (compact).
         use_render_range: If True, only export clips within the in/out range.
-        title: Project/event name.
+        title: Project/event name. If None, derived from output_path basename
+               so Resolve's "Load XML" dialog defaults to the file's name.
         fps: Sequence frame rate. If None, uses first source's FPS.
     """
     clips = timeline.clips
     if not clips:
         return
+
+    if not title:
+        title = os.path.splitext(os.path.basename(output_path))[0] or "PrismaSynth"
 
     # Determine FPS
     if fps is None:
@@ -267,7 +271,7 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
     # Library / event / project / sequence
     lines.append('  <library>')
     lines.append(f'    <event name="{xml_escape(title)}">')
-    lines.append(f'      <project name="{xml_escape(title)} Timeline">')
+    lines.append(f'      <project name="{xml_escape(title)}">')
     lines.append(
         f'        <sequence format="{format_id}" duration="{seq_duration}" '
         f'tcStart="0s" tcFormat="{tc_format}" '
