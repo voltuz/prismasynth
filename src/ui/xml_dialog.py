@@ -17,10 +17,11 @@ class XmlDialog(QDialog):
 
     export_requested = Signal(dict)  # settings dict
 
-    def __init__(self, timeline, fps: float = 24.0,
+    def __init__(self, timeline, sources: dict, fps: float = 24.0,
                  has_render_range: bool = False, parent=None):
         super().__init__(parent)
         self._timeline = timeline
+        self._sources = sources
         self._fps = fps
         self.setWindowTitle("Export XML (FCPXML)")
         self.setMinimumWidth(450)
@@ -31,6 +32,9 @@ class XmlDialog(QDialog):
         self._info_label = QLabel("")
         self._info_label.setStyleSheet("color: #aaa;")
         layout.addWidget(self._info_label)
+
+        self._audio_label = QLabel("")
+        layout.addWidget(self._audio_label)
 
         self._gaps_check = QCheckBox("Include gaps between clips")
         self._gaps_check.setToolTip(
@@ -83,6 +87,15 @@ class XmlDialog(QDialog):
         time_str = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
         self._info_label.setText(
             f"{clips} clips  |  {frames:,} frames  |  {time_str}"
+        )
+        audio = self._timeline.get_export_audio_summary(self._sources, use_range)
+        self._audio_label.setText(f"Audio: {audio}")
+        # Highlight when the export will be silent so the user notices
+        # before they spend minutes waiting for an audio-less file.
+        is_silent = (audio == "none")
+        self._audio_label.setStyleSheet(
+            "color: #e8a735; font-size: 11px;" if is_silent
+            else "color: #aaa; font-size: 11px;"
         )
 
     def _browse(self):

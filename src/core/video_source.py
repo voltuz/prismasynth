@@ -20,3 +20,21 @@ class VideoSource:
         if self.fps > 0:
             return self.total_frames / self.fps
         return 0.0
+
+    @property
+    def has_audio(self) -> bool:
+        return self.audio_channels > 0
+
+    def format_audio(self) -> str:
+        """Short human-readable audio description, or 'none' if the source
+        has no audio. Used by the clip info panel and the export dialogs."""
+        if not self.has_audio:
+            return "none"
+        parts = []
+        if self.audio_codec:
+            parts.append(self.audio_codec)
+        parts.append(f"{self.audio_channels} ch")
+        if self.audio_sample_rate > 0:
+            khz = self.audio_sample_rate / 1000.0
+            parts.append(f"{khz:g} kHz")
+        return ", ".join(parts)

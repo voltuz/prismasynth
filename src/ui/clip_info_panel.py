@@ -32,9 +32,11 @@ class ClipInfoPanel(QWidget):
         self._duration_label = QLabel("-")
         self._resolution_label = QLabel("-")
         self._fps_label = QLabel("-")
+        self._audio_label = QLabel("-")
 
         for lbl in [self._source_label, self._in_label, self._out_label,
-                     self._duration_label, self._resolution_label, self._fps_label]:
+                     self._duration_label, self._resolution_label, self._fps_label,
+                     self._audio_label]:
             lbl.setStyleSheet("color: #ccc;")
 
         form.addRow("Source:", self._source_label)
@@ -43,6 +45,7 @@ class ClipInfoPanel(QWidget):
         form.addRow("Duration:", self._duration_label)
         form.addRow("Resolution:", self._resolution_label)
         form.addRow("FPS:", self._fps_label)
+        form.addRow("Audio:", self._audio_label)
         self._group.setLayout(form)
         layout.addWidget(self._group)
 
@@ -52,8 +55,10 @@ class ClipInfoPanel(QWidget):
         if clip is None:
             self._title.setText("No clip selected")
             for lbl in [self._source_label, self._in_label, self._out_label,
-                         self._duration_label, self._resolution_label, self._fps_label]:
+                         self._duration_label, self._resolution_label, self._fps_label,
+                         self._audio_label]:
                 lbl.setText("-")
+                lbl.setStyleSheet("color: #ccc;")
             return
 
         if clip.is_gap:
@@ -64,6 +69,8 @@ class ClipInfoPanel(QWidget):
             self._duration_label.setText(f"{clip.duration_frames} frames")
             self._resolution_label.setText("-")
             self._fps_label.setText("-")
+            self._audio_label.setText("-")
+            self._audio_label.setStyleSheet("color: #ccc;")
             return
 
         source = sources.get(clip.source_id)
@@ -82,6 +89,14 @@ class ClipInfoPanel(QWidget):
         if source:
             self._resolution_label.setText(f"{source.width}x{source.height}")
             self._fps_label.setText(f"{source.fps:.3f}")
+            audio = source.format_audio()
+            self._audio_label.setText(audio)
+            # Highlight "none" so the user notices video-only sources before exporting
+            self._audio_label.setStyleSheet(
+                "color: #e8a735;" if audio == "none" else "color: #ccc;"
+            )
         else:
             self._resolution_label.setText("-")
             self._fps_label.setText("-")
+            self._audio_label.setText("-")
+            self._audio_label.setStyleSheet("color: #ccc;")

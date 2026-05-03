@@ -1192,7 +1192,7 @@ class MainWindow(QMainWindow):
         fps = first_source.fps if first_source else 24.0
         has_range = (self._timeline.in_point is not None
                      or self._timeline.out_point is not None)
-        dialog = XmlDialog(self._timeline, fps,
+        dialog = XmlDialog(self._timeline, self._sources, fps,
                            has_render_range=has_range, parent=self)
         dialog.export_requested.connect(
             lambda s: self._run_xml_export(s, dialog))
@@ -1217,7 +1217,7 @@ class MainWindow(QMainWindow):
         fps = first_source.fps if first_source else 24.0
         has_range = (self._timeline.in_point is not None
                      or self._timeline.out_point is not None)
-        dialog = OtioDialog(self._timeline, fps,
+        dialog = OtioDialog(self._timeline, self._sources, fps,
                             has_render_range=has_range, parent=self)
         dialog.export_requested.connect(
             lambda s: self._run_otio_export(s, dialog))

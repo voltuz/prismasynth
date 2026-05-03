@@ -284,6 +284,63 @@ class TimelineModel(QObject):
         end = min(end, total - 1)
         return (start, end)
 
+    def get_used_source_ids(self, use_render_range: bool) -> list:
+        """Return source IDs referenced by non-gap clips that would be exported,
+        in first-encountered order. Mirrors the iteration in xml_exporter /
+        otio_exporter so the export dialog's audio summary matches what the
+        actual exporter would emit."""
+        if use_render_range:
+            r_start, r_end = self.get_render_range()
+        else:
+            total = self.get_total_duration_frames()
+            r_start, r_end = 0, max(total - 1, 0)
+
+        pos = 0
+        used = []
+        seen = set()
+        for c in self._clips:
+            clip_start = pos
+            clip_end = pos + c.duration_frames - 1
+            pos += c.duration_frames
+            if clip_end < r_start or clip_start > r_end:
+                continue
+            if c.is_gap or c.source_id is None:
+                continue
+            if c.source_id in seen:
+                continue
+            seen.add(c.source_id)
+            used.append(c.source_id)
+        return used
+
+    def get_export_audio_summary(self, sources: dict,
+                                 use_render_range: bool) -> str:
+        """One-line audio summary for the sources that would be exported.
+
+        Returns:
+          - 'none' if no source has audio (or no sources used)
+          - the single source's format_audio() string when all referenced
+            sources share the same audio config
+          - 'mixed (N ch and silent)' when some have audio and others don't
+          - 'mixed' when multiple distinct audio configs are present
+        """
+        used = self.get_used_source_ids(use_render_range)
+        descs = []
+        for sid in used:
+            src = sources.get(sid)
+            if src is None:
+                continue
+            descs.append(src.format_audio())
+        if not descs:
+            return "none"
+        unique = list(dict.fromkeys(descs))
+        if len(unique) == 1:
+            return unique[0]
+        # Distinguish "some have audio, some don't" from "all have audio but configs differ"
+        if "none" in unique and len(unique) == 2:
+            other = next(d for d in unique if d != "none")
+            return f"mixed ({other} and silent)"
+        return "mixed"
+
     def compute_export_extent(self, include_gaps: bool,
                               use_render_range: bool) -> Tuple[int, int]:
         """Counts (real_clips, frames) that would be exported under the given flags.
