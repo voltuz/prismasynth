@@ -147,6 +147,79 @@ class TimelineModel(QObject):
             self._clips.insert(index, clip)
         self.clips_changed.emit()
 
+    def insert_clips_at_frame(self, clips: List[Clip], timeline_frame: int,
+                              assign_colors: bool = True):
+        """Insert clips at the given timeline frame, splitting an existing
+        clip if the frame falls inside one. Used by the Media Panel's
+        drag-to-timeline drop. Earlier clips stay put; later clips ripple
+        back by the inserted duration."""
+        if not clips:
+            return
+        self._push_undo()
+        if assign_colors:
+            for c in clips:
+                if not c.is_gap:
+                    c.color_index = self._color_counter % 8
+                    self._color_counter += 1
+
+        total = self.get_total_duration_frames()
+        if timeline_frame >= total or not self._clips:
+            self._clips.extend(clips)
+            self.clips_changed.emit()
+            return
+        if timeline_frame <= 0:
+            self._clips = list(clips) + self._clips
+            self.clips_changed.emit()
+            return
+
+        # Find the clip containing the target frame and the offset within it.
+        pos = 0
+        insert_idx = len(self._clips)
+        for i, c in enumerate(self._clips):
+            if pos <= timeline_frame < pos + c.duration_frames:
+                offset = timeline_frame - pos
+                if offset == 0:
+                    insert_idx = i
+                else:
+                    # Split this clip in two so the new clips slot between halves.
+                    if c.is_gap:
+                        left = Clip.make_gap(offset)
+                        right = Clip.make_gap(c.duration_frames - offset)
+                        # Preserve the original gap's id on the left half so undo
+                        # snapshots referencing it stay valid.
+                        left.id = c.id
+                    else:
+                        import uuid as _uuid
+                        from copy import copy
+                        left = copy(c)
+                        right = copy(c)
+                        right.id = _uuid.uuid4().hex[:12]  # fresh id for the right half
+                        left.source_out = c.source_in + offset - 1
+                        right.source_in = c.source_in + offset
+                    self._clips[i:i + 1] = [left, right]
+                    insert_idx = i + 1
+                break
+            pos += c.duration_frames
+
+        self._clips[insert_idx:insert_idx] = clips
+        self.clips_changed.emit()
+
+    def remove_source_clips(self, source_id: str) -> int:
+        """Replace every clip referencing the given source with a gap.
+        Returns the number of clips removed. Used by the Media Panel's
+        'Remove source AND its clips' action — we keep gaps so the timeline
+        layout stays stable; the user can then ripple-delete those gaps if
+        they want compaction."""
+        affected = [c for c in self._clips if c.source_id == source_id]
+        if not affected:
+            return 0
+        self.remove_clips({c.id for c in affected})
+        return len(affected)
+
+    def count_clips_for_source(self, source_id: str) -> int:
+        """How many real clips reference this source. Used by the remove dialog."""
+        return sum(1 for c in self._clips if c.source_id == source_id)
+
     def remove_clips(self, clip_ids: set):
         """Replace real clips with gaps, remove gaps outright. Merge adjacent gaps."""
         self._push_undo()

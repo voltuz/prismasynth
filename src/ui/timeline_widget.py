@@ -1,4 +1,5 @@
 import logging
+import os
 from enum import IntEnum
 from typing import Optional, List
 
@@ -7,11 +8,18 @@ from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPixmap, QAction,
     QMouseEvent, QWheelEvent, QPaintEvent, QKeyEvent,
+    QDragEnterEvent, QDragMoveEvent, QDragLeaveEvent, QDropEvent,
 )
 
 from core.timeline import TimelineModel
 from core.clip import Clip
 from ui.icon_loader import icon
+
+# Custom MIME for media-pool drags (kept in sync with ui/media_panel.py).
+_SOURCE_ID_MIME = "application/x-prismasynth-source-ids"
+_VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv',
+                     '.flv', '.webm', '.m4v', '.ts', '.mxf'}
+_DROP_INDICATOR_COLOR = QColor(255, 200, 0)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +67,8 @@ class TimelineStrip(QWidget):
     clip_clicked = Signal(str, object)  # clip_id, QMouseEvent (for modifier keys)
     preview_frame_requested = Signal(int)  # cut-mode hover scrub (no playhead move)
     cut_requested = Signal(int)    # cut-mode click at timeline frame
+    sources_dropped = Signal(list, int)   # source_ids (list[str]), insert frame
+    files_dropped = Signal(list, int)     # file paths (list[str]), insert frame
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -86,9 +96,14 @@ class TimelineStrip(QWidget):
         self._cut_preview_x: Optional[int] = None
         self._last_preview_frame = -1   # throttle cut-mode hover seeks
 
+        # Drop state — set during drag-over from the Media Panel; consumed by
+        # paintEvent to draw a vertical insertion line.
+        self._drop_insert_frame: Optional[int] = None
+
         self.setMinimumHeight(CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
 
         self._model.clips_changed.connect(self.update)
         self._model.selection_changed.connect(self.update)
@@ -157,6 +172,79 @@ class TimelineStrip(QWidget):
     def get_total_width(self) -> int:
         return self._frame_to_pixel(self._model.get_total_duration_frames())
 
+    # --- Drag and drop (sources from Media Panel, files from OS) ---
+
+    def _accepted_drag(self, event):
+        """True if the drag mime is something we want to handle. Sets the
+        drop insertion frame for the cursor position as a side effect when
+        the drag is accepted (so paintEvent draws the indicator line)."""
+        mime = event.mimeData()
+        accept = False
+        if mime.hasFormat(_SOURCE_ID_MIME):
+            accept = True
+        elif mime.hasUrls():
+            for u in mime.urls():
+                if u.isLocalFile():
+                    ext = os.path.splitext(u.toLocalFile())[1].lower()
+                    if ext in _VIDEO_EXTENSIONS:
+                        accept = True
+                        break
+        if accept:
+            self._drop_insert_frame = self._cursor_to_insert_frame(event.position().x())
+            self.update()
+        return accept
+
+    def _cursor_to_insert_frame(self, x: float) -> int:
+        """Snap the cursor x to a clip-boundary frame when close, else the
+        raw frame at the cursor."""
+        target = self._pixel_to_frame(x)
+        snap_px = 8  # px tolerance for snapping to clip boundaries
+        cumulative = 0
+        for c in self._model.clips:
+            for boundary in (cumulative, cumulative + c.duration_frames):
+                bx = self._frame_to_pixel(boundary) - self._scroll_offset
+                if abs(bx - x) <= snap_px:
+                    return boundary
+            cumulative += c.duration_frames
+        # Clamp to [0, total]
+        total = self._model.get_total_duration_frames()
+        return max(0, min(target, total))
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if self._accepted_drag(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if self._accepted_drag(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent):
+        self._drop_insert_frame = None
+        self.update()
+
+    def dropEvent(self, event: QDropEvent):
+        mime = event.mimeData()
+        frame = self._cursor_to_insert_frame(event.position().x())
+        if mime.hasFormat(_SOURCE_ID_MIME):
+            payload = bytes(mime.data(_SOURCE_ID_MIME)).decode("utf-8")
+            ids = [s for s in payload.split("\n") if s]
+            if ids:
+                self.sources_dropped.emit(ids, frame)
+                event.acceptProposedAction()
+        elif mime.hasUrls():
+            paths = [u.toLocalFile() for u in mime.urls()
+                     if u.isLocalFile()
+                     and os.path.splitext(u.toLocalFile())[1].lower() in _VIDEO_EXTENSIONS]
+            if paths:
+                self.files_dropped.emit(paths, frame)
+                event.acceptProposedAction()
+        self._drop_insert_frame = None
+        self.update()
+
     def ensure_playhead_visible(self):
         playhead_px = self._frame_to_pixel(self._playhead_frame) - self._scroll_offset
         margin = 100
@@ -203,6 +291,19 @@ class TimelineStrip(QWidget):
             painter.setBrush(QBrush(QColor(0, 120, 215, 30)))
             painter.setPen(QPen(QColor(0, 120, 215, 120), 1))
             painter.drawRect(marquee_rect)
+
+        # Drop insertion line (during drag from Media Panel)
+        if self._drop_insert_frame is not None:
+            ix = self._frame_to_pixel(self._drop_insert_frame) - self._scroll_offset
+            if 0 <= ix <= w:
+                painter.setPen(QPen(_DROP_INDICATOR_COLOR, 3))
+                painter.drawLine(ix, HEADER_HEIGHT, ix, h)
+                painter.setBrush(QBrush(_DROP_INDICATOR_COLOR))
+                painter.drawPolygon([
+                    QPoint(ix - 5, HEADER_HEIGHT),
+                    QPoint(ix + 5, HEADER_HEIGHT),
+                    QPoint(ix, HEADER_HEIGHT + 6),
+                ])
 
         painter.end()
 
@@ -675,6 +776,8 @@ class TimelineWidget(QWidget):
     thumbnails_toggled = Signal(bool)
     hq_thumbnails_toggled = Signal(bool)
     cache_thumbnails_clicked = Signal()  # button hit; main_window decides start vs cancel
+    sources_dropped = Signal(list, int)  # source_ids, insert_frame
+    files_dropped = Signal(list, int)    # file paths, insert_frame
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -751,6 +854,8 @@ class TimelineWidget(QWidget):
         self._strip.clip_clicked.connect(self.clip_clicked.emit)
         self._strip.preview_frame_requested.connect(self.preview_frame_requested.emit)
         self._strip.cut_requested.connect(self.cut_requested.emit)
+        self._strip.sources_dropped.connect(self.sources_dropped.emit)
+        self._strip.files_dropped.connect(self.files_dropped.emit)
         self._scrollbar.valueChanged.connect(self._strip.set_scroll_offset)
         self._model.clips_changed.connect(self._update_scrollbar)
 

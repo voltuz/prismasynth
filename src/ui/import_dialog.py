@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal
 
 from core.video_source import VideoSource
-from core.clip import Clip
 from utils.ffprobe import probe_video
 
 logger = logging.getLogger(__name__)
@@ -19,11 +18,12 @@ VIDEO_FILTERS = "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v *
 class ImportDialog(QDialog):
     """Dialog for importing one or more videos. Probes all selected files,
     validates that they share the same resolution and FPS (and match existing
-    timeline sources if any), and creates one whole-file clip per source.
-    Cut detection is a separate step."""
+    sources if any), and adds them to the Media Pool. Sources do NOT
+    automatically create timeline clips — the user drags them onto the
+    timeline from the Media Pool when ready. Cut detection is also separate."""
 
-    # Emits list of (VideoSource, Clip) pairs for all imported files
-    import_complete = Signal(list)  # List[Tuple[VideoSource, Clip]]
+    # Emits list of VideoSource objects to add to the media pool.
+    import_complete = Signal(list)  # List[VideoSource]
 
     def __init__(self, ref_width: int = 0, ref_height: int = 0,
                  ref_fps: float = 0.0, parent=None):
@@ -109,10 +109,11 @@ class ImportDialog(QDialog):
                 self._status_label.setText("Select video file(s) to import.")
                 return
 
-        # Build sources and clips
-        results = []
+        # Build sources only — clips are created later when the user drags
+        # from the media pool to the timeline.
+        sources = []
         for path, info in probed:
-            source = VideoSource(
+            sources.append(VideoSource(
                 file_path=path,
                 total_frames=info.total_frames,
                 fps=info.fps,
@@ -122,13 +123,7 @@ class ImportDialog(QDialog):
                 audio_codec=info.audio_codec,
                 audio_sample_rate=info.audio_sample_rate,
                 audio_channels=info.audio_channels,
-            )
-            clip = Clip(
-                source_id=source.id,
-                source_in=0,
-                source_out=source.total_frames - 1,
-            )
-            results.append((source, clip))
+            ))
 
-        self.import_complete.emit(results)
+        self.import_complete.emit(sources)
         self.accept()

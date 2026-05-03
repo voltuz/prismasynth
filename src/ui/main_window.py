@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QMessageBox, QFileDialog, QProgressBar,
     QApplication, QDialog,
 )
-from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtCore import Qt, QTimer, QEvent, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QAction, QKeySequence
 
 from version import __version__
@@ -23,16 +23,39 @@ from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
 from core.proxy_cache import ProxyManager
 from core.project import save_project, load_project
+from core.source_thumbnail import extract_thumbnail
 from utils.paths import get_config_dir
 from ui.icon_loader import icon
 from ui.preview_widget import PreviewWidget
 from ui.timeline_widget import TimelineWidget, EditMode
 from ui.toolbar import MainToolbar
 from ui.clip_info_panel import ClipInfoPanel
+from ui.media_panel import MediaPanel
+from ui.source_info_dialog import SourceInfoDialog
+from ui.remove_source_dialog import RemoveSourceDialog, RemoveSourceAction
 from ui.import_dialog import ImportDialog
 from ui.detect_dialog import DetectDialog
 from ui.export_dialog import ExportDialog
 from ui.relink_dialog import RelinkDialog
+
+
+class _SourceThumbWorker(QRunnable):
+    """Background worker that extracts one source's thumbnail and emits a
+    signal when done. Runs on MainWindow's QThreadPool so the import flow
+    stays non-blocking."""
+
+    def __init__(self, source: VideoSource, signal):
+        super().__init__()
+        self._source = source
+        self._signal = signal
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            extract_thumbnail(self._source)
+        except Exception:
+            logger.exception("source thumbnail extraction failed")
+        self._signal.emit(self._source.id)
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +205,9 @@ QTabBar::tab:selected {
 
 
 class MainWindow(QMainWindow):
+    # Emitted by background source-thumbnail workers when an extract finishes.
+    _thumb_extracted = Signal(str)  # source_id
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"PrismaSynth v{__version__}")
@@ -259,16 +285,19 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         main_layout.addWidget(splitter)
 
-        # Top area: clip info + preview
+        # Top area: media panel | preview | clip info (3-column layout)
         top_widget = QWidget()
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._clip_info = ClipInfoPanel()
-        top_layout.addWidget(self._clip_info)
+        self._media_panel = MediaPanel()
+        top_layout.addWidget(self._media_panel)
 
         self._preview = PreviewWidget()
         top_layout.addWidget(self._preview, 1)
+
+        self._clip_info = ClipInfoPanel()
+        top_layout.addWidget(self._clip_info)
 
         splitter.addWidget(top_widget)
 
@@ -293,7 +322,22 @@ class MainWindow(QMainWindow):
         self._timeline_widget.hq_thumbnails_toggled.connect(self._on_hq_thumbnails_toggled)
         self._timeline_widget.cache_thumbnails_clicked.connect(self._on_cache_thumbnails_clicked)
         self._timeline_widget.strip.scroll_changed.connect(self._on_viewport_changed)
+        self._timeline_widget.sources_dropped.connect(self._on_timeline_sources_dropped)
+        self._timeline_widget.files_dropped.connect(self._on_timeline_files_dropped)
         self._timeline.selection_changed.connect(self._on_selection_changed)
+
+        # Media Panel signals
+        self._media_panel.source_double_clicked.connect(self._on_source_double_clicked)
+        self._media_panel.relink_requested.connect(self._on_source_relink_requested)
+        self._media_panel.remove_requested.connect(self._on_source_remove_requested)
+        self._media_panel.files_dropped.connect(self._import_files)
+
+        # Source-thumbnail extraction worker pool
+        self._thumb_pool = QThreadPool()
+        self._thumb_pool.setMaxThreadCount(4)
+        self._thumb_extracted.connect(
+            self._on_source_thumb_extracted, Qt.ConnectionType.QueuedConnection)
+        self._source_info_dialog: Optional[SourceInfoDialog] = None
 
         # Status bar
         self._status_bar = QStatusBar()
@@ -518,8 +562,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _import_files(self, file_paths: list):
-        """Import video files directly (used by drag-and-drop).
-        Validates resolution/FPS against existing timeline sources."""
+        """Import video files directly (used by drag-and-drop and Media Panel
+        drops). Probes each file, validates resolution/FPS against existing
+        sources, and adds them to the media pool. Does NOT create clips."""
         from utils.ffprobe import probe_video
         ref_w, ref_h, ref_fps = self._get_timeline_ref()
 
@@ -531,7 +576,7 @@ class MainWindow(QMainWindow):
                 return
             probed.append((path, info))
 
-        # Use first file as reference if timeline is empty
+        # Use first file as reference if timeline/pool is empty
         if ref_w == 0 and probed:
             ref_w, ref_h, ref_fps = probed[0][1].width, probed[0][1].height, probed[0][1].fps
 
@@ -555,24 +600,19 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        results = []
-        for path, info in probed:
-            source = VideoSource(
-                file_path=path,
-                total_frames=info.total_frames,
-                fps=info.fps,
-                width=info.width,
-                height=info.height,
-                codec=info.codec,
-                audio_codec=info.audio_codec,
-                audio_sample_rate=info.audio_sample_rate,
-                audio_channels=info.audio_channels,
-            )
-            clip = Clip(source_id=source.id, source_in=0,
-                        source_out=source.total_frames - 1)
-            results.append((source, clip))
+        sources = [VideoSource(
+            file_path=path,
+            total_frames=info.total_frames,
+            fps=info.fps,
+            width=info.width,
+            height=info.height,
+            codec=info.codec,
+            audio_codec=info.audio_codec,
+            audio_sample_rate=info.audio_sample_rate,
+            audio_channels=info.audio_channels,
+        ) for path, info in probed]
 
-        self._on_import_complete(results)
+        self._on_import_complete(sources)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -594,30 +634,177 @@ class MainWindow(QMainWindow):
         if paths:
             self._import_files(paths)
 
-    def _on_import_complete(self, results: list):
-        """Handle import of one or more (VideoSource, Clip) pairs."""
-        if not results:
+    def _on_import_complete(self, sources: list):
+        """Add imported sources to the Media Pool. Does NOT create timeline
+        clips — the user drags from the pool to the timeline when ready."""
+        if not sources:
             return
-        all_clips = []
-        for source, clip in results:
+        for source in sources:
             self._sources[source.id] = source
             self._reader_pool.register_source(source)
             self._proxy_manager.load_or_open(source)
-            all_clips.append(clip)
+            self._thumb_pool.start(_SourceThumbWorker(source, self._thumb_extracted))
 
-        self._timeline.add_clips(all_clips)
-        self._timeline_widget.set_fps(results[0][0].fps)
+        # Set FPS from the first imported source if the timeline FPS isn't set yet
+        if sources:
+            self._timeline_widget.set_fps(sources[0].fps)
 
-        # Start thumbnail generation
-        self._start_thumbnail_cache()
-
-        # Show first frame
-        if all_clips:
-            self._timeline_widget.set_playhead(0)
-
+        self._refresh_media_panel()
+        self._dirty = True
         self._update_status()
-        for source, clip in results:
+        for source in sources:
             logger.info("Imported %s", source.file_path)
+
+    # --- Media Panel handlers ---
+
+    def _refresh_media_panel(self):
+        self._media_panel.set_sources(self._sources)
+
+    def _on_source_thumb_extracted(self, source_id: str):
+        src = self._sources.get(source_id)
+        if src is not None:
+            self._media_panel.refresh_thumbnail(src)
+
+    def _on_source_double_clicked(self, source_id: str):
+        src = self._sources.get(source_id)
+        if not src:
+            return
+        if self._source_info_dialog is None:
+            self._source_info_dialog = SourceInfoDialog(self)
+        self._source_info_dialog.show_for(src)
+
+    def _on_source_relink_requested(self, source_id: str):
+        src = self._sources.get(source_id)
+        if not src:
+            return
+        # Reuse RelinkDialog with a single-source dict.
+        dlg = RelinkDialog({source_id: src}, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        resolved = dlg.resolved_paths()
+        probe_cache = dlg.probe_cache()
+        new_path = resolved.get(source_id)
+        if not new_path:
+            return  # user skipped
+        old_total_frames = src.total_frames
+        src.file_path = new_path
+        info = probe_cache.get(source_id)
+        if info is not None:
+            src.width = info.width
+            src.height = info.height
+            src.fps = info.fps
+            src.total_frames = info.total_frames
+            src.codec = info.codec
+            src.audio_codec = info.audio_codec
+            src.audio_sample_rate = info.audio_sample_rate
+            src.audio_channels = info.audio_channels
+            # Clamp clips on the timeline if the new source is shorter
+            if info.total_frames < old_total_frames:
+                new_max = info.total_frames - 1
+                clamped = 0
+                for c in self._timeline.clips:
+                    if c.source_id == source_id:
+                        if c.source_in > new_max:
+                            c.source_in = new_max
+                            c.source_out = new_max
+                            clamped += 1
+                        elif c.source_out > new_max:
+                            c.source_out = new_max
+                            clamped += 1
+                if clamped:
+                    QMessageBox.warning(
+                        self, "Clips Clamped",
+                        f"{clamped} clip(s) had their out-points trimmed because "
+                        "the relinked source has fewer frames.",
+                    )
+        # Re-register reader+proxy with the new path
+        self._reader_pool.register_source(src)
+        self._proxy_manager.load_or_open(src, force_reopen=True)
+        # Force a fresh source thumbnail (the cache key is source.id, but the
+        # underlying media is now different — need a re-extract).
+        from core.source_thumbnail import extract_thumbnail
+        extract_thumbnail(src, force=True)
+        self._media_panel.refresh_thumbnail(src)
+        self._dirty = True
+        self._update_status()
+        # Trigger a repaint of the timeline so any newly-valid clips show thumbs
+        self._timeline_widget.update()
+
+    def _on_source_remove_requested(self, source_id: str):
+        src = self._sources.get(source_id)
+        if not src:
+            return
+        from pathlib import Path as _Path
+        name = _Path(src.file_path).name
+        clip_count = self._timeline.count_clips_for_source(source_id)
+        if clip_count == 0:
+            # No clips reference this source — quick confirmation.
+            if QMessageBox.question(
+                self, "Remove Source",
+                f"Remove '{name}' from the media pool?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._do_remove_source(source_id, remove_clips=False)
+            return
+        # Has clips — show the 3-button confirm.
+        dlg = RemoveSourceDialog(name, clip_count, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        if dlg.action == RemoveSourceAction.REMOVE_WITH_CLIPS:
+            self._do_remove_source(source_id, remove_clips=True)
+        elif dlg.action == RemoveSourceAction.REMOVE_KEEP_CLIPS:
+            self._do_remove_source(source_id, remove_clips=False)
+
+    def _do_remove_source(self, source_id: str, *, remove_clips: bool):
+        if remove_clips:
+            self._timeline.remove_source_clips(source_id)
+        # Drop the source from all bookkeeping. Orphaned clips (when
+        # remove_clips=False) render black via the missing-source path.
+        self._sources.pop(source_id, None)
+        try:
+            self._reader_pool.unregister_source(source_id)
+        except Exception:
+            # Older reader pool may not have unregister; best-effort cleanup.
+            pass
+        self._refresh_media_panel()
+        self._dirty = True
+        self._update_status()
+
+    # --- Timeline drop handlers (from Media Panel drag) ---
+
+    def _on_timeline_sources_dropped(self, source_ids: list, frame: int):
+        """Insert one new whole-source clip per dragged source at the drop frame."""
+        clips = []
+        for sid in source_ids:
+            src = self._sources.get(sid)
+            if src is None or src.total_frames <= 0:
+                continue
+            clips.append(Clip(
+                source_id=src.id,
+                source_in=0,
+                source_out=src.total_frames - 1,
+            ))
+        if not clips:
+            return
+        self._timeline.insert_clips_at_frame(clips, frame)
+        # Set FPS from the first source if not already set
+        first_src = self._sources.get(source_ids[0])
+        if first_src is not None:
+            self._timeline_widget.set_fps(first_src.fps)
+        self._start_thumbnail_cache()
+        self._dirty = True
+        self._update_status()
+
+    def _on_timeline_files_dropped(self, paths: list, frame: int):
+        """Files dropped directly on the timeline: import to pool AND insert
+        clips at the drop frame."""
+        # Snapshot existing source IDs so we can identify the freshly-added ones.
+        prior_ids = set(self._sources.keys())
+        self._import_files(paths)
+        new_ids = [sid for sid in self._sources.keys() if sid not in prior_ids]
+        if not new_ids:
+            return  # validation rejected the import
+        self._on_timeline_sources_dropped(new_ids, frame)
 
     def _on_detect_cuts(self):
         """Run cut detection on all non-gap clips on the timeline.
@@ -1299,6 +1486,7 @@ class MainWindow(QMainWindow):
         self._reader_pool.close_all()
         self._proxy_manager.close_all()
         self._sources.clear()
+        self._refresh_media_panel()
         self._project_path = None
         self._dirty = False
         self._preview.clear_frame()
@@ -1432,6 +1620,12 @@ class MainWindow(QMainWindow):
                 continue
             self._reader_pool.register_source(source)
             self._proxy_manager.load_or_open(source)
+            # Kick off a background thumbnail extract for the Media Panel.
+            # Cached thumbs return instantly; first-time projects extract once.
+            self._thumb_pool.start(_SourceThumbWorker(source, self._thumb_extracted))
+
+        # Populate the Media Panel
+        self._refresh_media_panel()
 
         # Set FPS from first source
         if self._sources:
