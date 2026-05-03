@@ -1,7 +1,6 @@
 import logging
-import subprocess
-import threading
 import time
+from enum import Enum
 from typing import List, Optional
 
 import av
@@ -12,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from core.clip import Clip
 from core.video_source import VideoSource
 from core.proxy_cache import ProxyFile
+from core.ffmpeg_decode import decode_to_array
 
 logger = logging.getLogger(__name__)
 
@@ -25,57 +25,11 @@ TNET_WINDOW = 100
 TNET_STEP = 50
 TNET_PAD = 25
 
-# Parallel decode
-N_DECODE_SEGMENTS = 4
 
-def _build_ffmpeg_cmd_gpu_scale(file_path: str, width: int, height: int,
-                                ss: float = None, duration: float = None) -> List[str]:
-    """NVDEC decode + GPU scale via scale_cuda, then hwdownload to pipe."""
-    cmd = ["ffmpeg", "-nostdin", "-v", "quiet",
-           "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-    if ss is not None:
-        cmd += ["-ss", f"{ss:.4f}"]
-    cmd += ["-i", file_path]
-    if duration is not None:
-        cmd += ["-t", f"{duration:.4f}"]
-    cmd += ["-vf", f"scale_cuda={width}:{height}:interp_algo=nearest,hwdownload,format=nv12,format=rgb24",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    return cmd
-
-
-def _build_ffmpeg_cmd(file_path: str, width: int, height: int,
-                      ss: float = None, duration: float = None) -> List[str]:
-    """Build ffmpeg decode command with GPU-accelerated decode + CPU scale."""
-    cmd = ["ffmpeg", "-nostdin", "-v", "quiet", "-hwaccel", "cuda"]
-    if ss is not None:
-        cmd += ["-ss", f"{ss:.4f}"]
-    cmd += ["-i", file_path]
-    if duration is not None:
-        cmd += ["-t", f"{duration:.4f}"]
-    cmd += ["-vf", f"scale={width}:{height}:flags=fast_bilinear",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
-    return cmd
-
-
-def _build_ffmpeg_cmd_cpu(file_path: str, width: int, height: int) -> List[str]:
-    """CPU-only fallback."""
-    return [
-        "ffmpeg", "-nostdin", "-v", "quiet", "-threads", "0",
-        "-i", file_path,
-        "-vf", f"scale={width}:{height}:flags=fast_bilinear",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "pipe:1",
-    ]
-
-
-def _probe_ffmpeg_cmd(cmd: List[str], frame_size: int) -> bool:
-    """Test if an ffmpeg command produces valid output frames."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    data = proc.stdout.read(frame_size * 2)
-    proc.stdout.close()
-    proc.kill()
-    proc.wait()
-    return len(data) >= frame_size
+class Detector(Enum):
+    """Which cut-detection backend to use."""
+    TRANSNETV2 = "transnetv2"
+    OMNISHOTCUT = "omnishotcut"
 
 
 class SceneDetector(QThread):
@@ -91,33 +45,49 @@ class SceneDetector(QThread):
     error = Signal(str)
 
     def __init__(self, segments: list, sources: dict,
-                 threshold: float = DEFAULT_THRESHOLD, parent=None):
+                 threshold: float = DEFAULT_THRESHOLD,
+                 detector: Detector = Detector.TRANSNETV2,
+                 omnishotcut_checkpoint: Optional[str] = None,
+                 parent=None):
         """segments: list of (source_id, source_in, source_out, clip_id) tuples.
-        sources: dict of source_id -> VideoSource."""
+        sources: dict of source_id -> VideoSource.
+        detector: which backend to use (TransNetV2 or OmniShotCut).
+        omnishotcut_checkpoint: path to OmniShotCut .pth file (required if detector==OMNISHOTCUT)."""
         super().__init__(parent)
         self._segments = segments
         self._sources = sources
         self._threshold = threshold
+        self._detector = detector
+        self._omnishotcut_checkpoint = omnishotcut_checkpoint
         self._cancelled = False
         self._procs: list = []
+        self._omnishotcut_runner = None  # set when running OmniShotCut
 
     def cancel(self):
         self._cancelled = True
         # Kill all ffmpeg subprocesses immediately
-        procs = list(self._procs)
-        for proc in procs:
+        for proc in list(self._procs):
             try:
                 proc.kill()
+            except Exception:
+                pass
+        # Cancel the OmniShotCut sidecar if running
+        if self._omnishotcut_runner is not None:
+            try:
+                self._omnishotcut_runner.cancel()
             except Exception:
                 pass
 
     def run(self):
         try:
-            # Calculate total frames across all segments for overall progress
             self._total_all = sum(
                 seg[2] - seg[1] + 1 for seg in self._segments
             )
             self._done_all = 0
+
+            if self._detector == Detector.OMNISHOTCUT:
+                self._run_omnishotcut()
+                return
 
             results = {}  # clip_id -> [Clip, ...]
 
@@ -174,46 +144,16 @@ class SceneDetector(QThread):
 
         pad_end = TNET_PAD + TNET_STEP - (total % TNET_STEP if total % TNET_STEP != 0 else TNET_STEP)
 
-        # Pre-allocate padded array — all decode paths write directly into it
-        padded = np.empty((TNET_PAD + total + pad_end, TNET_HEIGHT, TNET_WIDTH, 3), dtype=np.uint8)
-
         self.phase_changed.emit("Decoding")
 
-        # Decode fallback chain — each returns 0 on failure
-        n_frames = 0
-        decode_method = None
-
-        if not n_frames:
-            t0 = time.monotonic()
-            n_frames = self._decode_parallel(padded, total, range_start, source,
-                                             gpu_scale=True)
-            if n_frames:
-                decode_method = "ffmpeg-parallel-scale_cuda"
-                elapsed = time.monotonic() - t0
-                logger.info("Decode [ffmpeg-parallel-scale_cuda]: %d frames in %.1fs (%.0f fps)",
-                            n_frames, elapsed, n_frames / max(elapsed, 0.001))
-
-        if not n_frames:
-            t0 = time.monotonic()
-            n_frames = self._decode_parallel(padded, total, range_start, source,
-                                             gpu_scale=False)
-            if n_frames:
-                decode_method = "ffmpeg-parallel-cpu_scale"
-                elapsed = time.monotonic() - t0
-                logger.info("Decode [ffmpeg-parallel-cpu_scale]: %d frames in %.1fs (%.0f fps)",
-                            n_frames, elapsed, n_frames / max(elapsed, 0.001))
-
-        if not n_frames:
-            t0 = time.monotonic()
-            n_frames = self._decode_single(padded, total, range_start, source)
-            if n_frames:
-                decode_method = "ffmpeg-single-cpu"
-                elapsed = time.monotonic() - t0
-                logger.info("Decode [ffmpeg-single-cpu]: %d frames in %.1fs (%.0f fps)",
-                            n_frames, elapsed, n_frames / max(elapsed, 0.001))
-
-        if not decode_method:
-            logger.warning("All decode paths failed for %s", source.file_path)
+        padded, n_frames, _, _ = decode_to_array(
+            source, range_start, total, TNET_WIDTH, TNET_HEIGHT,
+            procs=self._procs,
+            is_cancelled=lambda: self._cancelled,
+            progress_cb=lambda done, _t: self._emit_decode_progress(done),
+            pad_before=TNET_PAD,
+            pad_after=pad_end,
+        )
 
         if self._cancelled or n_frames == 0:
             return []
@@ -278,140 +218,69 @@ class SceneDetector(QThread):
                      len(cut_frames), self._threshold)
         return cut_frames
 
-    # --- Decode: parallel ffmpeg segments ---
+    def _emit_decode_progress(self, seg_done: int):
+        overall = self._done_all + seg_done
+        pct = int(overall / self._total_all * 100) if self._total_all else 0
+        self.progress.emit(min(99, pct))
+        self.detail_progress.emit(overall, self._total_all, "Decoding")
 
-    def _decode_parallel(self, padded: np.ndarray, total: int,
-                         range_start: int, source: VideoSource,
-                         gpu_scale: bool = False) -> int:
-        """Decode using N parallel ffmpeg/NVDEC processes.
-        gpu_scale=True uses scale_cuda (resize on GPU), False uses CPU scale."""
-        fps = source.fps if source.fps > 0 else 24.0
-        frame_size = TNET_WIDTH * TNET_HEIGHT * 3
-        n_seg = N_DECODE_SEGMENTS
-        frames_per_seg = total // n_seg
+    # --- OmniShotCut (sidecar subprocess, all segments in one run) ---
 
-        # Pick the command builder
-        build_cmd = _build_ffmpeg_cmd_gpu_scale if gpu_scale else _build_ffmpeg_cmd
+    def _run_omnishotcut(self):
+        """Process all segments through the OmniShotCut sidecar.
+        Decoding (in-process, GPU-accelerated) and inference (sidecar) are
+        interleaved per segment. Emits the same signals as the TransNetV2 path."""
+        from core.omnishotcut_runner import OmnishotcutRunner
 
-        seg_counts = [0] * n_seg
-        seg_errors = [None] * n_seg
-        progress_lock = threading.Lock()
-        total_decoded = [0]
+        if not self._omnishotcut_checkpoint:
+            self.error.emit("OmniShotCut checkpoint path not provided.")
+            return
 
-        def decode_segment(seg_idx, start_frame, max_frames):
-            ss = start_frame / fps
-            dur = (max_frames + 100) / fps
-            cmd = build_cmd(source.file_path, TNET_WIDTH, TNET_HEIGHT,
-                            ss=ss, duration=dur)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self._procs.append(proc)
+        results: dict = {}
 
-            buf = bytearray()
-            count = 0
-            offset = TNET_PAD + start_frame - range_start
-            try:
-                while count < max_frames and not self._cancelled:
-                    raw = proc.stdout.read(frame_size * 500)
-                    if not raw:
-                        break
-                    buf.extend(raw)
-                    while len(buf) >= frame_size and count < max_frames:
-                        padded[offset + count] = (
-                            np.frombuffer(bytes(buf[:frame_size]), np.uint8)
-                            .reshape(TNET_HEIGHT, TNET_WIDTH, 3)
-                        )
-                        del buf[:frame_size]
-                        count += 1
+        def on_phase(phase: str):
+            self.phase_changed.emit(phase)
 
-                        with progress_lock:
-                            total_decoded[0] += 1
-                            n = total_decoded[0]
-                        if n % max(1, total // 200) == 0:
-                            overall = self._done_all + n
-                            pct = int(overall / self._total_all * 100)
-                            self.progress.emit(min(99, pct))
-                            self.detail_progress.emit(overall, self._total_all, "Decoding")
-            except Exception as e:
-                seg_errors[seg_idx] = e
-            finally:
-                try:
-                    proc.stdout.close()
-                    proc.kill()
-                    proc.wait()
-                except Exception:
-                    pass
-            seg_counts[seg_idx] = count
+        def on_decode_progress(seg_done: int):
+            self._emit_decode_progress(seg_done)
 
-        # Test if this pipeline works with a quick probe
-        test_cmd = build_cmd(source.file_path, TNET_WIDTH, TNET_HEIGHT)
-        if not _probe_ffmpeg_cmd(test_cmd, frame_size):
-            label = "scale_cuda" if gpu_scale else "NVDEC"
-            logger.info("ffmpeg %s unavailable, trying next path", label)
-            return 0
+        def on_analyze_progress(frame_done: int, total: int, seg_id):
+            # During inference, OmniShotCut reports per-window progress within
+            # the current segment. Map to overall by counting completed segments.
+            overall = self._done_all + frame_done
+            pct = int(overall / self._total_all * 100) if self._total_all else 0
+            self.progress.emit(min(99, pct))
+            self.detail_progress.emit(overall, self._total_all, "Analyzing")
 
-        threads = []
-        for i in range(n_seg):
-            start = range_start + i * frames_per_seg
-            count = frames_per_seg if i < n_seg - 1 else total - (i * frames_per_seg)
-            t = threading.Thread(target=decode_segment, args=(i, start, count))
-            threads.append(t)
-            t.start()
+        def on_segment_done(clip_id, source: VideoSource, range_start: int,
+                            seg_total: int, cuts: List[int]):
+            results[clip_id] = self._cuts_to_clips(cuts, source, range_start, seg_total)
+            self._done_all += seg_total
 
-        for t in threads:
-            t.join()
-
-        n_frames = sum(seg_counts)
-        errors = [e for e in seg_errors if e is not None]
-        if errors:
-            logger.warning("Segment decode errors: %s", errors)
-
-        return n_frames
-
-    # --- Decode: single ffmpeg (fallback, ~262 fps) ---
-
-    def _decode_single(self, padded: np.ndarray, total: int,
-                       range_start: int, source: VideoSource) -> int:
-        """Single ffmpeg process decode — CPU fallback."""
-        frame_size = TNET_WIDTH * TNET_HEIGHT * 3
-        fps = source.fps if source.fps > 0 else 24.0
-        ss = range_start / fps if range_start > 0 else None
-        dur = total / fps if range_start > 0 else None
-        cmd = _build_ffmpeg_cmd_cpu(source.file_path, TNET_WIDTH, TNET_HEIGHT)
-        if ss is not None:
-            # Insert -ss and -t for range-limited decode
-            cmd = cmd[:3] + ["-ss", f"{ss:.4f}"] + cmd[3:]
-            if dur is not None:
-                idx = cmd.index("-i") + 2
-                cmd = cmd[:idx] + ["-t", f"{dur + 5:.4f}"] + cmd[idx:]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self._procs.append(proc)
-
-        buf = bytearray()
-        count = 0
+        runner = OmnishotcutRunner(
+            segments=self._segments,
+            sources=self._sources,
+            checkpoint_path=self._omnishotcut_checkpoint,
+            procs=self._procs,
+            is_cancelled=lambda: self._cancelled,
+            on_phase=on_phase,
+            on_decode_progress=on_decode_progress,
+            on_analyze_progress=on_analyze_progress,
+            on_segment_done=on_segment_done,
+        )
+        self._omnishotcut_runner = runner
         try:
-            while count < total and not self._cancelled:
-                raw = proc.stdout.read(frame_size * 500)
-                if not raw:
-                    break
-                buf.extend(raw)
-                while len(buf) >= frame_size and count < total:
-                    padded[TNET_PAD + count] = (
-                        np.frombuffer(bytes(buf[:frame_size]), np.uint8)
-                        .reshape(TNET_HEIGHT, TNET_WIDTH, 3)
-                    )
-                    del buf[:frame_size]
-                    count += 1
-                    if count % max(1, total // 200) == 0:
-                        overall = self._done_all + count
-                        pct = int(overall / self._total_all * 100)
-                        self.progress.emit(min(99, pct))
-                        self.detail_progress.emit(overall, self._total_all, "Decoding")
+            runner.run()
+        except Exception as e:
+            logger.exception("OmniShotCut run failed")
+            self.error.emit(str(e))
+            return
         finally:
-            proc.stdout.close()
-            proc.kill()
-            proc.wait()
+            self._omnishotcut_runner = None
 
-        return count
+        if self._cancelled:
+            return
+        self.finished.emit(results)
 
     # --- HSV fallback (per-segment) ---
 

@@ -128,6 +128,7 @@ Only supported timeline-interchange format. FCPXML encodes positions as rational
 - **File URIs:** `pathlib.Path.as_uri()` produces percent-encoded `file:///C:/...` URLs — already safe for direct XML embedding (no `&`, `<`, `>`, or `"` after encoding).
 - **Spine layout:** one `<asset-clip>` per real clip. `offset` = cumulative timeline position (packed if `include_gaps=False`, absolute-in-render-range if `True`). `start` = source in-point as a fraction. Gaps (when included) emit `<gap>` elements.
 - **Asset reuse:** one `<asset>` per *source* file (not per clip), IDs assigned in discovery order as `r2`, `r3`, etc. (`r1` is reserved for the `<format>`).
+- **Timeline name from filename:** `title=` parameter defaults to None; when None, derives `os.path.splitext(os.path.basename(output_path))[0]` so Resolve's "Load XML" dialog defaults the Timeline name and Import-timeline dropdown to the file's name instead of a generic literal. The derived value also feeds `<event name="…">` (the bin folder Resolve creates for imported assets). Pass explicit `title=` to override.
 - **Remaining ±1 drift trace:** source-file container timebase, not this exporter. MOVs exported with pre-v0.2.0 PrismaSynth use `time_base=1/16000`, which can't represent 23.976 exactly (667 vs 668 tick frames averaging). Re-export the source with current PrismaSynth (`-video_track_timescale 24000000`) for clean frame math end-to-end.
 
 ### OTIO Export (OpenTimelineIO native JSON)
@@ -140,6 +141,7 @@ Only supported timeline-interchange format. FCPXML encodes positions as rational
 - **`available_range`** on each `ExternalReference` = `(start=0, duration=source.total_frames)` at sequence rate. Asserts source length so OTIO-aware tools can display source handles without re-probing the file.
 - **Asset reuse:** one `ExternalReference` *dict* per source file shared by dict identity across clips. After JSON round-trip those become equal-but-distinct dicts — still semantically correct, just no longer pointer-shared.
 - **Metadata round-trip:** `metadata["prismasynth"]` stores `source_id` / `clip_id` / `color_index` / `label` so a future OTIO importer could reconstruct a .psynth project with no loss. `metadata["Resolve_OTIO"]` (effects, locks, timeline TC offset) is never written by us — Resolve fills it on its own round-trip.
+- **Timeline name from filename:** `title=` defaults to None; when None, derives from the output filename's basename (extension stripped). Lands on `Timeline.name` in the OTIO doc. Pass explicit `title=` to override. Symmetric with FCPXML's behaviour — don't diverge the two paths.
 - **Smoke test:** `scripts/otio_smoke.py` builds a minimal in-memory timeline and asserts schema shape, nudge presence, integer counts for duration/available_range/gaps, metadata round-trip, packed-layout behaviour, render-range clipping, and the empty-timeline guard.
 
 ### Thumbnail System
@@ -154,6 +156,7 @@ Persistent, long-lived thumbnail generator with sweep-based sequential decode. C
 - **Pause on scrub:** `_pause_event` halts generation during playhead drag. Resumes after 500ms idle (`_thumb_resume_timer`). `_wake_event` signals the coordinator when there's new work. Viewport reprioritize debounced to 300ms (`_viewport_timer`).
 - **Memory-only cache:** `_mem_cache` dict of QImage at 192x108, keyed by `{source_id}_{frame_num}`. Persists across clip changes (splits, deletes). `.copy()` on QImage to prevent use-after-free across thread boundaries.
 - **GPU isolation:** Thumbnails use CPU-only ffmpeg (no `-hwaccel cuda`) to leave NVDEC exclusively for mpv scrubbing. This prevents GPU contention that would stall the preview during scrubbing.
+- **Cache Thumbnails dialog:** `ui.cache_thumbnails_dialog.CacheThumbnailsDialog` is a user-triggered modal that bakes the on-disk thumbnail cache for the first AND last frame of every non-gap clip on the timeline (or only clips inside the in/out range when set). Backed by `thumbnail_cache.BulkCacheJob`, which runs the same 6-worker `ThreadPoolExecutor` as the live cache but on every targeted clip boundary instead of just the visible viewport. Reusable across runs in one session: after Done / Cancelled / Already-Cached the dialog returns to idle with Start re-enabled so the user can re-run with the Overwrite checkbox toggled. Use this before exporting a project with many clips to pre-warm the disk cache.
 
 ### Proxy System (Scene Detection Only)
 
@@ -162,9 +165,32 @@ Persistent, long-lived thumbnail generator with sweep-based sequential decode. C
 ### Import & Scene Detection (separate steps)
 
 1. **Import** (`ImportDialog` or drag-and-drop) — multi-file select, probes all files, creates one whole-file clip per source appended sequentially. All files in a batch must share the same resolution and FPS. If the timeline already has sources, new imports must match.
-2. **Detect Cuts** (`DetectDialog`, Ctrl+D) — runs SceneDetector on **all non-gap clips** on the timeline. Each clip's source segment is processed independently through TransNetV2; cuts are forced at source boundaries. Replaces analyzed clips via `TimelineModel.replace_detected()`. Partially-clamped clips (by in/out range) get prefix/suffix clips preserved. Re-detects everything in the analysis range.
+2. **Detect Cuts** (`DetectDialog`, Ctrl+D) — runs SceneDetector on **all non-gap clips** on the timeline. Two detector backends are exposed via a dropdown:
+   - **TransNetV2** (default) — fast, hard-cut-only neural network. Per-segment loop. HSV differencing as automatic fallback if TransNetV2 fails to load.
+   - **OmniShotCut** — slower transformer that also detects dissolves, fades, wipes, pushes, slides, zooms. Runs in a sidecar subprocess (see below).
+   Each clip's source segment is processed independently; cuts are forced at source boundaries. Replaces analyzed clips via `TimelineModel.replace_detected()`. Partially-clamped clips (by in/out range) get prefix/suffix clips preserved. Re-detects everything in the analysis range.
 
-Scene detection decode fallback chain: (1) parallel 4-segment ffmpeg with `scale_cuda` (NVDEC + GPU resize), (2) parallel 4-segment ffmpeg with CPU scale (NVDEC + CPU resize, ~396 fps), (3) single ffmpeg CPU fallback (~245 fps). Each path is probed before use. TransNetV2 GPU inference with HSV frame differencing fallback. mpv and thumbnails are paused during detection to avoid GPU contention.
+Scene detection decode fallback chain (shared by both detectors via `core.ffmpeg_decode.decode_to_array`): (1) parallel 4-segment ffmpeg with `scale_cuda` (NVDEC + GPU resize), (2) parallel 4-segment ffmpeg with CPU scale (NVDEC + CPU resize, ~396 fps), (3) single ffmpeg CPU fallback (~245 fps). Each path is probed before use. mpv and thumbnails are paused during detection to avoid GPU contention.
+
+### OmniShotCut Sidecar Architecture
+
+OmniShotCut requires `torch==2.5.1` / Python 3.10 / CUDA 12.4 — incompatible with PrismaSynth's Python 3.13+ free-threaded + `torch cu126`. To avoid the version conflict, OmniShotCut runs in a separate venv (`venv-omnishotcut/` at repo root, gitignored) as a sidecar subprocess.
+
+- **Setup** — `scripts/setup_omnishotcut.py` is a one-shot installer that uses `uv` (downloaded as a static binary to `.uv/uv.exe`) to install Python 3.10, create the sidecar venv, install torch + OmniShotCut requirements, clone OmniShotCut to `third_party/OmniShotCut/`, download the model checkpoint to `%LOCALAPPDATA%/prismasynth/models/OmniShotCut_ckpt.pth`, run a `--selftest`, and write a `venv-omnishotcut/.prismasynth_ready` sentinel file. Idempotent. Re-runnable with `--repair`. Triggered from the Detect Cuts dialog: when OmniShotCut is selected and the sentinel is missing, the "Detect" button is replaced with "Set up OmniShotCut" → opens `OmnishotcutSetupDialog` which tails the script's stdout in a `QPlainTextEdit`.
+- **Sidecar** — `scripts/omnishotcut_sidecar.py` is the in-venv script. Loads the model ONCE per Detect Cuts run (5-15s) and processes all segments sequentially, amortising the load cost. Communicates with the main process over JSON-line stdio + raw frame bytes. Defines `_single_array_inference()` — a fork of OmniShotCut's `single_video_inference` that takes a pre-decoded numpy array instead of a video file path, so frames decoded by the parent's NVDEC pipeline at the model's required resolution can be piped in directly. Per-window progress callback emitted during inference.
+- **Runner** — `core.omnishotcut_runner.OmnishotcutRunner` is the main-process wrapper. Spawns the sidecar with `CREATE_NEW_PROCESS_GROUP` (Windows) so cancellation can send `CTRL_BREAK_EVENT` for graceful shutdown before `proc.kill()`. Decodes each segment in-process via `decode_to_array`, sends a JSON segment header + raw bytes to the sidecar, drains the sidecar's stdout in a background thread (analyzing-progress callbacks dispatched live, results enqueued for the main thread). Closes stdin to signal end of work. SceneDetector's `cancel()` propagates to the runner.
+- **Cut mapping** — OmniShotCut returns shot ranges `[[start, end_exclusive], ...]` per segment. We convert to a flat cut list with `[r[1] - 1 for r in ranges[:-1]]` so `_cuts_to_clips()`'s existing `+1` shift produces correct boundaries. Transition type metadata (intra/inter labels) is currently discarded — every transition collapses to a single cut frame.
+- **Setup detection** — `is_setup_complete()` checks all three of: sentinel file, sidecar python.exe, and `third_party/OmniShotCut/` exist. The sentinel is written as the LAST step of setup so a partially-installed venv (e.g. setup killed mid-install) is correctly reported as not-ready.
+
+### Project Portability & Relinking
+
+`.psynth` files store both an absolute `file_path` and a `relative_path` (relative to the project file's directory) per source. On load, if the absolute path is missing, `core.project.load_project()` silently falls back to the relative path resolved against the project file's directory — sources that travel together with the project (e.g. zipped to a USB stick) reopen with no UI prompt.
+
+For sources that still don't resolve, `_load_from()` shows `ui.relink_dialog.RelinkDialog` BEFORE clearing the previously-open project's state — cancelling the dialog leaves the previous project intact (no destructive load). The dialog uses folder pickers per row: the user picks the folder containing the missing source, the dialog finds the basename inside it (case-insensitive on Windows). Picking one row's folder runs `_folder_rebase()` across the other still-missing rows to auto-link any matching basename. Auto-found rows pass STRICT silent validation (exact width/height, fps within 0.02, frame count within ±1%); explicit Browse uses LENIENT validation with a warn-and-override dialog on mismatch.
+
+On accept, `_load_from()` updates each relinked `VideoSource`'s metadata from the dialog's probe cache (file_path + width/height/fps/total_frames + codec + audio fields), clamps any clip whose `source_out` exceeds the new (smaller) total_frames with a single batch warning, then clears state and proceeds with the existing load flow. Sources whose path still doesn't exist (user clicked Skip) bypass `_reader_pool.register_source()` and `_proxy_manager.load_or_open()` — clips referencing them render black with no thumbnails, matching existing missing-file behaviour. Relinks set `self._dirty = True` so the new paths persist on next autosave.
+
+`save_project()` wraps `os.path.relpath` in `try/except ValueError` to handle Windows cross-drive paths (stored as `relative_path: null`). `load_project()` uses `sd.get("relative_path")` so legacy `.psynth` files without the field load unchanged.
 
 ### Threading Model
 
@@ -172,7 +198,8 @@ Scene detection decode fallback chain: (1) parallel 4-segment ffmpeg with `scale
 |--------|------|---------------|
 | Main (Qt) | All UI, signal slots, mpv commands | QPixmap only here |
 | Thumbnail coordinator | Persistent thread + 6-worker pool, sweep decode via PyAV + ffmpeg | Pauses during scrubbing, playhead-distance sweep |
-| Scene detection (QThread) | Parallel ffmpeg decode + TransNetV2 inference | Stores subprocess refs for cancellation |
+| Scene detection (QThread) | Parallel ffmpeg decode + TransNetV2 inference (OR drives OmniShotCut sidecar) | Stores subprocess refs for cancellation |
+| OmniShotCut sidecar | Separate Python 3.10 process; loads model once, infers per segment | Communicates over JSON-line stdio + raw bytes; cancel via CTRL_BREAK_EVENT then kill |
 | Export | Per-segment ffmpeg subprocesses (ThreadPoolExecutor) | Signals must use QueuedConnection to UI |
 
 **Thread safety:** `threading.Lock` on VideoReader, FrameCache, and export process lists. Qt signals for cross-thread communication. ThumbnailCache emits `QImage` (thread-safe) not `QPixmap` (main-thread-only). Exporter uses `QueuedConnection` for all UI signal connections. Do NOT use `faulthandler.enable()` — it intercepts mpv's internal structured exceptions (`0xe24c4a02`) and kills the process.
@@ -219,3 +246,12 @@ Custom-painted strip (not Qt model/view). Clip positions computed from cumulativ
 - `TimelineModel.replace_detected(replacements)` swaps clips by ID with detected sub-clip lists — the core integration point after scene detection. Preserves gaps and non-matched clips.
 - `ThumbnailCache` is created once and lives for the session. `_start_thumbnail_cache()` creates it on first call, subsequent calls use `notify_clips_changed()` + `reprioritize()`. Only `_on_new_project()` destroys it.
 - `ProxyManager.load_or_open(source, force_reopen=True)` is used after detection to pick up newly saved proxy files. Without `force_reopen`, cached proxies from import time would be returned.
+- `_load_from()` runs the relink dialog BEFORE clearing state. Do not reorder — cancelling the dialog must leave the previous project intact. Skipped sources (user-checked "Skip") must bypass `_reader_pool.register_source()` and `_proxy_manager.load_or_open()`.
+- `save_project()` writes `relative_path` per source (relative to the `.psynth` directory) alongside the absolute path. Cross-drive paths on Windows (`os.path.relpath` raises `ValueError`) get stored as `relative_path: null`.
+- `RelinkDialog` per-row Browse uses `QFileDialog.getExistingDirectory`, not `getOpenFileName` — the user picks a folder and the dialog finds the basename inside. Don't switch back to file pickers; the folder UX is what users wanted.
+- FCPXML / OTIO `export_*(... title=None ...)` derive the title from `output_path`. Don't restore the old `title="PrismaSynth"` literal default — it overrides what users see in Resolve.
+- OmniShotCut sidecar is launched ONCE per Detect Cuts run, not per segment — model load is 5-15s and must be amortised. `OmnishotcutRunner` interleaves decode+send+wait sequentially per segment; do not refactor to per-segment subprocess spawning.
+- `core.omnishotcut_runner.is_setup_complete()` checks the sentinel file (`venv-omnishotcut/.prismasynth_ready`) AND the venv python AND `third_party/OmniShotCut/`. The sentinel is written as the LAST step of `scripts/setup_omnishotcut.py` — checking just python.exe would race with mid-setup.
+- The decode helpers in `core.ffmpeg_decode` (`decode_to_array` and friends) are SHARED by both detector backends. Don't fork them per detector — width/height parameters already make them detector-agnostic.
+- OmniShotCut has no LICENSE file in its upstream repo — vendored snapshot at `third_party/OmniShotCut/` is gitignored. Personal-use only until upstream clarifies licensing; do not redistribute PrismaSynth bundles that include a checkpoint or vendored copy.
+- `decode_to_array()` returns `(padded_array, n_frames, method, elapsed_secs)`. The padded array's leading and trailing slack is left UNINITIALIZED — caller must zero or pad-replicate it if the detector requires deterministic edges (e.g. TransNetV2 replicates first/last frame).

@@ -2,7 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
+venv-omnishotcut/
+.uv/
 .venv/
+
+# Vendored ML repo (cloned by scripts/setup_omnishotcut.py)
+third_party/OmniShotCut/
 *.egg-info/
 dist/
 build/
