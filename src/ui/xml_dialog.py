@@ -17,28 +17,27 @@ class XmlDialog(QDialog):
 
     export_requested = Signal(dict)  # settings dict
 
-    def __init__(self, clip_count: int = 0, total_frames: int = 0,
-                 fps: float = 24.0, has_render_range: bool = False,
-                 parent=None):
+    def __init__(self, timeline, fps: float = 24.0,
+                 has_render_range: bool = False, parent=None):
         super().__init__(parent)
+        self._timeline = timeline
+        self._fps = fps
         self.setWindowTitle("Export XML (FCPXML)")
         self.setMinimumWidth(450)
         self.setModal(True)
 
         layout = QVBoxLayout(self)
 
-        duration_secs = total_frames / fps if fps > 0 else 0
-        mins, secs = divmod(int(duration_secs), 60)
-        info = f"{clip_count} clips  |  {total_frames:,} frames  |  {mins}:{secs:02d}"
-        info_label = QLabel(info)
-        info_label.setStyleSheet("color: #aaa;")
-        layout.addWidget(info_label)
+        self._info_label = QLabel("")
+        self._info_label.setStyleSheet("color: #aaa;")
+        layout.addWidget(self._info_label)
 
         self._gaps_check = QCheckBox("Include gaps between clips")
         self._gaps_check.setToolTip(
             "Checked: gaps appear as empty space in the NLE timeline.\n"
             "Unchecked: clips are placed back-to-back (compact)."
         )
+        self._gaps_check.stateChanged.connect(self._refresh_info)
         layout.addWidget(self._gaps_check)
 
         self._range_check = QCheckBox("Use in/out render range")
@@ -46,6 +45,7 @@ class XmlDialog(QDialog):
             "Only export clips within the in/out point range."
         )
         self._range_check.setEnabled(has_render_range)
+        self._range_check.stateChanged.connect(self._refresh_info)
         layout.addWidget(self._range_check)
 
         form = QFormLayout()
@@ -70,6 +70,20 @@ class XmlDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
+
+        self._refresh_info()
+
+    def _refresh_info(self):
+        include_gaps = self._gaps_check.isChecked()
+        use_range = self._range_check.isChecked() and self._range_check.isEnabled()
+        clips, frames = self._timeline.compute_export_extent(include_gaps, use_range)
+        secs_total = int(frames / self._fps) if self._fps > 0 else 0
+        h, rem = divmod(secs_total, 3600)
+        m, s = divmod(rem, 60)
+        time_str = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
+        self._info_label.setText(
+            f"{clips} clips  |  {frames:,} frames  |  {time_str}"
+        )
 
     def _browse(self):
         path, _ = QFileDialog.getSaveFileName(

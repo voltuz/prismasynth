@@ -1188,14 +1188,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export XML", "No clips to export.")
             return
         from ui.xml_dialog import XmlDialog
-        clip_count = self._timeline.real_clip_count
-        total_frames = sum(c.duration_frames for c in self._timeline.clips
-                           if not c.is_gap)
         first_source = next(iter(self._sources.values()), None)
         fps = first_source.fps if first_source else 24.0
         has_range = (self._timeline.in_point is not None
                      or self._timeline.out_point is not None)
-        dialog = XmlDialog(clip_count, total_frames, fps,
+        dialog = XmlDialog(self._timeline, fps,
                            has_render_range=has_range, parent=self)
         dialog.export_requested.connect(
             lambda s: self._run_xml_export(s, dialog))
@@ -1216,14 +1213,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export OTIO", "No clips to export.")
             return
         from ui.otio_dialog import OtioDialog
-        clip_count = self._timeline.real_clip_count
-        total_frames = sum(c.duration_frames for c in self._timeline.clips
-                           if not c.is_gap)
         first_source = next(iter(self._sources.values()), None)
         fps = first_source.fps if first_source else 24.0
         has_range = (self._timeline.in_point is not None
                      or self._timeline.out_point is not None)
-        dialog = OtioDialog(clip_count, total_frames, fps,
+        dialog = OtioDialog(self._timeline, fps,
                             has_render_range=has_range, parent=self)
         dialog.export_requested.connect(
             lambda s: self._run_otio_export(s, dialog))

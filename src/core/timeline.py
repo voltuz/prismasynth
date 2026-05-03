@@ -284,6 +284,36 @@ class TimelineModel(QObject):
         end = min(end, total - 1)
         return (start, end)
 
+    def compute_export_extent(self, include_gaps: bool,
+                              use_render_range: bool) -> Tuple[int, int]:
+        """Counts (real_clips, frames) that would be exported under the given flags.
+        Mirrors what xml_exporter / otio_exporter actually emit so the export
+        dialog's info text matches the produced file.
+        """
+        if use_render_range:
+            r_start, r_end = self.get_render_range()
+        else:
+            total = self.get_total_duration_frames()
+            r_start, r_end = 0, max(total - 1, 0)
+
+        pos = 0
+        clips = 0
+        frames = 0
+        for c in self._clips:
+            clip_start = pos
+            clip_end = pos + c.duration_frames - 1
+            pos += c.duration_frames
+            if clip_end < r_start or clip_start > r_end:
+                continue
+            in_range_dur = min(clip_end, r_end) - max(clip_start, r_start) + 1
+            if c.is_gap:
+                if include_gaps:
+                    frames += in_range_dur
+            else:
+                clips += 1
+                frames += in_range_dur
+        return clips, frames
+
     # --- Selection ---
 
     @property
