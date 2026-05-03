@@ -25,7 +25,8 @@ class ProjectData:
 def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
                  selection_follows: bool = True,
                  in_point: Optional[int] = None, out_point: Optional[int] = None,
-                 scroll_offset: int = 0):
+                 scroll_offset: int = 0,
+                 orphan_paths: Optional[dict] = None):
     data = {
         "version": PROJECT_VERSION,
         "playhead_position": playhead,
@@ -35,6 +36,9 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
         "out_point": out_point,
         "sources": [],
         "clips": [],
+        # file_path -> source_id mapping for clips whose source was removed
+        # but kept on the timeline. Re-importing the same path revives them.
+        "orphan_paths": dict(orphan_paths) if orphan_paths else {},
     }
     project_dir = os.path.dirname(filepath)
     for s in sources.values():
@@ -122,5 +126,8 @@ def load_project(filepath: str):
         "selection_follows_playhead": data.get("selection_follows_playhead", True),
         "in_point": data.get("in_point"),
         "out_point": data.get("out_point"),
+        # Round-tripped registry; load_project hands it to MainWindow which
+        # uses it to revive orphan clips on a same-path re-import.
+        "orphan_paths": dict(data.get("orphan_paths", {})),
         "version": data.get("version", 1),
     }

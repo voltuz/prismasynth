@@ -19,13 +19,13 @@ Custom MIME type for the pool→timeline drag:
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 
 from PySide6.QtCore import (
     QByteArray, QMimeData, QSize, Qt, QSettings, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QDrag, QIcon, QPixmap, QStandardItem, QStandardItemModel,
+    QAction, QIcon, QPixmap, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QListView, QMenu, QSizePolicy, QToolButton,
@@ -41,9 +41,38 @@ _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv',
                      '.flv', '.webm', '.m4v', '.ts', '.mxf'}
 
 
+class _SourceModel(QStandardItemModel):
+    """Item model that exposes our custom MIME on outgoing drags.
+
+    Overriding ``mimeTypes`` + ``mimeData`` lets Qt's built-in QAbstractItemView
+    drag detection handle the press-on-item → drag-out flow correctly. The
+    earlier approach (overriding QListView.startDrag) was bypassed when the
+    user pressed in any IconMode empty area, leaving only marquee selection.
+    """
+
+    def mimeTypes(self):
+        return [SOURCE_ID_MIME]
+
+    def mimeData(self, indexes):
+        ids = []
+        seen = set()
+        for idx in indexes:
+            if not idx.isValid():
+                continue
+            sid = self.data(idx, Qt.ItemDataRole.UserRole)
+            if sid and sid not in seen:
+                seen.add(sid)
+                ids.append(sid)
+        if not ids:
+            return None
+        mime = QMimeData()
+        mime.setData(SOURCE_ID_MIME, QByteArray("\n".join(ids).encode("utf-8")))
+        return mime
+
+
 class _SourceListView(QListView):
-    """Subclass that initiates a drag with our custom MIME and accepts
-    file-URL drops for adding new sources."""
+    """List view that accepts file-URL drops for adding new sources. Outgoing
+    drags are produced by the model's mimeData() override above."""
 
     files_dropped = Signal(list)  # list[str] of local file paths
 
@@ -54,34 +83,8 @@ class _SourceListView(QListView):
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(False)  # we don't reorder; only accept files
         self.setDragDropMode(QListView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setUniformItemSizes(True)
-
-    # --- Outgoing drag (sources to timeline) ---
-
-    def startDrag(self, supported_actions):
-        ids = self._selected_source_ids()
-        if not ids:
-            return
-        mime = QMimeData()
-        mime.setData(SOURCE_ID_MIME, QByteArray("\n".join(ids).encode("utf-8")))
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        # Use the first selected item's icon as the drag pixmap
-        idx = self.selectedIndexes()[0]
-        ic = self.model().data(idx, Qt.ItemDataRole.DecorationRole)
-        if isinstance(ic, QIcon) and not ic.isNull():
-            pix = ic.pixmap(THUMB_WIDTH, THUMB_HEIGHT)
-            drag.setPixmap(pix)
-            drag.setHotSpot(pix.rect().center())
-        drag.exec(Qt.DropAction.CopyAction)
-
-    def _selected_source_ids(self) -> List[str]:
-        ids = []
-        for idx in self.selectedIndexes():
-            sid = self.model().data(idx, Qt.ItemDataRole.UserRole)
-            if sid:
-                ids.append(sid)
-        return ids
 
     # --- Incoming drag (file URLs to add to pool) ---
 
@@ -131,8 +134,11 @@ class MediaPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setFixedWidth(250)
+        # Resizable in a horizontal QSplitter; Preferred lets the user drag
+        # the splitter handle, with a sensible floor so the panel never
+        # collapses below readable.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(180)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -168,7 +174,7 @@ class MediaPanel(QWidget):
 
         # --- List view ---
         self._view = _SourceListView()
-        self._model = QStandardItemModel()
+        self._model = _SourceModel()
         self._view.setModel(self._model)
         layout.addWidget(self._view, 1)
 
@@ -223,7 +229,7 @@ class MediaPanel(QWidget):
             self._view.setGridSize(QSize(THUMB_WIDTH + 12, THUMB_HEIGHT + 28))
             self._view.setWordWrap(True)
             self._view.setResizeMode(QListView.ResizeMode.Adjust)
-            self._view.setMovement(QListView.Movement.Static)
+            self._view.setMovement(QListView.Movement.Snap)
             self._view.setFlow(QListView.Flow.LeftToRight)
             self._view.setSpacing(4)
         else:  # list
@@ -232,7 +238,7 @@ class MediaPanel(QWidget):
             self._view.setGridSize(QSize())  # use default per-row sizing
             self._view.setWordWrap(False)
             self._view.setResizeMode(QListView.ResizeMode.Fixed)
-            self._view.setMovement(QListView.Movement.Static)
+            self._view.setMovement(QListView.Movement.Snap)
             self._view.setFlow(QListView.Flow.TopToBottom)
             self._view.setSpacing(0)
 

@@ -14,8 +14,10 @@ class ClipInfoPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(250)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        # Resizable in a horizontal QSplitter; Preferred lets the user drag
+        # the splitter handle, with a sensible floor.
+        self.setMinimumWidth(180)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)

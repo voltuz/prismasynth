@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QMessageBox, QFileDialog, QProgressBar,
     QApplication, QDialog,
 )
-from PySide6.QtCore import Qt, QTimer, QEvent, QRunnable, QThreadPool, Signal
+from PySide6.QtCore import Qt, QTimer, QEvent, QRunnable, QThreadPool, QSettings, Signal
 from PySide6.QtGui import QAction, QKeySequence
 
 from version import __version__
@@ -286,20 +286,38 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
 
         # Top area: media panel | preview | clip info (3-column layout)
-        top_widget = QWidget()
-        top_layout = QHBoxLayout(top_widget)
-        top_layout.setContentsMargins(0, 0, 0, 0)
+        # Horizontal splitter so the side panels are user-resizable.
+        self._top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._top_splitter.setChildrenCollapsible(False)
+        self._top_splitter.setHandleWidth(4)
 
         self._media_panel = MediaPanel()
-        top_layout.addWidget(self._media_panel)
+        self._top_splitter.addWidget(self._media_panel)
 
         self._preview = PreviewWidget()
-        top_layout.addWidget(self._preview, 1)
+        self._top_splitter.addWidget(self._preview)
 
         self._clip_info = ClipInfoPanel()
-        top_layout.addWidget(self._clip_info)
+        self._top_splitter.addWidget(self._clip_info)
 
-        splitter.addWidget(top_widget)
+        # Centre column takes the remainder; side columns stay where the user puts them.
+        self._top_splitter.setStretchFactor(0, 0)
+        self._top_splitter.setStretchFactor(1, 1)
+        self._top_splitter.setStretchFactor(2, 0)
+
+        # Restore saved sizes (per-user, across launches) or fall back to defaults.
+        _settings = QSettings()
+        _saved_sizes = _settings.value("main_window/top_splitter_sizes")
+        if _saved_sizes:
+            try:
+                self._top_splitter.setSizes([int(s) for s in _saved_sizes])
+            except (TypeError, ValueError):
+                self._top_splitter.setSizes([250, 800, 250])
+        else:
+            self._top_splitter.setSizes([250, 800, 250])
+        self._top_splitter.splitterMoved.connect(self._on_top_splitter_moved)
+
+        splitter.addWidget(self._top_splitter)
 
         # Bottom area: timeline (with left/right margins)
         self._timeline_widget = TimelineWidget(self._timeline)
@@ -338,6 +356,12 @@ class MainWindow(QMainWindow):
         self._thumb_extracted.connect(
             self._on_source_thumb_extracted, Qt.ConnectionType.QueuedConnection)
         self._source_info_dialog: Optional[SourceInfoDialog] = None
+
+        # Orphan-source registry: when the user removes a source from the Media
+        # Pool but keeps its clips on the timeline, we record (file_path -> id).
+        # On a later re-import of the same path, we reuse that id so the clips
+        # bind back automatically. Persisted in the .psynth file via project.py.
+        self._orphan_paths: Dict[str, str] = {}
 
         # Status bar
         self._status_bar = QStatusBar()
@@ -636,10 +660,21 @@ class MainWindow(QMainWindow):
 
     def _on_import_complete(self, sources: list):
         """Add imported sources to the Media Pool. Does NOT create timeline
-        clips — the user drags from the pool to the timeline when ready."""
+        clips — the user drags from the pool to the timeline when ready.
+        If the file path matches a previously-removed source whose clips were
+        kept on the timeline, the new source reuses the old UUID so those
+        clips bind back automatically."""
         if not sources:
             return
         for source in sources:
+            # Orphan revival: exact file_path match against the removed-paths
+            # registry. The new source takes the old UUID so existing clips
+            # (still referencing it) immediately become valid again.
+            old_id = self._orphan_paths.pop(source.file_path, None)
+            if old_id is not None and old_id not in self._sources:
+                logger.info("Reviving orphan source %s -> %s for %s",
+                             source.id, old_id, source.file_path)
+                source.id = old_id
             self._sources[source.id] = source
             self._reader_pool.register_source(source)
             self._proxy_manager.load_or_open(source)
@@ -756,8 +791,12 @@ class MainWindow(QMainWindow):
             self._do_remove_source(source_id, remove_clips=False)
 
     def _do_remove_source(self, source_id: str, *, remove_clips: bool):
+        src = self._sources.get(source_id)
         if remove_clips:
             self._timeline.remove_source_clips(source_id)
+        elif src is not None and src.file_path:
+            # Track this source for potential revival on a same-path re-import.
+            self._orphan_paths[src.file_path] = source_id
         # Drop the source from all bookkeeping. Orphaned clips (when
         # remove_clips=False) render black via the missing-source path.
         self._sources.pop(source_id, None)
@@ -769,6 +808,10 @@ class MainWindow(QMainWindow):
         self._refresh_media_panel()
         self._dirty = True
         self._update_status()
+
+    def _on_top_splitter_moved(self, *_):
+        QSettings().setValue(
+            "main_window/top_splitter_sizes", self._top_splitter.sizes())
 
     # --- Timeline drop handlers (from Media Panel drag) ---
 
@@ -1486,6 +1529,7 @@ class MainWindow(QMainWindow):
         self._reader_pool.close_all()
         self._proxy_manager.close_all()
         self._sources.clear()
+        self._orphan_paths.clear()
         self._refresh_media_panel()
         self._project_path = None
         self._dirty = False
@@ -1517,7 +1561,8 @@ class MainWindow(QMainWindow):
                          playhead, self._selection_follows_playhead,
                          in_point=self._timeline.in_point,
                          out_point=self._timeline.out_point,
-                         scroll_offset=scroll)
+                         scroll_offset=scroll,
+                         orphan_paths=self._orphan_paths)
             self._project_path = path
             self._dirty = False
             self._autosave_timer.stop()
@@ -1626,6 +1671,11 @@ class MainWindow(QMainWindow):
 
         # Populate the Media Panel
         self._refresh_media_panel()
+
+        # Restore the orphan-paths registry so a re-import after reopen still
+        # reattaches the orphan clips to a freshly-imported source.
+        self._orphan_paths.clear()
+        self._orphan_paths.update(data.get("orphan_paths", {}))
 
         # Set FPS from first source
         if self._sources:
