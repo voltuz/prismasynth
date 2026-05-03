@@ -67,7 +67,7 @@ class DetectDialog(QDialog):
         self._detector_combo = QComboBox()
         self._detector_combo.addItem("TransNetV2 (fast, hard cuts)", Detector.TRANSNETV2)
         self._detector_combo.addItem(
-            "OmniShotCut (slower, detects dissolves/fades/wipes)", Detector.OMNISHOTCUT,
+            "OmniShotCut (slower, transformer-based)", Detector.OMNISHOTCUT,
         )
         self._detector_combo.currentIndexChanged.connect(self._on_detector_changed)
         form.addRow("Detector:", self._detector_combo)

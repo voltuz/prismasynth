@@ -149,19 +149,38 @@ def _single_array_inference(video_np, model, model_args, num_context_frames,
     return pred_ranges_full, pred_intra_labels_full, pred_inter_labels_full
 
 
-def _ranges_to_cuts(pred_ranges, total_frames):
+# OmniShotCut inter-label semantics (config/label_correspondence.py).
+# inter_labels[i] describes the boundary BEFORE shot i:
+#   0 = new_start (chunk artifact, not a real cut)
+#   1 = hard_cut
+#   2 = transition_source (the source side of a fade/dissolve, etc.)
+#   3 = transition (dissolve, fade, wipe, push, slide, zoom, doorway)
+#   4 = sudden_jump (rapid jump within otherwise continuous footage)
+INTER_HARD_CUT = 1
+
+
+def _ranges_to_cuts(pred_ranges, inter_labels, total_frames, hard_cuts_only=True):
     """Convert OmniShotCut shot ranges to PrismaSynth cut frame numbers.
-    Each range is [start, end_exclusive]. Cut between range[i] and range[i+1] is at end[i].
-    The final range's end is the segment boundary, not a cut. Matches TransNetV2's
-    'last frame of each shot' semantics that _cuts_to_clips() shifts by +1.
+    Each range is [start, end_exclusive]; cut between range[i] and range[i+1]
+    sits at end[i] - 1 (last frame of shot i). Matches TransNetV2's "last
+    frame of each shot" semantics that _cuts_to_clips() shifts by +1.
+
+    When hard_cuts_only=True (default), emit a cut at the end of shot[i] only
+    if inter_labels[i+1] == hard_cut; transitions, sudden jumps, and chunk
+    new_start markers are skipped. Otherwise emit cuts at every boundary.
     """
     if len(pred_ranges) <= 1:
         return []
     cuts = []
-    for r in pred_ranges[:-1]:
-        end = int(r[1]) - 1  # end is exclusive in OmniShotCut output → last frame is end-1
-        if 0 <= end < total_frames - 1:
-            cuts.append(end)
+    for i in range(len(pred_ranges) - 1):
+        end = int(pred_ranges[i][1]) - 1
+        if not (0 <= end < total_frames - 1):
+            continue
+        if hard_cuts_only:
+            next_label = inter_labels[i + 1] if i + 1 < len(inter_labels) else None
+            if next_label != INTER_HARD_CUT:
+                continue
+        cuts.append(end)
     return cuts
 
 
@@ -256,7 +275,7 @@ def main_run():
             })
 
         try:
-            pred_ranges, _intra, _inter = _single_array_inference(
+            pred_ranges, _intra, inter_labels = _single_array_inference(
                 video_np, model, model_args, num_context_frames,
                 progress_cb=progress,
             )
@@ -264,11 +283,17 @@ def main_run():
             _emit_error(f"segment {seg_id} inference failed: {e}")
             return 1
 
-        cuts = _ranges_to_cuts(pred_ranges, frame_count)
+        # Hard-cuts-only is the deliberate behaviour — soft transitions
+        # (dissolves, fades, wipes, etc.) are skipped per user request.
+        # Toggle via the segment header if a UI option is added later.
+        hard_cuts_only = bool(msg.get("hard_cuts_only", True))
+        cuts = _ranges_to_cuts(pred_ranges, inter_labels, frame_count,
+                               hard_cuts_only=hard_cuts_only)
         _emit({
             "phase": "result",
             "seg_id": seg_id,
             "ranges": [[int(r[0]), int(r[1])] for r in pred_ranges],
+            "inter_labels": [int(l) for l in inter_labels],
             "cuts": cuts,
         })
 
