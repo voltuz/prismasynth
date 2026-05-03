@@ -15,11 +15,13 @@ from core.timeline import TimelineModel
 from core.clip import Clip
 from ui.icon_loader import icon
 
-# Custom MIME for media-pool drags (kept in sync with ui/media_panel.py).
+# Custom MIMEs for media-pool drags (kept in sync with ui/media_panel.py).
 _SOURCE_ID_MIME = "application/x-prismasynth-source-ids"
+_SOURCE_DURATIONS_MIME = "application/x-prismasynth-source-durations"
 _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv',
                      '.flv', '.webm', '.m4v', '.ts', '.mxf'}
 _DROP_INDICATOR_COLOR = QColor(255, 200, 0)
+_DROP_FOOTPRINT_COLOR = QColor(255, 200, 0, 60)  # translucent fill
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +99,11 @@ class TimelineStrip(QWidget):
         self._last_preview_frame = -1   # throttle cut-mode hover seeks
 
         # Drop state — set during drag-over from the Media Panel; consumed by
-        # paintEvent to draw a vertical insertion line.
+        # paintEvent to draw a vertical insertion line and (when source
+        # durations are known) a translucent footprint rectangle showing
+        # how much room the dropped clip(s) will occupy.
         self._drop_insert_frame: Optional[int] = None
+        self._drop_total_frames: int = 0
 
         self.setMinimumHeight(CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -177,11 +182,21 @@ class TimelineStrip(QWidget):
     def _accepted_drag(self, event):
         """True if the drag mime is something we want to handle. Sets the
         drop insertion frame for the cursor position as a side effect when
-        the drag is accepted (so paintEvent draws the indicator line)."""
+        the drag is accepted (so paintEvent draws the indicator line +
+        translucent footprint rectangle)."""
         mime = event.mimeData()
         accept = False
+        total_frames = 0
         if mime.hasFormat(_SOURCE_ID_MIME):
             accept = True
+            # Decode the parallel durations mime so paintEvent can size the
+            # ghost rectangle. Falls back to no preview rect when missing.
+            if mime.hasFormat(_SOURCE_DURATIONS_MIME):
+                payload = bytes(mime.data(_SOURCE_DURATIONS_MIME)).decode("utf-8", "replace")
+                try:
+                    total_frames = sum(int(d) for d in payload.split("\n") if d)
+                except ValueError:
+                    total_frames = 0
         elif mime.hasUrls():
             for u in mime.urls():
                 if u.isLocalFile():
@@ -191,6 +206,7 @@ class TimelineStrip(QWidget):
                         break
         if accept:
             self._drop_insert_frame = self._cursor_to_insert_frame(event.position().x())
+            self._drop_total_frames = total_frames
             self.update()
         return accept
 
@@ -224,6 +240,7 @@ class TimelineStrip(QWidget):
 
     def dragLeaveEvent(self, event: QDragLeaveEvent):
         self._drop_insert_frame = None
+        self._drop_total_frames = 0
         self.update()
 
     def dropEvent(self, event: QDropEvent):
@@ -243,6 +260,7 @@ class TimelineStrip(QWidget):
                 self.files_dropped.emit(paths, frame)
                 event.acceptProposedAction()
         self._drop_insert_frame = None
+        self._drop_total_frames = 0
         self.update()
 
     def ensure_playhead_visible(self):
@@ -292,9 +310,22 @@ class TimelineStrip(QWidget):
             painter.setPen(QPen(QColor(0, 120, 215, 120), 1))
             painter.drawRect(marquee_rect)
 
-        # Drop insertion line (during drag from Media Panel)
+        # Drop insertion line + translucent footprint rectangle (during drag
+        # from the Media Panel). The rectangle previews how much room the
+        # dropped clip(s) will occupy on the timeline at the current zoom.
         if self._drop_insert_frame is not None:
             ix = self._frame_to_pixel(self._drop_insert_frame) - self._scroll_offset
+            # Footprint rectangle (drawn first so the line ends up on top).
+            if self._drop_total_frames > 0:
+                end_x = (self._frame_to_pixel(self._drop_insert_frame
+                                               + self._drop_total_frames)
+                         - self._scroll_offset)
+                rect_x = max(0, ix)
+                rect_w = min(end_x, w) - rect_x
+                if rect_w > 0:
+                    painter.fillRect(rect_x, clip_y, rect_w,
+                                      self._clip_height,
+                                      _DROP_FOOTPRINT_COLOR)
             if 0 <= ix <= w:
                 painter.setPen(QPen(_DROP_INDICATOR_COLOR, 3))
                 painter.drawLine(ix, HEADER_HEIGHT, ix, h)

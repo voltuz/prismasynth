@@ -3,6 +3,7 @@ import os
 from typing import Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem,
@@ -18,14 +19,23 @@ _FPS_TOLERANCE = 0.02
 _FRAME_TOLERANCE = 0.01  # ±1%
 
 
+_STATUS_LINKED = "Linked"
+_STATUS_MISSING = "Missing"
+_LINKED_COLOR = QColor("#6cba7e")
+_MISSING_COLOR = QColor("#e8a735")
+
+
 class RelinkDialog(QDialog):
-    """Modal dialog for relinking missing source files when opening a project
-    on a different machine. User browses to a replacement; folder-rebase then
-    auto-finds other missing sources by basename in the same folder."""
+    """Modal dialog for managing source file paths.
+
+    Originally built for missing-source recovery on project load; now also
+    invoked from the Media Pool to repoint an already-existing source at a
+    different file. The status column reflects the current state per source —
+    "Linked" (green) when the file exists, "Missing" (orange) when not."""
 
     def __init__(self, missing: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Relink Missing Sources")
+        self.setWindowTitle("Relink Sources")
         self.setModal(True)
         self.setMinimumWidth(720)
         self.setMinimumHeight(380)
@@ -36,12 +46,25 @@ class RelinkDialog(QDialog):
         self._row_by_id: dict[str, int] = {}
         self._last_browse_dir: str = ""
 
+        # Pre-compute which sources are missing so we can phrase the intro
+        # appropriately and gate the OK button correctly.
+        self._missing_count = sum(
+            1 for s in self._missing.values() if not os.path.exists(s.file_path)
+        )
+        total = len(self._missing)
+
         layout = QVBoxLayout(self)
 
-        intro = QLabel(
-            f"{len(self._missing)} source file(s) could not be found. "
-            "Browse to relink them, or skip to keep broken references."
-        )
+        if self._missing_count == total:
+            intro_text = (f"{total} source file(s) could not be found. "
+                          "Browse to relink them, or skip to keep broken references.")
+        elif self._missing_count == 0:
+            intro_text = ("Pick a different file for any source you want to "
+                          "repoint, or close to keep the existing links.")
+        else:
+            intro_text = (f"{self._missing_count} of {total} source file(s) are missing. "
+                          "Browse to relink missing ones, or repoint existing ones.")
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -64,7 +87,13 @@ class RelinkDialog(QDialog):
             file_item.setToolTip(src.file_path)
             self._table.setItem(row, 0, file_item)
 
-            status_item = QTableWidgetItem("Missing")
+            # Reflect the actual on-disk state per source.
+            if os.path.exists(src.file_path):
+                status_text, status_color = _STATUS_LINKED, _LINKED_COLOR
+            else:
+                status_text, status_color = _STATUS_MISSING, _MISSING_COLOR
+            status_item = QTableWidgetItem(status_text)
+            status_item.setForeground(QBrush(status_color))
             status_item.setToolTip(src.file_path)
             self._table.setItem(row, 1, status_item)
 
@@ -95,9 +124,11 @@ class RelinkDialog(QDialog):
         self._ok_btn = QPushButton("OK")
         self._ok_btn.setDefault(True)
         self._ok_btn.clicked.connect(self.accept)
-        self._ok_btn.setEnabled(False)
         bottom.addWidget(self._ok_btn)
         layout.addLayout(bottom)
+        # OK is enabled when every source is either explicitly handled
+        # (relinked or skipped) OR already linked to an existing file.
+        self._update_ok_enabled()
 
     def resolved_paths(self) -> dict:
         return dict(self._resolved)
@@ -155,7 +186,13 @@ class RelinkDialog(QDialog):
             self._set_status(source_id, "Skipped")
         else:
             self._resolved.pop(source_id, None)
-            self._set_status(source_id, "Missing", tooltip=self._missing[source_id].file_path)
+            src = self._missing[source_id]
+            if os.path.exists(src.file_path):
+                self._set_status(source_id, _STATUS_LINKED,
+                                 tooltip=src.file_path, color=_LINKED_COLOR)
+            else:
+                self._set_status(source_id, _STATUS_MISSING,
+                                 tooltip=src.file_path, color=_MISSING_COLOR)
         self._update_ok_enabled()
 
     def _folder_rebase(self, folder: str, exclude: str):
@@ -235,7 +272,9 @@ class RelinkDialog(QDialog):
             logger.exception("probe_video failed for %s", path)
             return None
 
-    def _set_status(self, source_id: str, text: str, tooltip: Optional[str] = None):
+    def _set_status(self, source_id: str, text: str,
+                    tooltip: Optional[str] = None,
+                    color: Optional[QColor] = None):
         row = self._row_by_id[source_id]
         item = self._table.item(row, 1)
         if item is None:
@@ -243,6 +282,19 @@ class RelinkDialog(QDialog):
             self._table.setItem(row, 1, item)
         item.setText(text)
         item.setToolTip(tooltip or text)
+        if color is not None:
+            item.setForeground(QBrush(color))
 
     def _update_ok_enabled(self):
-        self._ok_btn.setEnabled(len(self._resolved) == len(self._missing))
+        # A source is "handled" if explicitly resolved (relinked or skipped)
+        # OR if its current file path exists on disk (the user can close
+        # without changing it).
+        all_handled = True
+        for sid, src in self._missing.items():
+            if sid in self._resolved:
+                continue
+            if os.path.exists(src.file_path):
+                continue
+            all_handled = False
+            break
+        self._ok_btn.setEnabled(all_handled)

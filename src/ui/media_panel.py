@@ -37,8 +37,14 @@ from core.source_thumbnail import cache_path_for, THUMB_HEIGHT, THUMB_WIDTH
 
 
 SOURCE_ID_MIME = "application/x-prismasynth-source-ids"
+SOURCE_DURATIONS_MIME = "application/x-prismasynth-source-durations"
 _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv',
                      '.flv', '.webm', '.m4v', '.ts', '.mxf'}
+
+# Custom item-data role used by the drag mime to look up each source's
+# duration. Qt.ItemDataRole.UserRole holds the source ID; UserRole+1 holds
+# the total_frames for the drag-preview footprint on the timeline.
+_DURATION_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 class _SourceModel(QStandardItemModel):
@@ -51,22 +57,28 @@ class _SourceModel(QStandardItemModel):
     """
 
     def mimeTypes(self):
-        return [SOURCE_ID_MIME]
+        return [SOURCE_ID_MIME, SOURCE_DURATIONS_MIME]
 
     def mimeData(self, indexes):
         ids = []
+        durations = []
         seen = set()
         for idx in indexes:
             if not idx.isValid():
                 continue
             sid = self.data(idx, Qt.ItemDataRole.UserRole)
+            dur = self.data(idx, _DURATION_ROLE) or 0
             if sid and sid not in seen:
                 seen.add(sid)
                 ids.append(sid)
+                durations.append(int(dur))
         if not ids:
             return None
         mime = QMimeData()
-        mime.setData(SOURCE_ID_MIME, QByteArray("\n".join(ids).encode("utf-8")))
+        mime.setData(SOURCE_ID_MIME,
+                     QByteArray("\n".join(ids).encode("utf-8")))
+        mime.setData(SOURCE_DURATIONS_MIME,
+                     QByteArray("\n".join(str(d) for d in durations).encode("utf-8")))
         return mime
 
 
@@ -206,6 +218,7 @@ class MediaPanel(QWidget):
         for sid, src in sources.items():
             item = QStandardItem(self._display_name(src))
             item.setData(sid, Qt.ItemDataRole.UserRole)
+            item.setData(int(src.total_frames), _DURATION_ROLE)
             item.setEditable(False)
             item.setIcon(self._load_icon(src))
             item.setToolTip(self._tooltip(src))
@@ -229,7 +242,7 @@ class MediaPanel(QWidget):
             self._view.setGridSize(QSize(THUMB_WIDTH + 12, THUMB_HEIGHT + 28))
             self._view.setWordWrap(True)
             self._view.setResizeMode(QListView.ResizeMode.Adjust)
-            self._view.setMovement(QListView.Movement.Snap)
+            self._view.setMovement(QListView.Movement.Static)
             self._view.setFlow(QListView.Flow.LeftToRight)
             self._view.setSpacing(4)
         else:  # list
@@ -238,9 +251,14 @@ class MediaPanel(QWidget):
             self._view.setGridSize(QSize())  # use default per-row sizing
             self._view.setWordWrap(False)
             self._view.setResizeMode(QListView.ResizeMode.Fixed)
-            self._view.setMovement(QListView.Movement.Snap)
+            self._view.setMovement(QListView.Movement.Static)
             self._view.setFlow(QListView.Flow.TopToBottom)
             self._view.setSpacing(0)
+
+        # Force a full re-layout. Without this, Qt sometimes carries stale
+        # per-item positions (from a previous IconMode session) into ListMode,
+        # which can hide rows below the viewport.
+        self._view.scheduleDelayedItemsLayout()
 
         self._grid_btn.setChecked(mode == "grid")
         self._list_btn.setChecked(mode == "list")
