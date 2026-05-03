@@ -25,15 +25,16 @@ from PySide6.QtCore import (
     QByteArray, QMimeData, QSize, Qt, QSettings, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QIcon, QPixmap, QStandardItem, QStandardItemModel,
+    QAction, QDrag, QIcon, QPixmap, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QListView, QMenu, QSizePolicy, QToolButton,
-    QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QLabel, QListView, QMenu, QSizePolicy,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from core.video_source import VideoSource
 from core.source_thumbnail import cache_path_for, THUMB_HEIGHT, THUMB_WIDTH
+from ui.icon_loader import icon
 
 
 SOURCE_ID_MIME = "application/x-prismasynth-source-ids"
@@ -97,6 +98,57 @@ class _SourceListView(QListView):
         self.setDragDropMode(QListView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setUniformItemSizes(True)
+
+        # State for the manual drag override below.
+        self._press_pos = None
+        self._press_idx = None
+
+    # --- Outgoing drag: manual press/move detection ---
+    #
+    # In IconMode + ExtendedSelection + Movement.Static, Qt's built-in drag
+    # detection prefers rubber-band selection over starting a drag (even
+    # when pressing on a thumbnail). Forcing a drag on item-press here
+    # bypasses that heuristic entirely. Empty-area press still falls
+    # through to super() and produces the marquee selection.
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            idx = self.indexAt(self._press_pos)
+            self._press_idx = idx if idx.isValid() else None
+        else:
+            self._press_pos = None
+            self._press_idx = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press_idx is not None
+                and self._press_pos is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            distance = (event.position().toPoint() - self._press_pos).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                indexes = self.selectedIndexes() or [self._press_idx]
+                mime = self.model().mimeData(indexes)
+                if mime is not None:
+                    drag = QDrag(self)
+                    drag.setMimeData(mime)
+                    # Drag pixmap = first item's icon, scaled. Improves the
+                    # visual feedback while dragging vs. the default cursor.
+                    ic = self.model().data(indexes[0], Qt.ItemDataRole.DecorationRole)
+                    if isinstance(ic, QIcon) and not ic.isNull():
+                        pix = ic.pixmap(THUMB_WIDTH, THUMB_HEIGHT)
+                        drag.setPixmap(pix)
+                        drag.setHotSpot(pix.rect().center())
+                    drag.exec(Qt.DropAction.CopyAction)
+                self._press_idx = None
+                self._press_pos = None
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._press_idx = None
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
 
     # --- Incoming drag (file URLs to add to pool) ---
 
@@ -164,11 +216,12 @@ class MediaPanel(QWidget):
         header.addWidget(title)
         header.addStretch()
 
-        # Grid / List toggles. We don't ship dedicated icons for these so we
-        # use Unicode glyphs — small and works without an icon SVG.
+        # Grid / List toggles — distinct SVG icons (4-square grid vs.
+        # 3-line list with leading bullets).
         self._grid_btn = QToolButton()
         self._grid_btn.setCheckable(True)
-        self._grid_btn.setText("▦")  # ▦ squared equal
+        self._grid_btn.setIcon(icon("grid"))
+        self._grid_btn.setIconSize(QSize(16, 16))
         self._grid_btn.setToolTip("Grid view")
         self._grid_btn.setAutoRaise(True)
         self._grid_btn.clicked.connect(lambda: self._set_view_mode("grid"))
@@ -176,7 +229,8 @@ class MediaPanel(QWidget):
 
         self._list_btn = QToolButton()
         self._list_btn.setCheckable(True)
-        self._list_btn.setText("≡")  # ≡ identical to
+        self._list_btn.setIcon(icon("list"))
+        self._list_btn.setIconSize(QSize(16, 16))
         self._list_btn.setToolTip("List view")
         self._list_btn.setAutoRaise(True)
         self._list_btn.clicked.connect(lambda: self._set_view_mode("list"))
