@@ -72,6 +72,15 @@ IMAGE_FORMATS = {
     "exr": {"name": "OpenEXR (HDR)", "ext": ".exr"},
 }
 
+# Audio formats for standalone audio export. The exporter has its own
+# preset map with codec/encoder args; this is just for UI display + ext.
+AUDIO_FORMAT_PRESETS = {
+    "wav":  {"name": "WAV (PCM)",     "ext": ".wav"},
+    "flac": {"name": "FLAC",          "ext": ".flac"},
+    "mp3":  {"name": "MP3 (192k)",    "ext": ".mp3"},
+    "m4a":  {"name": "M4A (AAC 320k)","ext": ".m4a"},
+}
+
 
 class ExportDialog(QDialog):
     """Export settings dialog for video and image sequence export."""
@@ -174,14 +183,77 @@ class ExportDialog(QDialog):
         vform.addRow("FPS:", self._vid_fps)
 
         self._vid_output = QLineEdit()
-        vid_browse_btn = QPushButton("Browse...")
-        vid_browse_btn.clicked.connect(self._browse_video_output)
+        self._vid_browse_btn = QPushButton("Browse...")
+        self._vid_browse_btn.clicked.connect(self._browse_video_output)
         out_layout = QHBoxLayout()
         out_layout.addWidget(self._vid_output, 1)
-        out_layout.addWidget(vid_browse_btn)
+        out_layout.addWidget(self._vid_browse_btn)
         vform.addRow("Output:", out_layout)
 
         vl.addLayout(vform)
+
+        # --- Audio group ---
+        audio_group = QGroupBox("Audio")
+        ag_form = QFormLayout(audio_group)
+
+        # Audio mode — three options on the Video tab. Standalone audio-only
+        # export lives on its own tab + Timeline menu entry.
+        self._audio_mode_combo = QComboBox()
+        self._audio_mode_combo.addItem("Save audio in video", "embedded")
+        self._audio_mode_combo.addItem("No audio", "none")
+        self._audio_mode_combo.addItem(
+            "Save audio in video + standalone", "both")
+        self._audio_mode_combo.setCurrentIndex(0)
+        self._audio_mode_combo.currentIndexChanged.connect(
+            self._on_audio_mode_changed)
+        ag_form.addRow("Mode:", self._audio_mode_combo)
+
+        # Format — visible only when mode == "both" (sidecar file).
+        self._audio_format_label = QLabel("Format:")
+        self._audio_format_combo = QComboBox()
+        for key in ("wav", "flac", "mp3", "m4a"):
+            self._audio_format_combo.addItem(
+                AUDIO_FORMAT_PRESETS[key]["name"], key)
+        self._audio_format_combo.currentIndexChanged.connect(
+            self._on_audio_format_changed)
+        ag_form.addRow(self._audio_format_label, self._audio_format_combo)
+
+        # Location — "Next to video file" (auto-derived path, no field shown)
+        # or "Custom path" (reveals the line edit + Browse). Visible only
+        # when mode == "both".
+        self._audio_location_label = QLabel("Location:")
+        self._audio_location_combo = QComboBox()
+        self._audio_location_combo.addItem("Next to video file", "auto")
+        self._audio_location_combo.addItem("Custom path", "custom")
+        self._audio_location_combo.setCurrentIndex(0)
+        self._audio_location_combo.currentIndexChanged.connect(
+            self._on_audio_location_changed)
+        ag_form.addRow(self._audio_location_label, self._audio_location_combo)
+
+        self._audio_output_label = QLabel("Audio output:")
+        self._audio_output = QLineEdit()
+        self._audio_browse_btn = QPushButton("Browse...")
+        self._audio_browse_btn.clicked.connect(self._browse_audio_output)
+        audio_out_layout = QHBoxLayout()
+        audio_out_layout.addWidget(self._audio_output, 1)
+        audio_out_layout.addWidget(self._audio_browse_btn)
+        ag_form.addRow(self._audio_output_label, audio_out_layout)
+
+        vl.addWidget(audio_group)
+
+        # Track the last value we auto-filled into the audio output line so
+        # we can tell if the user has manually edited it (don't clobber).
+        self._audio_path_auto_value = ""
+        # When the user retypes the video output, refresh the custom audio
+        # path field if it's empty or still showing the previous derived
+        # value. The auto-location case derives at export time so this is
+        # purely a UX nicety for the custom field.
+        self._vid_output.textChanged.connect(
+            lambda _t: self._maybe_autofill_audio_path())
+
+        # Apply initial visibility state (mode = embedded → everything hidden).
+        self._on_audio_mode_changed()
+
         self._tabs.addTab(video_tab, "Video")
 
         # --- Image Sequence tab ---
@@ -216,6 +288,30 @@ class ExportDialog(QDialog):
 
         il.addLayout(iform)
         self._tabs.addTab(img_tab, "Image Sequence")
+
+        # --- Audio tab (audio-only export, no video) ---
+        audio_tab = QWidget()
+        al = QVBoxLayout(audio_tab)
+        aform = QFormLayout()
+
+        self._aud_format_combo = QComboBox()
+        for key in ("wav", "flac", "mp3", "m4a"):
+            self._aud_format_combo.addItem(
+                AUDIO_FORMAT_PRESETS[key]["name"], key)
+        self._aud_format_combo.currentIndexChanged.connect(
+            self._on_audio_tab_format_changed)
+        aform.addRow("Format:", self._aud_format_combo)
+
+        self._aud_output = QLineEdit()
+        aud_browse_btn = QPushButton("Browse...")
+        aud_browse_btn.clicked.connect(self._browse_audio_tab_output)
+        aud_out_layout = QHBoxLayout()
+        aud_out_layout.addWidget(self._aud_output, 1)
+        aud_out_layout.addWidget(aud_browse_btn)
+        aform.addRow("Output:", aud_out_layout)
+
+        al.addLayout(aform)
+        self._tabs.addTab(audio_tab, "Audio only")
 
         # Info stats
         fps = default_fps if default_fps > 0 else 24.0
@@ -294,14 +390,113 @@ class ExportDialog(QDialog):
         if path:
             self._vid_output.setText(path)
 
+    # --- Audio controls ---
+
+    def _on_audio_mode_changed(self):
+        mode = self._audio_mode_combo.currentData()
+        sidecar = (mode == "both")
+        # Format + Location rows are only relevant for the sidecar.
+        self._audio_format_label.setVisible(sidecar)
+        self._audio_format_combo.setVisible(sidecar)
+        self._audio_location_label.setVisible(sidecar)
+        self._audio_location_combo.setVisible(sidecar)
+        # The custom-path row also depends on which location is chosen.
+        self._update_audio_path_row_visibility()
+        if sidecar:
+            self._maybe_autofill_audio_path()
+
+    def _on_audio_location_changed(self):
+        self._update_audio_path_row_visibility()
+        # When the user switches to Custom, pre-fill the field from the
+        # video output so they don't start from a blank line.
+        if self._audio_location_combo.currentData() == "custom":
+            self._maybe_autofill_audio_path()
+
+    def _update_audio_path_row_visibility(self):
+        mode = self._audio_mode_combo.currentData()
+        location = self._audio_location_combo.currentData()
+        custom = (mode == "both" and location == "custom")
+        self._audio_output_label.setVisible(custom)
+        self._audio_output.setVisible(custom)
+        self._audio_browse_btn.setVisible(custom)
+
+    def _on_audio_format_changed(self):
+        self._maybe_autofill_audio_path()
+
+    def _browse_audio_output(self):
+        fmt_key = self._audio_format_combo.currentData() or "wav"
+        ext = AUDIO_FORMAT_PRESETS[fmt_key]["ext"]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Audio", "", f"Audio (*{ext})"
+        )
+        if path:
+            if not path.lower().endswith(ext):
+                path += ext
+            self._audio_output.setText(path)
+            # User-chosen path: clear the auto-fill marker so the next
+            # autofill no-ops (don't clobber).
+            self._audio_path_auto_value = path
+
+    def _derive_audio_path(self) -> str:
+        """Audio output derived from video output basename + audio format ext.
+        Returns '' if there's no video output to derive from."""
+        vid_path = self._vid_output.text().strip()
+        if not vid_path:
+            return ""
+        fmt_key = self._audio_format_combo.currentData() or "wav"
+        ext = AUDIO_FORMAT_PRESETS[fmt_key]["ext"]
+        base, _src_ext = os.path.splitext(vid_path)
+        return base + ext
+
+    def _maybe_autofill_audio_path(self):
+        """Auto-fill the custom audio output line from the video output path.
+        Skipped when the user has edited the line manually (current text !=
+        last auto-filled value)."""
+        cur = self._audio_output.text().strip()
+        if cur and cur != self._audio_path_auto_value:
+            return
+        derived = self._derive_audio_path()
+        if not derived:
+            return
+        self._audio_output.setText(derived)
+        self._audio_path_auto_value = derived
+
     def _browse_image_output(self):
         path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if path:
             self._img_output_dir.setText(path)
 
+    def _browse_audio_tab_output(self):
+        fmt_key = self._aud_format_combo.currentData() or "wav"
+        ext = AUDIO_FORMAT_PRESETS[fmt_key]["ext"]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Audio", "", f"Audio (*{ext})"
+        )
+        if path:
+            if not path.lower().endswith(ext):
+                path += ext
+            self._aud_output.setText(path)
+
+    def _on_audio_tab_format_changed(self):
+        # Swap the extension of the audio-tab output line if it currently
+        # ends in any of the known audio extensions. Leaves user-entered
+        # paths alone if they don't match a known ext.
+        cur = self._aud_output.text().strip()
+        if not cur:
+            return
+        known_exts = tuple(p["ext"] for p in AUDIO_FORMAT_PRESETS.values())
+        if not cur.lower().endswith(known_exts):
+            return
+        new_ext = AUDIO_FORMAT_PRESETS[
+            self._aud_format_combo.currentData() or "wav"]["ext"]
+        base, _ = os.path.splitext(cur)
+        self._aud_output.setText(base + new_ext)
+
     def _start_export(self):
-        if self._tabs.currentIndex() == 0:
-            # Video export
+        idx = self._tabs.currentIndex()
+        if idx == 0:
+            # Video tab — three audio modes (standalone has its own tab)
+            audio_mode = self._audio_mode_combo.currentData() or "embedded"
             output = self._vid_output.text().strip()
             if not output:
                 self._status_label.setText("Please specify an output path.")
@@ -319,8 +514,27 @@ class ExportDialog(QDialog):
                 "width": self._vid_width.value(),
                 "height": self._vid_height.value(),
                 "fps": self._vid_fps.value(),
+                "audio_mode": audio_mode,
             }
-        else:
+            if audio_mode == "both":
+                audio_format = self._audio_format_combo.currentData() or "wav"
+                ext = AUDIO_FORMAT_PRESETS[audio_format]["ext"]
+                location = self._audio_location_combo.currentData() or "auto"
+                if location == "auto":
+                    # Sidecar alongside the video, same basename, audio ext.
+                    base, _ = os.path.splitext(output)
+                    audio_output = base + ext
+                else:  # custom
+                    audio_output = self._audio_output.text().strip()
+                    if not audio_output:
+                        self._status_label.setText(
+                            "Please specify the custom audio output path.")
+                        return
+                    if not audio_output.lower().endswith(ext):
+                        audio_output = os.path.splitext(audio_output)[0] + ext
+                settings["audio_format"] = audio_format
+                settings["audio_output_path"] = audio_output
+        elif idx == 1:
             # Image sequence export
             output_dir = self._img_output_dir.text().strip()
             if not output_dir:
@@ -334,6 +548,32 @@ class ExportDialog(QDialog):
                 "ext": IMAGE_FORMATS[fmt_key]["ext"],
                 "width": self._img_width.value(),
                 "height": self._img_height.value(),
+            }
+        else:
+            # Audio-only export
+            audio_format = self._aud_format_combo.currentData() or "wav"
+            ext = AUDIO_FORMAT_PRESETS[audio_format]["ext"]
+            audio_output = self._aud_output.text().strip()
+            if not audio_output:
+                self._status_label.setText(
+                    "Please specify an audio output path.")
+                return
+            if not audio_output.lower().endswith(ext):
+                audio_output = os.path.splitext(audio_output)[0] + ext
+            settings = {
+                # Reuses the video dispatch path with audio_mode=standalone
+                # so the Exporter routes to _export_audio_only.
+                "mode": "video",
+                "output_path": "",
+                "codec_key": "",
+                "ffmpeg_args": [],
+                "ext": ext,
+                "width": 0,
+                "height": 0,
+                "fps": 24.0,  # unused for audio-only path
+                "audio_mode": "standalone",
+                "audio_format": audio_format,
+                "audio_output_path": audio_output,
             }
 
         self._export_btn.setEnabled(False)

@@ -26,6 +26,15 @@ _AUDIO_CODEC_FOR_EXT = {
     ".mp4": ("aac", ["-b:a", "320k"]),
 }
 
+# Standalone audio export presets (audio-only output and 'both' mode's
+# sidecar). Keyed by the dialog's audio_format choice.
+_AUDIO_FORMAT_PRESETS = {
+    "wav":  {"ext": ".wav",  "codec": "pcm_s16le",  "extra": []},
+    "flac": {"ext": ".flac", "codec": "flac",       "extra": []},
+    "mp3":  {"ext": ".mp3",  "codec": "libmp3lame", "extra": ["-b:a", "192k"]},
+    "m4a":  {"ext": ".m4a",  "codec": "aac",        "extra": ["-b:a", "320k"]},
+}
+
 # Cached GPU probe result (None = not yet probed)
 _gpu_tonemap_available: Optional[bool] = None
 _opencl_device: Optional[str] = None
@@ -266,6 +275,11 @@ class Exporter(QObject):
         # All codecs benefit from parallel segment encoding:
         # - NVENC: exploits multiple HW decode/encode units
         # - CPU codecs (ProRes, x264, etc.): multiple processes saturate all cores
+        audio_mode = settings.get("audio_mode", "embedded")
+        if audio_mode == "standalone":
+            # Audio-only path; skip the video pipeline entirely.
+            self._export_audio_only(settings)
+            return
         try:
             self._export_video_parallel(settings)
         except Exception as e:
@@ -275,6 +289,11 @@ class Exporter(QObject):
             self.status.emit(f"Parallel failed: {e} — retrying (legacy)...")
             self.progress.emit(0)
             self._export_video_concat_legacy(settings)
+        # 'both' = video with embedded audio + a separate sidecar audio file.
+        # Run the sidecar extract after the video pipeline succeeds so we
+        # don't double-encode if the video step fails.
+        if audio_mode == "both" and not self._cancelled:
+            self._extract_audio_sidecar(settings)
 
     def _export_video_parallel(self, settings: dict):
         """Enhanced parallel export: coalesced segments, HDR-aware, thread pool."""
@@ -283,6 +302,10 @@ class Exporter(QObject):
         fps = settings["fps"]
         output_path = settings["output_path"]
         ffmpeg_args = settings["ffmpeg_args"]
+        # 'none' strips audio; 'embedded' / 'both' embed it (default).
+        # 'standalone' is handled by _export_audio_only and never reaches here.
+        audio_mode = settings.get("audio_mode", "embedded")
+        strip_audio = (audio_mode == "none")
 
         groups = self._build_source_groups()
         if not groups:
@@ -376,10 +399,14 @@ class Exporter(QObject):
             # seconds from ALL output streams (audio included), so the
             # anullsrc must over-produce by post_ss to leave audio_dur after.
             audio_dur = count / src_fps
-            if not has_audio:
+            # When stripping audio, the silent-audio anullsrc pre-input is
+            # unnecessary — there's no audio stream to keep aligned. Skipping
+            # it also keeps the input index at 0 so the subsequent maps stay
+            # straightforward.
+            if not has_audio and not strip_audio:
                 cmd += ["-f", "lavfi", "-t", f"{audio_dur + post_ss:.6f}",
                         "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-            video_idx = 1 if not has_audio else 0
+            video_idx = 0 if (has_audio or strip_audio) else 1
             if pre_ss > 0:
                 cmd += ["-ss", f"{pre_ss:.6f}"]
             cmd += ["-i", path]
@@ -411,7 +438,10 @@ class Exporter(QObject):
             audio_codec, audio_extra = _AUDIO_CODEC_FOR_EXT.get(
                 out_ext, ("pcm_s16le", []))
             cmd += ["-map", f"{video_idx}:v:0"]
-            if has_audio:
+            if strip_audio:
+                # No audio stream in the output at all.
+                cmd += ["-an"]
+            elif has_audio:
                 # asetpts=PTS-STARTPTS is the audio analogue of setpts above.
                 # atrim bounds the audio to the same window as -frames:v so
                 # decoder-tail packets can't bleed past the video's last frame.
@@ -432,10 +462,12 @@ class Exporter(QObject):
                     "aresample=async=1:first_pts=0,"
                     "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
                 ]
+                cmd += ["-c:a", audio_codec, *audio_extra,
+                        "-ar", "48000", "-ac", "2"]
             else:
                 cmd += ["-map", "0:a:0"]
-            cmd += ["-c:a", audio_codec, *audio_extra,
-                    "-ar", "48000", "-ac", "2"]
+                cmd += ["-c:a", audio_codec, *audio_extra,
+                        "-ar", "48000", "-ac", "2"]
             cmd += ["-fps_mode", "passthrough",
                     "-video_track_timescale", "24000000"]
             cmd += ffmpeg_args + [out_file]
@@ -563,6 +595,11 @@ class Exporter(QObject):
         fps = settings["fps"]
         output_path = settings["output_path"]
         ffmpeg_args = settings["ffmpeg_args"]
+        # 'standalone' is routed away earlier; only 'none' / 'embedded' /
+        # 'both' reach the legacy path. 'both' looks identical to 'embedded'
+        # at the segment level — the sidecar pass runs after _export_video.
+        audio_mode = settings.get("audio_mode", "embedded")
+        strip_audio = (audio_mode == "none")
 
         segments = self._build_segments()
         if not segments:
@@ -595,12 +632,14 @@ class Exporter(QObject):
             self._export_video_concat(
                 segments, temp_dir, output_path, fps,
                 vf, hw_args, ffmpeg_args, max_parallel, total_frames,
+                strip_audio=strip_audio,
             )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _export_video_concat(self, segments, temp_dir, output_path, fps,
-                             vf, hw_args, ffmpeg_args, max_parallel, total_frames):
+                             vf, hw_args, ffmpeg_args, max_parallel, total_frames,
+                             strip_audio: bool = False):
         """Encode each segment to a temp file, then concat."""
         temp_files = []
         commands = []
@@ -629,11 +668,11 @@ class Exporter(QObject):
                 "-hwaccel", "cuda",
             ]
             # See _build_segment_cmd for why anullsrc must be input #0 and
-            # why -t must include post_ss.
-            if not has_audio:
+            # why -t must include post_ss. Skipped entirely when stripping.
+            if not has_audio and not strip_audio:
                 cmd += ["-f", "lavfi", "-t", f"{audio_dur + post_ss:.6f}",
                         "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-            video_idx = 1 if not has_audio else 0
+            video_idx = 0 if (has_audio or strip_audio) else 1
             if pre_ss > 0:
                 cmd += ["-ss", f"{pre_ss:.6f}"]
             cmd += ["-i", source_path]
@@ -643,7 +682,9 @@ class Exporter(QObject):
             if vf_chain:
                 cmd += ["-vf", vf_chain]
             cmd += ["-map", f"{video_idx}:v:0"]
-            if has_audio:
+            if strip_audio:
+                cmd += ["-an"]
+            elif has_audio:
                 trim_dur = audio_dur + post_ss
                 cmd += [
                     "-map", f"{video_idx}:a:0?",
@@ -653,10 +694,12 @@ class Exporter(QObject):
                     "aresample=async=1:first_pts=0,"
                     "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
                 ]
+                cmd += ["-c:a", audio_codec, *audio_extra,
+                        "-ar", "48000", "-ac", "2"]
             else:
                 cmd += ["-map", "0:a:0"]
-            cmd += ["-c:a", audio_codec, *audio_extra,
-                    "-ar", "48000", "-ac", "2"]
+                cmd += ["-c:a", audio_codec, *audio_extra,
+                        "-ar", "48000", "-ac", "2"]
             cmd += ["-fps_mode", "passthrough",
                     "-video_track_timescale", "24000000"]
             cmd += ffmpeg_args + [tmp]
@@ -754,6 +797,192 @@ class Exporter(QObject):
 
         self.progress.emit(100)
         self.status.emit(f"Video saved to {output_path}")
+
+    def _export_audio_only(self, settings: dict):
+        """Standalone audio export. Per-segment WAV temp files (PCM, easy to
+        concat losslessly), then a single concat-and-encode pass to the user's
+        chosen format. Mirrors the video pipeline structure so cancel +
+        process tracking work uniformly."""
+        fmt_key = settings.get("audio_format", "wav")
+        fmt = _AUDIO_FORMAT_PRESETS[fmt_key]
+        output_path = settings["audio_output_path"]
+
+        segments = self._build_segments()
+        if not segments:
+            self.status.emit("Nothing to export")
+            return
+
+        self.status.emit(
+            f"Encoding {len(segments)} audio segment(s) to {output_path}...")
+
+        # Temp WAVs alongside the output so the muxer's filesystem matches
+        # (mkdtemp needs a real dir; avoid empty dirname on bare filenames).
+        temp_dir = tempfile.mkdtemp(
+            prefix="prismasynth_audio_",
+            dir=os.path.dirname(os.path.abspath(output_path)))
+        try:
+            temp_files = []
+            commands = []
+            for i, (src_path, src_in, count, src_fps, sid) in enumerate(segments):
+                source = self._sources.get(sid)
+                has_audio = bool(source and source.audio_channels > 0)
+                audio_dur = count / src_fps
+                tmp = os.path.join(temp_dir, f"seg_{i:04d}.wav")
+                temp_files.append(tmp)
+
+                cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+                if has_audio:
+                    # Same two-stage seek as video: pre-input cheap keyframe
+                    # jump + post-input precise discard. The half-frame
+                    # margin in _frame_to_seek_ts defeats the IEEE-754 off-
+                    # by-one near segment boundaries.
+                    ss = self._frame_to_seek_ts(src_in, src_fps)
+                    PRE_SEEK_MARGIN = 1.0
+                    if ss > PRE_SEEK_MARGIN:
+                        pre_ss, post_ss = ss - PRE_SEEK_MARGIN, PRE_SEEK_MARGIN
+                    else:
+                        pre_ss, post_ss = 0.0, ss
+                    trim_dur = audio_dur + post_ss
+                    if pre_ss > 0:
+                        cmd += ["-ss", f"{pre_ss:.6f}"]
+                    cmd += ["-i", src_path]
+                    if post_ss > 0:
+                        cmd += ["-ss", f"{post_ss:.6f}"]
+                    cmd += [
+                        "-vn",
+                        "-map", "0:a:0?",
+                        "-af",
+                        "asetpts=PTS-STARTPTS,"
+                        f"atrim=duration={trim_dur:.6f},"
+                        "aresample=async=1:first_pts=0,"
+                        "aformat=sample_fmts=s16:sample_rates=48000:"
+                        "channel_layouts=stereo",
+                    ]
+                else:
+                    # No-audio source — feed silence sized to the segment.
+                    cmd += [
+                        "-f", "lavfi", "-t", f"{audio_dur:.6f}",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        "-vn",
+                    ]
+                cmd += ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", tmp]
+                commands.append(cmd)
+
+            # Parallel per-segment encode. Audio decode is cheap; ~half the
+            # core count is plenty.
+            cpu_count = os.cpu_count() or 8
+            max_parallel = max(2, cpu_count // 2)
+
+            done_count = 0
+            total_count = len(commands)
+            failed = threading.Event()
+
+            def _encode_segment(idx):
+                if self._cancelled or failed.is_set():
+                    return idx, -1, b"cancelled"
+                cmd = commands[idx]
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                self._register_proc(proc)
+                try:
+                    _, stderr_data = proc.communicate()
+                finally:
+                    self._unregister_proc(proc)
+                return idx, proc.returncode, stderr_data or b""
+
+            def _kill_active():
+                with self._procs_lock:
+                    procs = list(self._active_procs)
+                for p in procs:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+
+            with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+                futures = {pool.submit(_encode_segment, i): i
+                           for i in range(total_count)}
+                for future in as_completed(futures):
+                    if self._cancelled:
+                        return
+                    idx, rc, stderr = future.result()
+                    if rc != 0 and not self._cancelled:
+                        failed.set()
+                        _kill_active()
+                        err = stderr.decode(errors="replace")[-500:]
+                        raise RuntimeError(
+                            f"Audio segment {idx} failed: {err}")
+                    done_count += 1
+                    self.progress.emit(
+                        min(85, int(done_count / total_count * 85)))
+
+            if self._cancelled:
+                return
+
+            # Concat WAV segments and encode to the final format in one pass.
+            self.status.emit("Concatenating audio segments...")
+            concat_list = os.path.join(temp_dir, "concat.txt")
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for tmp in temp_files:
+                    escaped = tmp.replace("\\", "/").replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+
+            concat_cmd = [
+                "ffmpeg", "-y", "-nostdin", "-v", "error",
+                "-f", "concat", "-safe", "0", "-i", concat_list,
+                "-c:a", fmt["codec"], *fmt["extra"],
+                "-ar", "48000", "-ac", "2",
+                output_path,
+            ]
+            proc = subprocess.Popen(
+                concat_cmd, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
+            self._register_proc(proc)
+            try:
+                _, stderr_data = proc.communicate()
+            finally:
+                self._unregister_proc(proc)
+            if proc.returncode != 0 and not self._cancelled:
+                err = (stderr_data or b"").decode(errors="replace")[-500:]
+                raise RuntimeError(f"Audio concat failed: {err}")
+
+            self.progress.emit(100)
+            self.status.emit(f"Audio saved to {output_path}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _extract_audio_sidecar(self, settings: dict):
+        """Used by audio_mode='both': after the video export completes,
+        re-extract the audio from the produced video file into a standalone
+        audio file. One ffmpeg pass — keeps the implementation independent
+        of which video path (parallel/single/legacy) produced the source."""
+        fmt_key = settings.get("audio_format", "wav")
+        fmt = _AUDIO_FORMAT_PRESETS[fmt_key]
+        video_path = settings["output_path"]
+        audio_path = settings["audio_output_path"]
+
+        self.status.emit(f"Extracting audio sidecar to {audio_path}...")
+
+        cmd = [
+            "ffmpeg", "-y", "-nostdin", "-v", "error",
+            "-i", video_path,
+            "-vn",
+            "-c:a", fmt["codec"], *fmt["extra"],
+            "-ar", "48000", "-ac", "2",
+            audio_path,
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self._register_proc(proc)
+        try:
+            _, stderr_data = proc.communicate()
+        finally:
+            self._unregister_proc(proc)
+        if proc.returncode != 0 and not self._cancelled:
+            err = (stderr_data or b"").decode(errors="replace")[-500:]
+            raise RuntimeError(f"Audio sidecar extract failed: {err}")
+
+        self.status.emit(f"Audio sidecar saved to {audio_path}")
 
     def _export_image_sequence(self, settings: dict):
         width = settings["width"]

@@ -549,6 +549,10 @@ class MainWindow(QMainWindow):
         export_img_action.triggered.connect(self._on_export_images)
         timeline_menu.addAction(export_img_action)
 
+        export_audio_action = QAction(icon("audio"), "Export Audio Only...", self)
+        export_audio_action.triggered.connect(self._on_export_audio)
+        timeline_menu.addAction(export_audio_action)
+
         xml_action = QAction(icon("document"), "Export XML (FCPXML)...", self)
         xml_action.triggered.connect(self._on_export_xml)
         timeline_menu.addAction(xml_action)
@@ -1494,6 +1498,9 @@ class MainWindow(QMainWindow):
 
     def _on_export_images(self):
         self._show_export_dialog(tab=1)
+
+    def _on_export_audio(self):
+        self._show_export_dialog(tab=2)
 
     def _on_export_xml(self):
         if self._timeline.clip_count == 0:
