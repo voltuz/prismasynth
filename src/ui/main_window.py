@@ -571,6 +571,21 @@ class MainWindow(QMainWindow):
         play_action.triggered.connect(self._toggle_play)
         timeline_menu.addAction(play_action)
 
+        # --- Tools menu ---
+        tools_menu = menu.addMenu("Tools")
+
+        relink_action = QAction(icon("link"), "Relink…", self)
+        relink_action.triggered.connect(self._on_tools_relink)
+        tools_menu.addAction(relink_action)
+
+        cache_action = QAction("Cache Manager…", self)
+        cache_action.triggered.connect(self._on_tools_cache_manager)
+        tools_menu.addAction(cache_action)
+
+        cut_inspect_action = QAction("Cut Inspect…", self)
+        cut_inspect_action.triggered.connect(self._on_tools_cut_inspect)
+        tools_menu.addAction(cut_inspect_action)
+
     # --- Import ---
 
     _VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.mxf'}
@@ -720,54 +735,114 @@ class MainWindow(QMainWindow):
         dlg = RelinkDialog({source_id: src}, parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
-        resolved = dlg.resolved_paths()
-        probe_cache = dlg.probe_cache()
-        new_path = resolved.get(source_id)
-        if not new_path:
-            return  # user skipped
-        old_total_frames = src.total_frames
-        src.file_path = new_path
-        info = probe_cache.get(source_id)
-        if info is not None:
-            src.width = info.width
-            src.height = info.height
-            src.fps = info.fps
-            src.total_frames = info.total_frames
-            src.codec = info.codec
-            src.audio_codec = info.audio_codec
-            src.audio_sample_rate = info.audio_sample_rate
-            src.audio_channels = info.audio_channels
-            # Clamp clips on the timeline if the new source is shorter
-            if info.total_frames < old_total_frames:
-                new_max = info.total_frames - 1
-                clamped = 0
-                for c in self._timeline.clips:
-                    if c.source_id == source_id:
-                        if c.source_in > new_max:
-                            c.source_in = new_max
-                            c.source_out = new_max
-                            clamped += 1
-                        elif c.source_out > new_max:
-                            c.source_out = new_max
-                            clamped += 1
-                if clamped:
-                    QMessageBox.warning(
-                        self, "Clips Clamped",
-                        f"{clamped} clip(s) had their out-points trimmed because "
-                        "the relinked source has fewer frames.",
-                    )
-        # Re-register reader+proxy with the new path
-        self._reader_pool.register_source(src)
-        self._proxy_manager.load_or_open(src, force_reopen=True)
-        # Force a fresh source thumbnail (the cache key is source.id, but the
-        # underlying media is now different — need a re-extract).
+        self._apply_relink_results(dlg.resolved_paths(), dlg.probe_cache())
+
+    def _on_tools_relink(self):
+        """Tools → Relink… shows every imported source so the user can repoint
+        any of them (missing or linked). The single-source flow stays on the
+        Media Pool's right-click menu."""
+        if not self._sources:
+            QMessageBox.information(
+                self, "Relink",
+                "No sources to relink. Import a video first.")
+            return
+        dlg = RelinkDialog(self._sources, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._apply_relink_results(dlg.resolved_paths(), dlg.probe_cache())
+
+    def _on_tools_cache_manager(self):
+        """Tools → Cache Manager… opens the disk-cache management dialog."""
+        from ui.cache_manager_dialog import CacheManagerDialog
+        dlg = CacheManagerDialog(proxy_manager=self._proxy_manager, parent=self)
+        dlg.exec()
+
+    def _on_tools_cut_inspect(self):
+        """Tools → Cut Inspect… launches scripts/cut_inspect.py as a separate
+        Python process so its mpv instance is fully isolated from
+        PrismaSynth's preview player. Two mpv instances in one process can
+        deadlock or crash."""
+        import subprocess
+        import sys as _sys
+        from pathlib import Path as _Path
+        repo_root = _Path(__file__).resolve().parent.parent.parent
+        script = repo_root / "scripts" / "cut_inspect.py"
+        if not script.exists():
+            QMessageBox.warning(
+                self, "Cut Inspect",
+                f"Cut Inspect script not found:\n{script}")
+            return
+        flags = 0
+        if _sys.platform == "win32":
+            flags = (subprocess.DETACHED_PROCESS
+                     | subprocess.CREATE_NEW_PROCESS_GROUP)
+        try:
+            subprocess.Popen(
+                [_sys.executable, str(script)],
+                cwd=str(repo_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+        except OSError as e:
+            QMessageBox.warning(
+                self, "Cut Inspect",
+                f"Could not launch Cut Inspect:\n{e}")
+
+    def _apply_relink_results(self, resolved: dict, probe_cache: dict):
+        """Apply the user's relink choices from RelinkDialog to one or more
+        sources. Updates VideoSource metadata, clamps any clips whose out-point
+        exceeds the new (shorter) source length, re-registers reader+proxy, and
+        refreshes the source thumbnail. Shared by per-source relink (Media
+        Pool) and the Tools menu's bulk-relink entry."""
+        clamp_total = 0
+        touched = False
         from core.source_thumbnail import extract_thumbnail
-        extract_thumbnail(src, force=True)
-        self._media_panel.refresh_thumbnail(src)
-        self._dirty = True
-        self._update_status()
-        # Trigger a repaint of the timeline so any newly-valid clips show thumbs
-        self._timeline_widget.update()
+        for source_id, new_path in resolved.items():
+            if not new_path:
+                continue  # user skipped this row
+            src = self._sources.get(source_id)
+            if not src:
+                continue
+            old_total_frames = src.total_frames
+            src.file_path = new_path
+            info = probe_cache.get(source_id)
+            if info is not None:
+                src.width = info.width
+                src.height = info.height
+                src.fps = info.fps
+                src.total_frames = info.total_frames
+                src.codec = info.codec
+                src.audio_codec = info.audio_codec
+                src.audio_sample_rate = info.audio_sample_rate
+                src.audio_channels = info.audio_channels
+                if info.total_frames < old_total_frames:
+                    new_max = info.total_frames - 1
+                    for c in self._timeline.clips:
+                        if c.source_id == source_id:
+                            if c.source_in > new_max:
+                                c.source_in = new_max
+                                c.source_out = new_max
+                                clamp_total += 1
+                            elif c.source_out > new_max:
+                                c.source_out = new_max
+                                clamp_total += 1
+            self._reader_pool.register_source(src)
+            self._proxy_manager.load_or_open(src, force_reopen=True)
+            extract_thumbnail(src, force=True)
+            self._media_panel.refresh_thumbnail(src)
+            touched = True
+        if clamp_total:
+            QMessageBox.warning(
+                self, "Clips Clamped",
+                f"{clamp_total} clip(s) had their out-points trimmed because "
+                "a relinked source has fewer frames.",
+            )
+        if touched:
+            self._dirty = True
+            self._update_status()
+            self._timeline_widget.update()
 
     def _on_source_remove_requested(self, source_id: str):
         src = self._sources.get(source_id)

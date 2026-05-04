@@ -914,16 +914,25 @@ class BulkCacheJob(QObject):
 
         n_light = sum(len(c) for _, _, c in sweep_chunks)
         n_heavy = len(heavy_units)
-        diag(f"bulk    pool create light_workers={_BULK_LIGHT_WORKERS} "
+        # Cap concurrent PyAV containers per source. The historical "Fantasy
+        # Island" segfault (see _grab_frames_sweep) and a 2026-05 user crash
+        # both involved 4+ containers open on the same source. Bound the
+        # light pool to 2 workers per unique light-path source so no file
+        # ever has more than 2 concurrent av.open()s in flight.
+        unique_light_sources = len({sid for _, sid, _ in sweep_chunks})
+        light_workers = min(_BULK_LIGHT_WORKERS,
+                            max(1, unique_light_sources * 2))
+        diag(f"bulk    pool create "
+             f"light_workers={light_workers}/{_BULK_LIGHT_WORKERS} "
+             f"unique_light_sources={unique_light_sources} "
              f"light_chunks={len(sweep_chunks)} (frames={n_light}) "
              f"heavy_workers={_BULK_HEAVY_WORKERS} "
              f"heavy_units={n_heavy}")
-        # Two pools: light gets up to cpu_count workers (PyAV scales with
-        # CPU), heavy stays capped (NVDEC concurrent-stream limit). Only
-        # spin up a pool if we actually have work for it, so a pure-light
-        # or pure-heavy bake doesn't carry an unused executor's overhead.
+        # Two pools: light scales with unique source count (per-source
+        # concurrency cap above), heavy stays capped (NVDEC concurrent-
+        # stream limit). Only spin up a pool if there's matching work.
         light_pool = (
-            ThreadPoolExecutor(max_workers=_BULK_LIGHT_WORKERS,
+            ThreadPoolExecutor(max_workers=light_workers,
                                thread_name_prefix="bulk-light")
             if sweep_chunks else None)
         heavy_pool = (
