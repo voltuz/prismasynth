@@ -4,12 +4,16 @@ import os
 import time
 
 import numpy as np
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QSizePolicy, QComboBox
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtWidgets import (
+    QComboBox, QSizePolicy, QSlider, QToolButton, QVBoxLayout, QWidget,
+)
+from PySide6.QtCore import Qt, QSize, Signal, QTimer
 
 # Ensure libmpv DLL is findable
 os.environ['PATH'] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ['PATH']
 import mpv
+
+from ui.icon_loader import icon
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +118,66 @@ class PreviewWidget(QWidget):
         self._zoom_combo.activated.connect(self._on_combo_activated)
         self._zoom_combo.raise_()
 
+        # Mute toggle + volume slider, sitting next to the zoom combo.
+        # Session-only state — no persistence.
+        self._mute_btn = QToolButton(self)
+        self._mute_btn.setCheckable(True)
+        self._mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mute_btn.setAutoRaise(True)
+        self._mute_btn.setFixedSize(22, 22)
+        self._mute_btn.setIconSize(QSize(16, 16))
+        self._mute_icon_unmuted = icon("volume")
+        self._mute_icon_muted = icon("volume-muted")
+        self._mute_btn.setIcon(self._mute_icon_unmuted)
+        self._mute_btn.setToolTip("Mute audio")
+        self._mute_btn.setStyleSheet(
+            "QToolButton {"
+            " background-color: rgba(58, 58, 58, 220);"
+            " border: 1px solid #555;"
+            " border-radius: 3px;"
+            "}"
+            "QToolButton:hover {"
+            " background-color: rgba(68, 68, 68, 230);"
+            "}"
+            "QToolButton:checked {"
+            " background-color: rgba(85, 119, 170, 220);"
+            " border: 1px solid #6688bb;"
+            "}"
+        )
+        self._mute_btn.toggled.connect(self._on_mute_toggled)
+        self._mute_btn.raise_()
+
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setValue(100)
+        self._volume_slider.setFixedWidth(100)
+        self._volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._volume_slider.setToolTip("Volume")
+        self._volume_slider.setStyleSheet(
+            "QSlider::groove:horizontal {"
+            " background: #2a2a2a;"
+            " height: 4px;"
+            " border-radius: 2px;"
+            "}"
+            "QSlider::sub-page:horizontal {"
+            " background: #5577aa;"
+            " height: 4px;"
+            " border-radius: 2px;"
+            "}"
+            "QSlider::handle:horizontal {"
+            " background: #cccccc;"
+            " width: 10px;"
+            " margin: -4px 0;"
+            " border-radius: 5px;"
+            "}"
+            "QSlider::handle:horizontal:hover {"
+            " background: #ffffff;"
+            "}"
+        )
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        self._volume_slider.raise_()
+
     def init_player(self):
         """Initialize the mpv player. Must be called after the widget is shown
         (so winId() is valid)."""
@@ -132,13 +196,18 @@ class PreviewWidget(QWidget):
             input_cursor='no',
             input_default_bindings='no',
             input_vo_keyboard='no',
-            ao='null',             # no audio output
             video_sync='display-resample',
             demuxer_max_bytes=str(150 * 1024 * 1024),     # 150MB forward cache
             demuxer_max_back_bytes=str(75 * 1024 * 1024),  # 75MB backward cache
         )
         self._player.pause = True
         self._is_playing = False
+        # Sync mpv to the volume/mute widgets' current state.
+        try:
+            self._player.volume = float(self._volume_slider.value())
+            self._player.mute = self._mute_btn.isChecked()
+        except Exception:
+            pass
         self._ready = True
         logger.info("mpv player initialized (hwdec=%s, wid=%s)", 'auto', wid)
 
@@ -189,8 +258,10 @@ class PreviewWidget(QWidget):
         self._black_overlay.setGeometry(self._container.geometry())
         self._black_overlay.raise_()
         self._black_overlay.show()
-        # Keep the zoom combo clickable above the overlay
+        # Keep the overlay controls clickable above the black overlay.
         self._zoom_combo.raise_()
+        self._mute_btn.raise_()
+        self._volume_slider.raise_()
 
     def scrub_start(self):
         """Called when the user begins dragging the playhead."""
@@ -270,17 +341,18 @@ class PreviewWidget(QWidget):
         super().resizeEvent(event)
         if self._black_overlay.isVisible():
             self._black_overlay.setGeometry(self._container.geometry())
-        # Position zoom combo in bottom-left of the container
-        self._reposition_zoom_combo()
+        # Position bottom-left overlay row (zoom combo + mute + volume slider)
+        self._reposition_overlays()
         # Fit-factor changes with widget size, so a fixed percentage needs to
         # be re-translated into mpv's video-zoom.
         if self._zoom_mode == "percent":
             self._apply_zoom()
 
-    def _reposition_zoom_combo(self):
+    def _reposition_overlays(self):
         if not hasattr(self, "_zoom_combo"):
             return
         inset = 8
+        gap = 6
         geo = self._container.geometry()
         combo_h = self._zoom_combo.sizeHint().height()
         combo_w = self._zoom_combo.width()
@@ -288,6 +360,42 @@ class PreviewWidget(QWidget):
         y = geo.y() + geo.height() - combo_h - inset
         self._zoom_combo.setGeometry(x, y, combo_w, combo_h)
         self._zoom_combo.raise_()
+
+        if not hasattr(self, "_mute_btn"):
+            return
+        mute_w = self._mute_btn.width()
+        mute_h = self._mute_btn.height()
+        mute_x = x + combo_w + gap
+        mute_y = y + (combo_h - mute_h) // 2
+        self._mute_btn.setGeometry(mute_x, mute_y, mute_w, mute_h)
+        self._mute_btn.raise_()
+
+        slider_w = self._volume_slider.width()
+        slider_h = self._volume_slider.sizeHint().height()
+        slider_x = mute_x + mute_w + 4
+        slider_y = y + (combo_h - slider_h) // 2
+        self._volume_slider.setGeometry(slider_x, slider_y, slider_w, slider_h)
+        self._volume_slider.raise_()
+
+    def _on_volume_changed(self, value: int):
+        if self._player is None:
+            return
+        try:
+            self._player.volume = float(value)
+        except Exception:
+            pass
+
+    def _on_mute_toggled(self, checked: bool):
+        # Reflect state on the icon regardless of player readiness.
+        self._mute_btn.setIcon(
+            self._mute_icon_muted if checked else self._mute_icon_unmuted)
+        self._mute_btn.setToolTip("Unmute audio" if checked else "Mute audio")
+        if self._player is None:
+            return
+        try:
+            self._player.mute = checked
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Zoom / pan
@@ -441,9 +549,11 @@ class PreviewWidget(QWidget):
     # ------------------------------------------------------------------
 
     def wheelEvent(self, event):
-        # Only zoom when the wheel is over the video area, not over the combo
+        # Only zoom when the wheel is over the video area, not over an overlay
         pos = event.position().toPoint()
-        if self._zoom_combo.geometry().contains(pos):
+        if (self._zoom_combo.geometry().contains(pos)
+                or self._mute_btn.geometry().contains(pos)
+                or self._volume_slider.geometry().contains(pos)):
             super().wheelEvent(event)
             return
         if self._source_w <= 0 or self._source_h <= 0:
@@ -531,9 +641,11 @@ class PreviewWidget(QWidget):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        # Don't hijack double-clicks on the combo
+        # Don't hijack double-clicks on overlay widgets
         pos = event.position().toPoint()
-        if self._zoom_combo.geometry().contains(pos):
+        if (self._zoom_combo.geometry().contains(pos)
+                or self._mute_btn.geometry().contains(pos)
+                or self._volume_slider.geometry().contains(pos)):
             super().mouseDoubleClickEvent(event)
             return
         self._zoom_mode = "fit"

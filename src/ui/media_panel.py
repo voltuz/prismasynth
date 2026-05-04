@@ -132,13 +132,9 @@ class _SourceListView(QListView):
                 if mime is not None:
                     drag = QDrag(self)
                     drag.setMimeData(mime)
-                    # Drag pixmap = first item's icon, scaled. Improves the
-                    # visual feedback while dragging vs. the default cursor.
-                    ic = self.model().data(indexes[0], Qt.ItemDataRole.DecorationRole)
-                    if isinstance(ic, QIcon) and not ic.isNull():
-                        pix = ic.pixmap(THUMB_WIDTH, THUMB_HEIGHT)
-                        drag.setPixmap(pix)
-                        drag.setHotSpot(pix.rect().center())
+                    # No drag pixmap — the timeline draws the source's
+                    # thumbnail inside the drop footprint as visual feedback,
+                    # so a cursor pixmap would only obscure the drop target.
                     drag.exec(Qt.DropAction.CopyAction)
                 self._press_idx = None
                 self._press_pos = None
@@ -359,7 +355,7 @@ class MediaPanel(QWidget):
 
     @staticmethod
     def _display_name(src: VideoSource) -> str:
-        return Path(src.file_path).stem or Path(src.file_path).name or src.id
+        return Path(src.file_path).name or src.id
 
     @staticmethod
     def _tooltip(src: VideoSource) -> str:

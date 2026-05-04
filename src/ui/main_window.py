@@ -321,6 +321,10 @@ class MainWindow(QMainWindow):
 
         # Bottom area: timeline (with left/right margins)
         self._timeline_widget = TimelineWidget(self._timeline)
+        # Share the source dict so drag-from-Media-Pool previews can render
+        # each source's thumbnail in the drop footprint. The dict is mutated
+        # in place by import/load, so the reference stays valid.
+        self._timeline_widget.set_sources_ref(self._sources)
         timeline_container = QWidget()
         tl_layout = QVBoxLayout(timeline_container)
         tl_layout.setContentsMargins(16, 0, 16, 0)
@@ -1249,7 +1253,10 @@ class MainWindow(QMainWindow):
     # --- Playback ---
 
     def _toggle_play(self):
-        if self._preview.is_playing:
+        # _preview.is_playing reflects mpv's pause state, but during a gap
+        # mpv stays paused while the wall-clock timer drives the playhead.
+        # Check both so Space can stop playback regardless of which mode.
+        if self._preview.is_playing or self._playback_timer.isActive():
             self._stop_playback()
         else:
             self._start_playback()

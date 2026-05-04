@@ -104,6 +104,12 @@ class TimelineStrip(QWidget):
         # how much room the dropped clip(s) will occupy.
         self._drop_insert_frame: Optional[int] = None
         self._drop_total_frames: int = 0
+        self._drop_source_ids: list = []      # parallel to _drop_durations
+        self._drop_durations: list = []
+        self._drop_thumb_cache: dict = {}     # sid -> QPixmap (lazy-loaded)
+        # Sources dict reference — set by MainWindow once at startup so the
+        # drop preview can render each dragged source's media-pool thumbnail.
+        self._sources_ref: dict = {}
 
         self.setMinimumHeight(CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -160,6 +166,30 @@ class TimelineStrip(QWidget):
         self._thumbnails[(clip_id, position)] = pixmap
         self.update()
 
+    def set_sources_ref(self, sources: dict):
+        """Share MainWindow's source dict so drag-over previews can pull
+        per-source thumbnails from disk."""
+        self._sources_ref = sources
+
+    def _get_drop_thumb(self, sid: str):
+        cached = self._drop_thumb_cache.get(sid)
+        if cached is not None or sid in self._drop_thumb_cache:
+            return cached
+        src = self._sources_ref.get(sid) if self._sources_ref else None
+        pix = None
+        if src is not None:
+            try:
+                from core.source_thumbnail import cache_path_for
+                path = cache_path_for(src)
+                if path.exists() and path.stat().st_size > 0:
+                    p = QPixmap(str(path))
+                    if not p.isNull():
+                        pix = p
+            except Exception:
+                pix = None
+        self._drop_thumb_cache[sid] = pix
+        return pix
+
     def set_thumbnails_enabled(self, enabled: bool):
         """Toggle thumbnail rendering. When off, clips show as solid color blocks."""
         if self._thumbnails_enabled == enabled:
@@ -187,15 +217,21 @@ class TimelineStrip(QWidget):
         mime = event.mimeData()
         accept = False
         total_frames = 0
+        source_ids: list = []
+        durations: list = []
         if mime.hasFormat(_SOURCE_ID_MIME):
             accept = True
+            id_payload = bytes(mime.data(_SOURCE_ID_MIME)).decode("utf-8", "replace")
+            source_ids = [s for s in id_payload.split("\n") if s]
             # Decode the parallel durations mime so paintEvent can size the
             # ghost rectangle. Falls back to no preview rect when missing.
             if mime.hasFormat(_SOURCE_DURATIONS_MIME):
                 payload = bytes(mime.data(_SOURCE_DURATIONS_MIME)).decode("utf-8", "replace")
                 try:
-                    total_frames = sum(int(d) for d in payload.split("\n") if d)
+                    durations = [int(d) for d in payload.split("\n") if d]
+                    total_frames = sum(durations)
                 except ValueError:
+                    durations = []
                     total_frames = 0
         elif mime.hasUrls():
             for u in mime.urls():
@@ -207,6 +243,14 @@ class TimelineStrip(QWidget):
         if accept:
             self._drop_insert_frame = self._cursor_to_insert_frame(event.position().x())
             self._drop_total_frames = total_frames
+            # Only the source-id drag carries per-source breakdown; OS file
+            # drags fall through with empty lists (no thumbnail preview).
+            if len(source_ids) == len(durations):
+                self._drop_source_ids = source_ids
+                self._drop_durations = durations
+            else:
+                self._drop_source_ids = []
+                self._drop_durations = []
             self.update()
         return accept
 
@@ -241,6 +285,8 @@ class TimelineStrip(QWidget):
     def dragLeaveEvent(self, event: QDragLeaveEvent):
         self._drop_insert_frame = None
         self._drop_total_frames = 0
+        self._drop_source_ids = []
+        self._drop_durations = []
         self.update()
 
     def dropEvent(self, event: QDropEvent):
@@ -261,6 +307,8 @@ class TimelineStrip(QWidget):
                 event.acceptProposedAction()
         self._drop_insert_frame = None
         self._drop_total_frames = 0
+        self._drop_source_ids = []
+        self._drop_durations = []
         self.update()
 
     def ensure_playhead_visible(self):
@@ -326,6 +374,32 @@ class TimelineStrip(QWidget):
                     painter.fillRect(rect_x, clip_y, rect_w,
                                       self._clip_height,
                                       _DROP_FOOTPRINT_COLOR)
+                # Per-source thumbnails — one at the start of each source's
+                # segment, mirroring the regular clip's first-frame thumbnail.
+                if (self._drop_source_ids
+                        and len(self._drop_source_ids) == len(self._drop_durations)):
+                    pad = 6
+                    th = self._clip_height - pad * 2
+                    tw = int(th * 16 / 9)
+                    cumulative = self._drop_insert_frame
+                    for sid, dur in zip(self._drop_source_ids, self._drop_durations):
+                        seg_x = self._frame_to_pixel(cumulative) - self._scroll_offset
+                        seg_end_x = self._frame_to_pixel(cumulative + dur) - self._scroll_offset
+                        cumulative += dur
+                        seg_w = seg_end_x - seg_x
+                        if seg_w <= pad * 2 or th <= 0:
+                            continue
+                        if seg_end_x < 0 or seg_x > w:
+                            continue
+                        pix = self._get_drop_thumb(sid)
+                        if pix is None:
+                            continue
+                        painter.save()
+                        thumb_clip = QRect(seg_x + pad, clip_y + pad,
+                                            seg_w - pad * 2, th)
+                        painter.setClipRect(thumb_clip)
+                        painter.drawPixmap(seg_x + pad, clip_y + pad, tw, th, pix)
+                        painter.restore()
             if 0 <= ix <= w:
                 painter.setPen(QPen(_DROP_INDICATOR_COLOR, 3))
                 painter.drawLine(ix, HEADER_HEIGHT, ix, h)
@@ -510,14 +584,16 @@ class TimelineStrip(QWidget):
         dim_color = QColor(0, 0, 0, 120)
         marker_color = QColor(0, 200, 255)
 
-        if in_pt is not None:
-            in_px = self._frame_to_pixel(in_pt) - self._scroll_offset
-            dim_right = max(0, in_px)
-            if dim_right > 0:
-                painter.fillRect(0, 0, dim_right, total_h, dim_color)
-            if 0 <= in_px <= viewport_width:
-                painter.setPen(QPen(marker_color, 2))
-                painter.drawLine(in_px, 0, in_px, total_h)
+        # In marker — at the explicit in_pt, or at frame 0 as the implicit
+        # range start when only Out is set (so the highlighted region is
+        # bookended by visible markers on both sides).
+        effective_in = in_pt if in_pt is not None else 0
+        in_px = self._frame_to_pixel(effective_in) - self._scroll_offset
+        if in_pt is not None and in_px > 0:
+            painter.fillRect(0, 0, in_px, total_h, dim_color)
+        if 0 <= in_px <= viewport_width:
+            painter.setPen(QPen(marker_color, 2))
+            painter.drawLine(in_px, 0, in_px, total_h)
 
         if out_pt is not None:
             out_px = self._frame_to_pixel(out_pt + 1) - self._scroll_offset
@@ -893,6 +969,11 @@ class TimelineWidget(QWidget):
     @property
     def strip(self) -> TimelineStrip:
         return self._strip
+
+    def set_sources_ref(self, sources: dict):
+        """Forward MainWindow's source dict to the strip so drag previews
+        can render per-source thumbnails."""
+        self._strip.set_sources_ref(sources)
 
     @property
     def thumbnails_enabled(self) -> bool:

@@ -325,18 +325,33 @@ class TimelineModel(QObject):
         # Reject values that would invalidate the pair instead of silently
         # wiping the opposite marker (in/out is not undoable, so a wipe
         # destroys data the user cannot recover).
-        if (frame is not None and self._out_point is not None
-                and frame >= self._out_point):
-            return
+        if frame is not None and self._out_point is not None:
+            # The visible Out marker is rendered at out_pt+1's pixel (so the
+            # dim overlay covers everything past the Out frame), so a click
+            # on the marker line lands the playhead at out_pt+1. Accept both
+            # out_pt and out_pt+1 as "at Out" for the collision-nudge.
+            if frame == self._out_point or frame == self._out_point + 1:
+                last_frame = self.get_total_duration_frames() - 1
+                if frame >= last_frame:
+                    return  # No room to push Out past the timeline tail
+                self._out_point = frame + 1
+            elif frame > self._out_point:
+                return
         if self._in_point == frame:
             return
         self._in_point = frame
         self.in_out_changed.emit()
 
     def set_out_point(self, frame: Optional[int]):
-        if (frame is not None and self._in_point is not None
-                and frame <= self._in_point):
-            return
+        if frame is not None and self._in_point is not None:
+            if frame == self._in_point:
+                # Collision-nudge: pressing R at the In frame shoves In
+                # back by one so the gesture sets Out here without losing In.
+                if self._in_point <= 0:
+                    return
+                self._in_point = self._in_point - 1
+            elif frame < self._in_point:
+                return
         if self._out_point == frame:
             return
         self._out_point = frame
