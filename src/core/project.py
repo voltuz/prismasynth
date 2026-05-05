@@ -26,11 +26,15 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
                  selection_follows: bool = True,
                  in_point: Optional[int] = None, out_point: Optional[int] = None,
                  scroll_offset: int = 0,
+                 pixels_per_frame: float = 0.5,
                  orphan_paths: Optional[dict] = None):
     data = {
         "version": PROJECT_VERSION,
         "playhead_position": playhead,
         "scroll_offset": scroll_offset,
+        # scroll_offset is a pixel value; without the zoom level it was saved
+        # at, restore can't reconstruct the same view. Persist both.
+        "pixels_per_frame": pixels_per_frame,
         "selection_follows_playhead": selection_follows,
         "in_point": in_point,
         "out_point": out_point,
@@ -123,6 +127,9 @@ def load_project(filepath: str):
         "clips": clips,
         "playhead_position": data.get("playhead_position", 0),
         "scroll_offset": data.get("scroll_offset", 0),
+        # Legacy projects without pixels_per_frame fall back to the original
+        # default zoom (0.5) so their pixel scroll_offset stays meaningful.
+        "pixels_per_frame": data.get("pixels_per_frame", 0.5),
         "selection_follows_playhead": data.get("selection_follows_playhead", True),
         "in_point": data.get("in_point"),
         "out_point": data.get("out_point"),

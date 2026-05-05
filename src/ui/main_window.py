@@ -152,6 +152,19 @@ QScrollBar::handle:horizontal {
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
 }
+QScrollBar:vertical {
+    background: #333;
+    width: 14px;
+    border: none;
+}
+QScrollBar::handle:vertical {
+    background: #666;
+    min-height: 30px;
+    border-radius: 3px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
 QSplitter::handle {
     background-color: #444;
     height: 4px;
@@ -262,6 +275,11 @@ class MainWindow(QMainWindow):
         # Apply dark theme
         self.setStyleSheet(DARK_STYLE)
 
+        # Customizable-shortcut registry. Created before menus so QActions
+        # built in _setup_menus pick up any user overrides.
+        from core.shortcuts import ShortcutManager
+        self._shortcut_mgr = ShortcutManager()
+
         # Toolbar
         self._toolbar = MainToolbar(self)
         self.addToolBar(self._toolbar)
@@ -281,6 +299,14 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
+
+        # Thin separator below the toolbar — matches the colour and height of
+        # the QSplitter handles so the toolbar feels visually divorced from
+        # the panels in the same way the timeline / panels divider does.
+        top_separator = QWidget()
+        top_separator.setFixedHeight(4)
+        top_separator.setStyleSheet("background-color: #444;")
+        main_layout.addWidget(top_separator)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         main_layout.addWidget(splitter)
@@ -337,6 +363,11 @@ class MainWindow(QMainWindow):
         self._timeline_widget.playhead_changed.connect(self._on_playhead_changed)
         self._timeline_widget.scrub_started.connect(self._preview.scrub_start)
         self._timeline_widget.scrub_ended.connect(self._preview.scrub_end)
+        # Middle-mouse pan: pause the thumbnail coordinator while the user
+        # is dragging the timeline so the rapid viewport reprioritization
+        # doesn't thrash the prioritization queue. Resume on release.
+        self._timeline_widget.pan_started.connect(self._on_timeline_pan_started)
+        self._timeline_widget.pan_ended.connect(self._on_timeline_pan_ended)
         self._timeline_widget.clip_clicked.connect(self._on_clip_clicked)
         self._timeline_widget.preview_frame_requested.connect(self._on_preview_frame_requested)
         self._timeline_widget.cut_requested.connect(self._on_cut_at_frame)
@@ -385,6 +416,11 @@ class MainWindow(QMainWindow):
         self._setup_menus()
         self._update_title()
 
+        # Timeline-specific keys (arrows / Home / End / Up / Down) are
+        # QShortcuts scoped to the timeline widget so they only fire when
+        # it has focus. Customizable via the Keyboard Shortcuts dialog.
+        self._setup_timeline_shortcuts()
+
         # Ctrl+Shift+D — diagnostic thread-stack dump to src/diag.log.
         # Use during a hang to capture every Python thread's current stack.
         # Cheap and side-effect-free; safe to leave enabled.
@@ -397,6 +433,35 @@ class MainWindow(QMainWindow):
         # App-wide capture of mouse Back/Forward buttons for undo/redo,
         # so a mouse-driven workflow doesn't have to bounce to the keyboard.
         QApplication.instance().installEventFilter(self)
+
+    def _setup_timeline_shortcuts(self):
+        """Wire the timeline-widget keys (arrow stepping, Home/End, clip
+        navigation) as QShortcuts scoped to the timeline so they only fire
+        when it has focus. Each is registered with the ShortcutManager so
+        the Keyboard Shortcuts dialog can rebind them."""
+        from PySide6.QtGui import QShortcut
+        strip = self._timeline_widget.strip
+        pairs = [
+            ("playhead_left",       lambda: strip.step_playhead(-1)),
+            ("playhead_left_fast",  lambda: strip.step_playhead(-10)),
+            ("playhead_right",      lambda: strip.step_playhead(1)),
+            ("playhead_right_fast", lambda: strip.step_playhead(10)),
+            ("playhead_home",       strip.go_to_start),
+            ("playhead_end",        strip.go_to_end),
+            ("select_next_clip",    lambda: strip.select_adjacent_clip(1)),
+            ("select_prev_clip",    lambda: strip.select_adjacent_clip(-1)),
+        ]
+        for sid, handler in pairs:
+            sc = QShortcut(QKeySequence(), self._timeline_widget)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(handler)
+            self._shortcut_mgr.attach_qshortcut(sid, sc)
+
+    def _on_keyboard_shortcuts(self):
+        """File → Keyboard Shortcuts… opens the rebinding dialog."""
+        from ui.shortcuts_dialog import KeyboardShortcutsDialog
+        dlg = KeyboardShortcutsDialog(self._shortcut_mgr, parent=self)
+        dlg.exec()
 
     def _dump_diag(self):
         """Diagnostic shortcut handler — writes a thread dump to diag.log."""
@@ -430,12 +495,12 @@ class MainWindow(QMainWindow):
         file_menu = menu.addMenu("File")
 
         new_action = QAction(icon("new"), "New Project", self)
-        new_action.setShortcut(QKeySequence("Ctrl+N"))
+        self._shortcut_mgr.attach_action("new_project", new_action)
         new_action.triggered.connect(self._on_new_project)
         file_menu.addAction(new_action)
 
         open_action = QAction(icon("open"), "Open Project...", self)
-        open_action.setShortcut(QKeySequence("Ctrl+O"))
+        self._shortcut_mgr.attach_action("open_project", open_action)
         open_action.triggered.connect(self._on_open_project)
         file_menu.addAction(open_action)
 
@@ -445,87 +510,93 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
 
         save_action = QAction(icon("save"), "Save Project", self)
-        save_action.setShortcut(QKeySequence("Ctrl+S"))
+        self._shortcut_mgr.attach_action("save_project", save_action)
         save_action.triggered.connect(self._on_save_project)
         file_menu.addAction(save_action)
 
         save_as_action = QAction(icon("save-as"), "Save Project As...", self)
-        save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self._shortcut_mgr.attach_action("save_as", save_as_action)
         save_as_action.triggered.connect(self._on_save_project_as)
         file_menu.addAction(save_as_action)
+
+        file_menu.addSeparator()
+
+        shortcuts_action = QAction("Keyboard Shortcuts...", self)
+        shortcuts_action.triggered.connect(self._on_keyboard_shortcuts)
+        file_menu.addAction(shortcuts_action)
 
         edit_menu = menu.addMenu("Edit")
 
         split_action = QAction(icon("scissors"), "Split at Playhead", self)
-        split_action.setShortcut("S")  # middle finger home
+        self._shortcut_mgr.attach_action("split", split_action)
         split_action.triggered.connect(self._on_split)
         edit_menu.addAction(split_action)
 
         delete_action = QAction(icon("trash"), "Delete Selected", self)
-        delete_action.setShortcut("W")  # top row middle — most-used delete
+        self._shortcut_mgr.attach_action("delete", delete_action)
         delete_action.triggered.connect(self._on_delete)
         edit_menu.addAction(delete_action)
 
         ripple_delete_action = QAction(icon("ripple-delete"), "Ripple Delete Selected", self)
-        ripple_delete_action.setShortcut("D")  # index finger home — ripple delete
+        self._shortcut_mgr.attach_action("ripple_delete", ripple_delete_action)
         ripple_delete_action.triggered.connect(self._on_ripple_delete)
         edit_menu.addAction(ripple_delete_action)
 
         edit_menu.addSeparator()
 
         undo_action = QAction(icon("undo"), "Undo", self)
-        undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        self._shortcut_mgr.attach_action("undo", undo_action)
         undo_action.triggered.connect(self._timeline.undo)
         edit_menu.addAction(undo_action)
 
         redo_action = QAction(icon("redo"), "Redo", self)
-        redo_action.setShortcut(QKeySequence("Ctrl+Shift+Z"))
+        self._shortcut_mgr.attach_action("redo", redo_action)
         redo_action.triggered.connect(self._timeline.redo)
         edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
 
         select_all_action = QAction(icon("select-all"), "Select All", self)
-        select_all_action.setShortcut(QKeySequence("Ctrl+A"))
+        self._shortcut_mgr.attach_action("select_all", select_all_action)
         select_all_action.triggered.connect(self._on_select_all)
         edit_menu.addAction(select_all_action)
 
         select_gap_action = QAction(icon("select-gap"), "Select to Gap Left", self)
-        select_gap_action.setShortcut("A")  # pinky home — select to gap
+        self._shortcut_mgr.attach_action("select_to_gap", select_gap_action)
         select_gap_action.triggered.connect(self._on_select_to_gap)
         edit_menu.addAction(select_gap_action)
 
         edit_menu.addSeparator()
 
         set_in_action = QAction(icon("set-in"), "Set In Point", self)
-        set_in_action.setShortcut("E")  # top row — in point
+        self._shortcut_mgr.attach_action("set_in", set_in_action)
         set_in_action.triggered.connect(self._on_set_in_point)
         edit_menu.addAction(set_in_action)
 
         set_out_action = QAction(icon("set-out"), "Set Out Point", self)
-        set_out_action.setShortcut("R")  # top row — out point
+        self._shortcut_mgr.attach_action("set_out", set_out_action)
         set_out_action.triggered.connect(self._on_set_out_point)
         edit_menu.addAction(set_out_action)
 
         clear_in_out_action = QAction(icon("clear-in-out"), "Clear In/Out", self)
-        clear_in_out_action.setShortcut("X")
+        self._shortcut_mgr.attach_action("clear_in_out", clear_in_out_action)
         clear_in_out_action.triggered.connect(self._on_clear_in_out)
         edit_menu.addAction(clear_in_out_action)
 
         edit_menu.addSeparator()
 
         selection_mode_action = QAction(icon("cursor"), "Selection Mode", self)
-        selection_mode_action.setShortcut("V")
+        self._shortcut_mgr.attach_action("selection_mode", selection_mode_action)
         selection_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.SELECTION))
         edit_menu.addAction(selection_mode_action)
 
         cut_mode_action = QAction(icon("cut-mode"), "Cut Mode", self)
-        cut_mode_action.setShortcut("C")
+        self._shortcut_mgr.attach_action("cut_mode", cut_mode_action)
         cut_mode_action.triggered.connect(lambda: self._set_edit_mode(EditMode.CUT))
         edit_menu.addAction(cut_mode_action)
 
         scrub_follow_action = QAction(icon("target"), "Scrub Follow", self)
-        scrub_follow_action.setShortcut("F")
+        self._shortcut_mgr.attach_action("scrub_follow", scrub_follow_action)
         scrub_follow_action.triggered.connect(self._toggle_scrub_follow)
         edit_menu.addAction(scrub_follow_action)
 
@@ -533,19 +604,19 @@ class MainWindow(QMainWindow):
         timeline_menu = menu.addMenu("Timeline")
 
         import_action = QAction(icon("import"), "Import Video...", self)
-        import_action.setShortcut(QKeySequence("Ctrl+I"))
+        self._shortcut_mgr.attach_action("import_video", import_action)
         import_action.triggered.connect(self._on_import)
         timeline_menu.addAction(import_action)
 
         timeline_menu.addSeparator()
 
         export_vid_action = QAction(icon("film"), "Export Video...", self)
-        export_vid_action.setShortcut(QKeySequence("Ctrl+E"))
+        self._shortcut_mgr.attach_action("export_video", export_vid_action)
         export_vid_action.triggered.connect(self._on_export_video)
         timeline_menu.addAction(export_vid_action)
 
         export_img_action = QAction(icon("image"), "Export Image Sequence...", self)
-        export_img_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self._shortcut_mgr.attach_action("export_images", export_img_action)
         export_img_action.triggered.connect(self._on_export_images)
         timeline_menu.addAction(export_img_action)
 
@@ -564,14 +635,14 @@ class MainWindow(QMainWindow):
         timeline_menu.addSeparator()
 
         detect_action = QAction(icon("wand"), "Detect Cuts...", self)
-        detect_action.setShortcut(QKeySequence("Ctrl+D"))
+        self._shortcut_mgr.attach_action("detect_cuts", detect_action)
         detect_action.triggered.connect(self._on_detect_cuts)
         timeline_menu.addAction(detect_action)
 
         timeline_menu.addSeparator()
 
         play_action = QAction(icon("play"), "Play/Pause", self)
-        play_action.setShortcut("Space")
+        self._shortcut_mgr.attach_action("play_pause", play_action)
         play_action.triggered.connect(self._toggle_play)
         timeline_menu.addAction(play_action)
 
@@ -582,11 +653,11 @@ class MainWindow(QMainWindow):
         relink_action.triggered.connect(self._on_tools_relink)
         tools_menu.addAction(relink_action)
 
-        cache_action = QAction("Cache Manager…", self)
+        cache_action = QAction(icon("cache"), "Cache Manager…", self)
         cache_action.triggered.connect(self._on_tools_cache_manager)
         tools_menu.addAction(cache_action)
 
-        cut_inspect_action = QAction("Cut Inspect…", self)
+        cut_inspect_action = QAction(icon("cut-inspect"), "Cut Inspect…", self)
         cut_inspect_action.triggered.connect(self._on_tools_cut_inspect)
         tools_menu.addAction(cut_inspect_action)
 
@@ -1188,10 +1259,10 @@ class MainWindow(QMainWindow):
             clip, _ = result
             self._timeline.select_clip(clip.id)
 
-        # Pause thumbnail generation while scrubbing — resume after 500ms idle
-        if self._thumbnail_cache:
-            self._thumbnail_cache.pause()
-            self._thumb_resume_timer.start()
+        # EXPERIMENT v0.9.x: don't pause the thumbnail coordinator during
+        # scrub. With a full pre-bake on disk, the coordinator's work is
+        # cheap (JPEG decode) and shouldn't contend with mpv. Revert if
+        # playhead drag feels laggy.
 
         # Seek mpv to the correct source frame (GPU-accelerated)
         if result is None or result[0].is_gap:
@@ -1206,6 +1277,14 @@ class MainWindow(QMainWindow):
 
     def _resume_thumbnails(self):
         if self._thumbnail_cache:
+            self._thumbnail_cache.resume()
+
+    def _on_timeline_pan_started(self):
+        if self._thumbnail_cache is not None:
+            self._thumbnail_cache.pause()
+
+    def _on_timeline_pan_ended(self):
+        if self._thumbnail_cache is not None:
             self._thumbnail_cache.resume()
 
     # --- Clip selection ---
@@ -1353,9 +1432,8 @@ class MainWindow(QMainWindow):
 
     def _on_preview_frame_requested(self, frame: int):
         """Preview a frame without moving the playhead (cut mode hover scrub)."""
-        if self._thumbnail_cache:
-            self._thumbnail_cache.pause()
-            self._thumb_resume_timer.start()
+        # EXPERIMENT v0.9.x: same as _on_playhead_changed — coordinator
+        # stays running during cut-mode hover. Revert if hover feels laggy.
 
         result = self._timeline.get_clip_at_position(frame)
         if result is None or result[0].is_gap:
@@ -1698,11 +1776,13 @@ class MainWindow(QMainWindow):
         try:
             playhead = self._timeline_widget.strip.playhead_frame
             scroll = self._timeline_widget.strip._scroll_offset
+            zoom = self._timeline_widget.strip.pixels_per_frame
             save_project(path, self._sources, self._timeline.clips,
                          playhead, self._selection_follows_playhead,
                          in_point=self._timeline.in_point,
                          out_point=self._timeline.out_point,
                          scroll_offset=scroll,
+                         pixels_per_frame=zoom,
                          orphan_paths=self._orphan_paths)
             self._project_path = path
             self._dirty = False
@@ -1825,6 +1905,12 @@ class MainWindow(QMainWindow):
 
         # Restore clips (preserve saved colors)
         self._timeline.add_clips(data["clips"], assign_colors=False)
+
+        # Restore zoom BEFORE the scroll offset — scroll_offset is a pixel
+        # value, so it only lands at the correct logical position once
+        # _pixels_per_frame matches what was saved.
+        self._timeline_widget.strip.set_pixels_per_frame(
+            data.get("pixels_per_frame", 0.5))
 
         # Restore playhead and scroll position
         self._timeline_widget.set_playhead(data.get("playhead_position", 0))

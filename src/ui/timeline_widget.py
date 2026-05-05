@@ -65,6 +65,8 @@ class TimelineStrip(QWidget):
     playhead_moved = Signal(int)   # timeline frame
     scrub_started = Signal()       # user started dragging playhead
     scrub_ended = Signal()         # user released playhead drag
+    pan_started = Signal()         # user started middle-mouse pan
+    pan_ended = Signal()           # user released middle-mouse pan
     scroll_changed = Signal()      # scroll offset changed (no playhead change)
     clip_clicked = Signal(str, object)  # clip_id, QMouseEvent (for modifier keys)
     preview_frame_requested = Signal(int)  # cut-mode hover scrub (no playhead move)
@@ -160,6 +162,18 @@ class TimelineStrip(QWidget):
     def set_scroll_offset(self, offset: int):
         self._scroll_offset = max(0, offset)
         self.update()
+        self.scroll_changed.emit()
+
+    def set_pixels_per_frame(self, value: float):
+        """Set the timeline zoom level. Used to restore the saved zoom when
+        loading a project. Bounds match the wheel-zoom clamp so a corrupt
+        or out-of-range value can't render the strip degenerate."""
+        new = max(0.001, min(20.0, float(value)))
+        if new == self._pixels_per_frame:
+            return
+        self._pixels_per_frame = new
+        self.update()
+        # Total width changed; the parent's scrollbar needs to recompute.
         self.scroll_changed.emit()
 
     def set_thumbnail(self, clip_id: str, position: str, pixmap: QPixmap):
@@ -634,6 +648,7 @@ class TimelineStrip(QWidget):
             self._pan_start_x = int(event.position().x())
             self._pan_start_offset = self._scroll_offset
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.pan_started.emit()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
@@ -756,8 +771,11 @@ class TimelineStrip(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.MiddleButton:
+            was_panning = self._panning
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            if was_panning:
+                self.pan_ended.emit()
         elif event.button() == Qt.MouseButton.LeftButton:
             if self._marquee_active:
                 self._finish_marquee_selection()
@@ -846,29 +864,36 @@ class TimelineStrip(QWidget):
         self.set_playhead(start)
         self.ensure_playhead_visible()
 
+    # --- Public timeline-action methods ---
+    #
+    # These were previously inlined in keyPressEvent. They're now exposed as
+    # methods so MainWindow can wire customizable QShortcuts to them via the
+    # ShortcutManager. The shortcuts (Left/Right/Home/End/Up/Down by default)
+    # are owned by core.shortcuts.SHORTCUTS — change the bindings in the
+    # Keyboard Shortcuts dialog.
+
+    def step_playhead(self, frames: int):
+        """Move the playhead by ``frames`` (negative for backward)."""
+        self.set_playhead(self._playhead_frame + frames)
+        self.ensure_playhead_visible()
+
+    def go_to_start(self):
+        self.set_playhead(0)
+        self.set_scroll_offset(0)
+
+    def go_to_end(self):
+        total = self._model.get_total_duration_frames()
+        self.set_playhead(total - 1 if total > 0 else 0)
+        self.ensure_playhead_visible()
+
+    def select_adjacent_clip(self, direction: int):
+        """Select the next (1) or previous (-1) clip on the timeline."""
+        self._select_adjacent_clip(direction)
+
     def keyPressEvent(self, event: QKeyEvent):
-        # Arrow keys for frame stepping
-        if event.key() == Qt.Key.Key_Left:
-            step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
-            self.set_playhead(self._playhead_frame - step)
-            self.ensure_playhead_visible()
-        elif event.key() == Qt.Key.Key_Right:
-            step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
-            self.set_playhead(self._playhead_frame + step)
-            self.ensure_playhead_visible()
-        elif event.key() == Qt.Key.Key_Home:
-            self.set_playhead(0)
-            self.set_scroll_offset(0)
-        elif event.key() == Qt.Key.Key_End:
-            total = self._model.get_total_duration_frames()
-            self.set_playhead(total - 1 if total > 0 else 0)
-            self.ensure_playhead_visible()
-        elif event.key() == Qt.Key.Key_Down:
-            self._select_adjacent_clip(1)
-        elif event.key() == Qt.Key.Key_Up:
-            self._select_adjacent_clip(-1)
-        else:
-            super().keyPressEvent(event)
+        # All formerly-hardcoded keys (arrow stepping, Home/End, Up/Down clip
+        # navigation) are now QShortcut-driven; nothing left to handle here.
+        super().keyPressEvent(event)
 
 
 class TimelineWidget(QWidget):
@@ -877,6 +902,8 @@ class TimelineWidget(QWidget):
     playhead_changed = Signal(int)
     scrub_started = Signal()
     scrub_ended = Signal()
+    pan_started = Signal()
+    pan_ended = Signal()
     clip_clicked = Signal(str, object)
     preview_frame_requested = Signal(int)
     cut_requested = Signal(int)
@@ -957,6 +984,8 @@ class TimelineWidget(QWidget):
         self._strip.playhead_moved.connect(self._on_playhead_moved)
         self._strip.scrub_started.connect(self.scrub_started.emit)
         self._strip.scrub_ended.connect(self.scrub_ended.emit)
+        self._strip.pan_started.connect(self.pan_started.emit)
+        self._strip.pan_ended.connect(self.pan_ended.emit)
         self._strip.scroll_changed.connect(self._update_scrollbar)
         self._strip.clip_clicked.connect(self.clip_clicked.emit)
         self._strip.preview_frame_requested.connect(self.preview_frame_requested.emit)
