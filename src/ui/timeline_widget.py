@@ -50,6 +50,12 @@ TIMELINE_H_PADDING = 4  # small internal padding for playhead clearance
 RESIZE_HANDLE_HEIGHT = 5  # pixels at bottom edge for drag resize
 THUMB_HIDE_THRESHOLD = 15  # px clip width — below this, skip thumbnail paint and generation
                             # (hard floor is ~13px: 6px color border on each side)
+# People — group label strip rendered below each clip body. Each label is
+# GROUP_LABEL_HEIGHT tall; we reserve space for up to MAX_VISIBLE on the
+# track and surface "+N" on the last visible label when a clip has more.
+GROUP_LABEL_HEIGHT = 14
+GROUP_LABEL_MAX_VISIBLE = 3
+GROUP_STRIP_RESERVE = GROUP_LABEL_HEIGHT * GROUP_LABEL_MAX_VISIBLE
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
 GAP_COLOR = QColor(30, 30, 30)
@@ -113,7 +119,9 @@ class TimelineStrip(QWidget):
         # drop preview can render each dragged source's media-pool thumbnail.
         self._sources_ref: dict = {}
 
-        self.setMinimumHeight(CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4)
+        # Reserve room for the group-label strip below the clip body.
+        self.setMinimumHeight(
+            CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4 + GROUP_STRIP_RESERVE)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
@@ -121,6 +129,7 @@ class TimelineStrip(QWidget):
         self._model.clips_changed.connect(self.update)
         self._model.selection_changed.connect(self.update)
         self._model.in_out_changed.connect(self.update)
+        self._model.groups_changed.connect(self.update)
 
     @property
     def pixels_per_frame(self) -> float:
@@ -580,6 +589,53 @@ class TimelineStrip(QWidget):
                 text_rect = QRect(screen_x + tw, y, clip_w - tw * 2, self._clip_height)
                 painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
 
+            # --- Group / People labels below the clip ---
+            self._paint_group_labels(
+                painter, clip, screen_x, y + self._clip_height + 1, clip_w)
+
+    def _paint_group_labels(self, painter: QPainter, clip: Clip,
+                             x: int, y: int, w: int):
+        """Render up to GROUP_LABEL_MAX_VISIBLE group chips beneath a clip.
+        Each chip is filled with the group's colour and shows the group's
+        name in a high-contrast text colour. If the clip belongs to more
+        groups than fit, the last visible chip overlays a '+N' indicator."""
+        if not clip.group_ids:
+            return
+        groups = self._model.groups
+        # Resolve in stored order; skip ids that no longer exist.
+        my_groups = [groups[gid] for gid in clip.group_ids if gid in groups]
+        if not my_groups:
+            return
+        visible = my_groups[:GROUP_LABEL_MAX_VISIBLE]
+        extra = len(my_groups) - len(visible)
+        font = QFont("Segoe UI", 8)
+        painter.setFont(font)
+        for i, g in enumerate(visible):
+            ly = y + i * GROUP_LABEL_HEIGHT
+            rect = QRect(x, ly, w, GROUP_LABEL_HEIGHT - 1)
+            painter.fillRect(rect, QColor(g.color))
+            # Name on the chip — high-contrast text colour.
+            text_color = self._readable_text_for(g.color)
+            painter.setPen(QPen(text_color))
+            label_text = g.name
+            # On the last visible chip, append '+N' when more groups exist.
+            if extra > 0 and i == len(visible) - 1:
+                label_text = f"{g.name}  +{extra}"
+            painter.drawText(
+                rect.adjusted(4, 0, -4, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                label_text)
+
+    @staticmethod
+    def _readable_text_for(hex_str: str) -> QColor:
+        """Pick black or white based on the relative luminance of ``hex_str``.
+        Standard W3C contrast rule, threshold tuned to keep mid-tones legible."""
+        c = QColor(hex_str)
+        lum = (0.2126 * c.redF()
+               + 0.7152 * c.greenF()
+               + 0.0722 * c.blueF())
+        return QColor(0, 0, 0) if lum > 0.55 else QColor(255, 255, 255)
+
     def _paint_cut_preview(self, painter: QPainter, clip_y: int):
         x = self._cut_preview_x
         if x is None or x < 0 or x > self.width():
@@ -633,7 +689,9 @@ class TimelineStrip(QWidget):
     # --- Mouse interaction ---
 
     def _track_bottom_y(self) -> int:
-        return HEADER_HEIGHT + 2 + self._clip_height
+        # Bottom of the clip body + the reserved group-label strip — this is
+        # where the resize handle sits and where the marquee area starts.
+        return HEADER_HEIGHT + 2 + self._clip_height + GROUP_STRIP_RESERVE
 
     def mousePressEvent(self, event: QMouseEvent):
         # Quick-cut: right-click while scrubbing (drag or scrub-follow mode)

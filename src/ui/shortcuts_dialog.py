@@ -99,7 +99,7 @@ class KeyboardShortcutsDialog(QDialog):
         edit_btn = QPushButton("Edit")
         edit_btn.clicked.connect(self._on_edit)
         btn_row.addWidget(edit_btn)
-        reset_one_btn = QPushButton("Reset Row")
+        reset_one_btn = QPushButton("Reset to default")
         reset_one_btn.clicked.connect(self._on_reset_one)
         btn_row.addWidget(reset_one_btn)
         clear_btn = QPushButton("Clear")

@@ -66,6 +66,19 @@ SHORTCUTS: List[ShortcutDef] = [
     ShortcutDef("playhead_end",       "Timeline", "Go to End",                  "End"),
     ShortcutDef("select_next_clip",   "Timeline", "Select Next Clip",           "Down"),
     ShortcutDef("select_prev_clip",   "Timeline", "Select Previous Clip",       "Up"),
+    # People — toggle group membership for the currently-selected clips.
+    # If no group holds this digit yet, the handler prompts to create one
+    # inline. Order matches the keyboard's number row: 1-9 first, 0 at end.
+    ShortcutDef("group_digit_1",      "People",   "Toggle Group 1",             "1"),
+    ShortcutDef("group_digit_2",      "People",   "Toggle Group 2",             "2"),
+    ShortcutDef("group_digit_3",      "People",   "Toggle Group 3",             "3"),
+    ShortcutDef("group_digit_4",      "People",   "Toggle Group 4",             "4"),
+    ShortcutDef("group_digit_5",      "People",   "Toggle Group 5",             "5"),
+    ShortcutDef("group_digit_6",      "People",   "Toggle Group 6",             "6"),
+    ShortcutDef("group_digit_7",      "People",   "Toggle Group 7",             "7"),
+    ShortcutDef("group_digit_8",      "People",   "Toggle Group 8",             "8"),
+    ShortcutDef("group_digit_9",      "People",   "Toggle Group 9",             "9"),
+    ShortcutDef("group_digit_0",      "People",   "Toggle Group 0",             "0"),
 ]
 
 _QSETTINGS_PREFIX = "shortcuts/"

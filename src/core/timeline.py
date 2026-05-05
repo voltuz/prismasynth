@@ -1,7 +1,8 @@
 import copy
-from typing import List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 from PySide6.QtCore import QObject, Signal
 from core.clip import Clip
+from core.group import Group, GROUP_COLOR_PALETTE
 
 MAX_UNDO = 50
 
@@ -10,6 +11,7 @@ class TimelineModel(QObject):
     clips_changed = Signal()
     selection_changed = Signal()
     in_out_changed = Signal()
+    groups_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -20,23 +22,35 @@ class TimelineModel(QObject):
         self._redo_stack: list = []
         self._in_point: Optional[int] = None
         self._out_point: Optional[int] = None
+        self._groups: Dict[str, Group] = {}
 
     # --- Undo / Redo ---
 
     def _snapshot(self) -> tuple:
+        # deepcopy of clips so mutable Clip.group_ids lists don't leak
+        # between the live model and the snapshot.
         return (
-            [copy.copy(c) for c in self._clips],
+            [copy.deepcopy(c) for c in self._clips],
             set(self._selected_ids),
             self._color_counter,
+            copy.deepcopy(self._groups),
         )
 
     def _restore(self, snapshot: tuple):
-        clips, selected, color_counter = snapshot
+        # Tolerate legacy 3-tuple snapshots in case any in-memory ones
+        # predate the groups field (defensive).
+        if len(snapshot) == 4:
+            clips, selected, color_counter, groups = snapshot
+        else:
+            clips, selected, color_counter = snapshot
+            groups = {}
         self._clips = clips
         self._selected_ids = selected
         self._color_counter = color_counter
+        self._groups = groups
         self.clips_changed.emit()
         self.selection_changed.emit()
+        self.groups_changed.emit()
 
     def _push_undo(self):
         self._undo_stack.append(self._snapshot())
@@ -306,10 +320,123 @@ class TimelineModel(QObject):
         self._color_counter = 0
         self._in_point = None
         self._out_point = None
+        self._groups.clear()
         self.clear_undo()
         self.clips_changed.emit()
         self.selection_changed.emit()
         self.in_out_changed.emit()
+        self.groups_changed.emit()
+
+    # --- People / Groups ---
+
+    @property
+    def groups(self) -> Dict[str, Group]:
+        """Live dict — callers must not mutate it directly."""
+        return self._groups
+
+    def get_group_by_digit(self, digit: Optional[int]) -> Optional[Group]:
+        if digit is None:
+            return None
+        for g in self._groups.values():
+            if g.digit == digit:
+                return g
+        return None
+
+    def _next_group_color(self) -> str:
+        used = {g.color for g in self._groups.values()}
+        for c in GROUP_COLOR_PALETTE:
+            if c not in used:
+                return c
+        # Palette exhausted — recycle by index (count modulo palette size).
+        return GROUP_COLOR_PALETTE[len(self._groups) % len(GROUP_COLOR_PALETTE)]
+
+    def add_group(self, name: str, color: Optional[str] = None,
+                  digit: Optional[int] = None) -> Group:
+        """Create and register a new group. ``color`` defaults to the next
+        free palette entry. ``digit`` must be either None or a free digit
+        (0-9); raises ValueError if that digit is already in use."""
+        if digit is not None and self.get_group_by_digit(digit) is not None:
+            raise ValueError(f"digit {digit} already in use")
+        if color is None:
+            color = self._next_group_color()
+        self._push_undo()
+        g = Group(name=name, color=color, digit=digit)
+        self._groups[g.id] = g
+        self.groups_changed.emit()
+        return g
+
+    def remove_group(self, group_id: str):
+        """Delete a group and strip its id from every clip's group_ids."""
+        if group_id not in self._groups:
+            return
+        self._push_undo()
+        del self._groups[group_id]
+        for c in self._clips:
+            if group_id in c.group_ids:
+                c.group_ids = [gid for gid in c.group_ids if gid != group_id]
+        self.groups_changed.emit()
+        self.clips_changed.emit()
+
+    def update_group(self, group_id: str,
+                     name: Optional[str] = None,
+                     color: Optional[str] = None,
+                     digit=Ellipsis) -> Optional[str]:
+        """Rename / recolour / re-bind digit. Pass digit=Ellipsis (default)
+        to leave it unchanged; pass None to clear; pass 0-9 to assign.
+
+        Returns:
+          - ``None`` on success.
+          - The conflicting group's display name when the requested digit
+            is already held by a different group.
+        """
+        g = self._groups.get(group_id)
+        if g is None:
+            return None
+        if digit is not Ellipsis and digit is not None:
+            owner = self.get_group_by_digit(digit)
+            if owner is not None and owner.id != group_id:
+                return owner.name
+        self._push_undo()
+        if name is not None:
+            g.name = name
+        if color is not None:
+            g.color = color
+        if digit is not Ellipsis:
+            g.digit = digit
+        self.groups_changed.emit()
+        return None
+
+    def toggle_clip_group(self, clip_ids, group_id: str):
+        """Toggle group membership for one or many clip ids. Behaviour
+        on multi-select: if every targeted clip already has the group,
+        the group is removed from all of them; otherwise it's added to
+        every clip that doesn't yet have it (so all become members)."""
+        if group_id not in self._groups:
+            return
+        if isinstance(clip_ids, str):
+            clip_ids = [clip_ids]
+        ids_set = set(clip_ids)
+        targets = [c for c in self._clips
+                   if c.id in ids_set and not c.is_gap]
+        if not targets:
+            return
+        all_have = all(group_id in c.group_ids for c in targets)
+        self._push_undo()
+        for c in targets:
+            if all_have:
+                if group_id in c.group_ids:
+                    c.group_ids = [gid for gid in c.group_ids
+                                   if gid != group_id]
+            else:
+                if group_id not in c.group_ids:
+                    c.group_ids = list(c.group_ids) + [group_id]
+        self.clips_changed.emit()
+
+    def set_groups_bulk(self, groups_iter: Iterable[Group]):
+        """Replace the entire groups dict from an iterable of Group objects.
+        Used by project load. Does NOT push undo (load is a fresh state)."""
+        self._groups = {g.id: g for g in groups_iter}
+        self.groups_changed.emit()
 
     # --- In/Out Points ---
 

@@ -7,7 +7,7 @@ from typing import Dict, Optional
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QStatusBar, QMessageBox, QFileDialog, QProgressBar,
-    QApplication, QDialog,
+    QApplication, QDialog, QTabWidget, QInputDialog,
 )
 from PySide6.QtCore import Qt, QTimer, QEvent, QRunnable, QThreadPool, QSettings, Signal
 from PySide6.QtGui import QAction, QKeySequence
@@ -30,6 +30,7 @@ from ui.preview_widget import PreviewWidget
 from ui.timeline_widget import TimelineWidget, EditMode
 from ui.toolbar import MainToolbar
 from ui.clip_info_panel import ClipInfoPanel
+from ui.people_panel import PeoplePanel
 from ui.media_panel import MediaPanel
 from ui.source_info_dialog import SourceInfoDialog
 from ui.remove_source_dialog import RemoveSourceDialog, RemoveSourceAction
@@ -323,8 +324,32 @@ class MainWindow(QMainWindow):
         self._preview = PreviewWidget()
         self._top_splitter.addWidget(self._preview)
 
+        # Right column: Clip Info + People, switchable via vertical
+        # text-tabs on the left edge of the column. Tab strip width is
+        # tightened via stylesheet so it doesn't eat horizontal space.
         self._clip_info = ClipInfoPanel()
-        self._top_splitter.addWidget(self._clip_info)
+        self._people_panel = PeoplePanel(self._timeline)
+        self._right_tabs = QTabWidget()
+        self._right_tabs.setTabPosition(QTabWidget.TabPosition.West)
+        self._right_tabs.addTab(self._clip_info, "Clip Info")
+        self._right_tabs.addTab(self._people_panel, "People")
+        self._right_tabs.setDocumentMode(True)
+        self._right_tabs.setStyleSheet(
+            "QTabWidget::pane { border: none; }"
+            "QTabBar::tab {"
+            " padding: 6px 2px;"
+            " min-height: 60px;"
+            " background-color: #2b2b2b;"
+            " color: #aaa;"
+            " border: 1px solid #444;"
+            "}"
+            "QTabBar::tab:selected {"
+            " background-color: #3a3a3a;"
+            " color: #fff;"
+            "}"
+            "QTabBar::tab:hover { background-color: #333; }"
+        )
+        self._top_splitter.addWidget(self._right_tabs)
 
         # Centre column takes the remainder; side columns stay where the user puts them.
         self._top_splitter.setStretchFactor(0, 0)
@@ -456,6 +481,36 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             sc.activated.connect(handler)
             self._shortcut_mgr.attach_qshortcut(sid, sc)
+
+        # People — 10 digit shortcuts toggle the selected clips' membership
+        # in the group bound to that digit.
+        for digit in range(10):
+            sc = QShortcut(QKeySequence(), self._timeline_widget)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(
+                lambda d=digit: self._on_group_digit(d))
+            self._shortcut_mgr.attach_qshortcut(f"group_digit_{digit}", sc)
+
+    def _on_group_digit(self, digit: int):
+        """Toggle the digit-bound group on every selected clip. If no group
+        owns this digit yet, prompt for a name and create one inline."""
+        selected = [cid for cid in self._timeline.selected_ids
+                    if (c := self._timeline.get_clip_by_id(cid))
+                    and not c.is_gap]
+        if not selected:
+            return
+        group = self._timeline.get_group_by_digit(digit)
+        if group is None:
+            name, ok = QInputDialog.getText(
+                self, "Create Group",
+                f"Name for new group bound to digit {digit}:")
+            if not ok:
+                return
+            name = name.strip()
+            if not name:
+                return
+            group = self._timeline.add_group(name=name, digit=digit)
+        self._timeline.toggle_clip_group(selected, group.id)
 
     def _on_keyboard_shortcuts(self):
         """File → Keyboard Shortcuts… opens the rebinding dialog."""
@@ -1783,7 +1838,8 @@ class MainWindow(QMainWindow):
                          out_point=self._timeline.out_point,
                          scroll_offset=scroll,
                          pixels_per_frame=zoom,
-                         orphan_paths=self._orphan_paths)
+                         orphan_paths=self._orphan_paths,
+                         groups=self._timeline.groups)
             self._project_path = path
             self._dirty = False
             self._autosave_timer.stop()
@@ -1902,6 +1958,10 @@ class MainWindow(QMainWindow):
         if self._sources:
             fps = next(iter(self._sources.values())).fps
             self._timeline_widget.set_fps(fps)
+
+        # Restore groups BEFORE clips so the clips' group_ids reference a
+        # populated registry by the time clip-related signals fire.
+        self._timeline.set_groups_bulk(data.get("groups", {}).values())
 
         # Restore clips (preserve saved colors)
         self._timeline.add_clips(data["clips"], assign_colors=False)

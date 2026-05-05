@@ -11,6 +11,9 @@ class Clip:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     label: str = ""
     color_index: int = 0
+    # Group (People) memberships. Order is preserved so the timeline
+    # label strip renders them in user-assigned order.
+    group_ids: list = field(default_factory=list)
 
     @property
     def is_gap(self) -> bool:
@@ -36,6 +39,7 @@ class Clip:
             "source_out": self.source_out,
             "label": self.label,
             "color_index": self.color_index,
+            "group_ids": list(self.group_ids),
         }
 
     @classmethod
@@ -47,4 +51,5 @@ class Clip:
             source_out=d["source_out"],
             label=d.get("label", ""),
             color_index=d.get("color_index", 0),
+            group_ids=list(d.get("group_ids", [])),
         )

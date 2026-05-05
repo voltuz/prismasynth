@@ -27,7 +27,8 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
                  in_point: Optional[int] = None, out_point: Optional[int] = None,
                  scroll_offset: int = 0,
                  pixels_per_frame: float = 0.5,
-                 orphan_paths: Optional[dict] = None):
+                 orphan_paths: Optional[dict] = None,
+                 groups: Optional[dict] = None):
     data = {
         "version": PROJECT_VERSION,
         "playhead_position": playhead,
@@ -40,6 +41,8 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
         "out_point": out_point,
         "sources": [],
         "clips": [],
+        # People / group registry. Each entry is Group.to_dict().
+        "groups": [g.to_dict() for g in (groups or {}).values()],
         # file_path -> source_id mapping for clips whose source was removed
         # but kept on the timeline. Re-importing the same path revives them.
         "orphan_paths": dict(orphan_paths) if orphan_paths else {},
@@ -118,13 +121,30 @@ def load_project(filepath: str):
                 s.audio_channels = info.audio_channels
         sources[s.id] = s
 
+    # People / group registry — each entry round-tripped via Group.from_dict.
+    from core.group import Group
+    groups: dict = {}
+    for gd in data.get("groups", []):
+        try:
+            g = Group.from_dict(gd)
+            groups[g.id] = g
+        except Exception:
+            pass
+
     clips = []
+    valid_group_ids = set(groups.keys())
     for cd in data.get("clips", []):
-        clips.append(Clip.from_dict(cd))
+        c = Clip.from_dict(cd)
+        # Strip stale group_ids — if a project was edited externally and a
+        # group was deleted from the registry, skip dangling references.
+        if c.group_ids:
+            c.group_ids = [gid for gid in c.group_ids if gid in valid_group_ids]
+        clips.append(c)
 
     return {
         "sources": sources,
         "clips": clips,
+        "groups": groups,
         "playhead_position": data.get("playhead_position", 0),
         "scroll_offset": data.get("scroll_offset", 0),
         # Legacy projects without pixels_per_frame fall back to the original

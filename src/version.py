@@ -4,4 +4,4 @@ Bumped in lockstep with git tags. Displayed in the main window title bar
 and available for crash reports / About dialogs / exported metadata.
 """
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
