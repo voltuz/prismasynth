@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Dict
 
 from PySide6.QtCore import (
-    QByteArray, QMimeData, QSize, Qt, QSettings, Signal,
+    QByteArray, QItemSelection, QItemSelectionModel, QMimeData, QSize,
+    Qt, QSettings, Signal,
 )
 from PySide6.QtGui import (
     QAction, QDrag, QIcon, QPixmap, QStandardItem, QStandardItemModel,
@@ -102,6 +103,11 @@ class _SourceListView(QListView):
         # State for the manual drag override below.
         self._press_pos = None
         self._press_idx = None
+        # True when the most recent press landed on an already-selected row
+        # with no modifier — we defer the default "collapse to one row"
+        # selection update until release so a drag of the whole multi-
+        # selection stays intact.
+        self._press_was_on_selected = False
 
     # --- Outgoing drag: manual press/move detection ---
     #
@@ -112,13 +118,72 @@ class _SourceListView(QListView):
     # through to super() and produces the marquee selection.
 
     def mousePressEvent(self, event):
+        # Always handle a press on a valid item ourselves so QListView's
+        # default never gets a chance to start a rubber-band rectangle from
+        # the press location (which it can do in IconMode + ExtendedSelection
+        # even when the press lands on a thumbnail's grid cell). Empty-area
+        # presses still fall through to super so the marquee selection
+        # works normally.
+        self._press_was_on_selected = False
         if event.button() == Qt.MouseButton.LeftButton:
             self._press_pos = event.position().toPoint()
             idx = self.indexAt(self._press_pos)
             self._press_idx = idx if idx.isValid() else None
+
+            if idx.isValid():
+                mods = event.modifiers()
+                sm = self.selectionModel()
+                # IMPORTANT: use selectionModel().setCurrentIndex(idx,
+                # NoUpdate) instead of self.setCurrentIndex(idx). The view's
+                # setCurrentIndex computes a default selection command based
+                # on the active mode + modifiers and frequently issues
+                # ClearAndSelect, which would undo the explicit Deselect /
+                # custom range we just set on the line above.
+                no_update = QItemSelectionModel.SelectionFlag.NoUpdate
+                if mods & Qt.KeyboardModifier.ControlModifier:
+                    # Toggle this item; leave the rest of the selection alone.
+                    # Explicit Select/Deselect avoids the Toggle flag's quirky
+                    # interaction with multi-cell selection ranges.
+                    if sm.isSelected(idx):
+                        sm.select(
+                            idx,
+                            QItemSelectionModel.SelectionFlag.Deselect)
+                    else:
+                        sm.select(
+                            idx,
+                            QItemSelectionModel.SelectionFlag.Select)
+                    sm.setCurrentIndex(idx, no_update)
+                elif mods & Qt.KeyboardModifier.ShiftModifier:
+                    # Extend from the current anchor to the clicked item.
+                    anchor = sm.currentIndex()
+                    if anchor.isValid():
+                        sel = QItemSelection(anchor, idx)
+                        sm.select(
+                            sel,
+                            QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    else:
+                        sm.select(
+                            idx,
+                            QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    sm.setCurrentIndex(idx, no_update)
+                else:
+                    if sm.isSelected(idx):
+                        # Defer the "collapse to this row" behaviour to the
+                        # release handler; if the user drags out instead,
+                        # the multi-selection survives.
+                        self._press_was_on_selected = True
+                    else:
+                        sm.select(
+                            idx,
+                            QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                        sm.setCurrentIndex(idx, no_update)
+                event.accept()
+                return
         else:
             self._press_pos = None
             self._press_idx = None
+        # Empty-area press (or non-left button) — let QListView handle it
+        # so rubber-band selection still works in blank space.
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -138,12 +203,33 @@ class _SourceListView(QListView):
                     drag.exec(Qt.DropAction.CopyAction)
                 self._press_idx = None
                 self._press_pos = None
+                self._press_was_on_selected = False
                 return
+            # Below the drag threshold: swallow the move event so QListView
+            # can't interpret it as 'extend rubber-band'. The drag fires
+            # the moment the threshold is crossed.
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # Plain click on a row that was already selected — no drag occurred,
+        # so apply the default "collapse to clicked row" behaviour now.
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._press_was_on_selected
+                and self._press_idx is not None
+                and self._press_idx.isValid()):
+            sm = self.selectionModel()
+            sm.select(self._press_idx,
+                      QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            # NoUpdate so the explicit ClearAndSelect above isn't overwritten
+            # by setCurrentIndex's default command.
+            sm.setCurrentIndex(
+                self._press_idx,
+                QItemSelectionModel.SelectionFlag.NoUpdate)
         self._press_idx = None
         self._press_pos = None
+        self._press_was_on_selected = False
         super().mouseReleaseEvent(event)
 
     # --- Incoming drag (file URLs to add to pool) ---
@@ -186,8 +272,8 @@ class MediaPanel(QWidget):
 
     # Signals consumed by MainWindow
     source_double_clicked = Signal(str)   # source_id
-    relink_requested = Signal(str)        # source_id
-    remove_requested = Signal(str)        # source_id
+    relink_requested = Signal(list)       # list[str] — one or many source_ids
+    remove_requested = Signal(list)       # list[str] — one or many source_ids
     files_dropped = Signal(list)          # list[str] — added to pool
 
     _SETTINGS_VIEW_MODE = "media_panel/view_mode"
@@ -329,22 +415,65 @@ class MediaPanel(QWidget):
         if not sid:
             return
 
-        menu = QMenu(self)
-        info_action = QAction("Open Info", menu)
-        info_action.triggered.connect(lambda: self.source_double_clicked.emit(sid))
-        menu.addAction(info_action)
+        # Operate on the multi-selection only when the clicked row is part
+        # of it. Right-clicking a non-selected row falls back to single-
+        # source so the user can act on one item without losing the
+        # current selection.
+        selected = self._selected_source_ids()
+        if sid in selected and len(selected) > 1:
+            ids = selected
+        else:
+            ids = [sid]
+        n = len(ids)
 
-        relink_action = QAction("Relink...", menu)
-        relink_action.triggered.connect(lambda: self.relink_requested.emit(sid))
+        menu = QMenu(self)
+        # 'Open Info' is single-source only — opening N dialogs at once is
+        # noisy. Multi-select right-click skips it.
+        if n == 1:
+            info_action = QAction("Open Info", menu)
+            info_action.triggered.connect(
+                lambda: self.source_double_clicked.emit(sid))
+            menu.addAction(info_action)
+
+        relink_label = "Relink..." if n == 1 else f"Relink {n} sources..."
+        relink_action = QAction(relink_label, menu)
+        relink_action.triggered.connect(
+            lambda: self.relink_requested.emit(list(ids)))
         menu.addAction(relink_action)
 
         menu.addSeparator()
 
-        remove_action = QAction("Remove from Media Pool...", menu)
-        remove_action.triggered.connect(lambda: self.remove_requested.emit(sid))
+        remove_label = ("Remove from Media Pool..." if n == 1
+                        else f"Remove {n} sources from Media Pool...")
+        remove_action = QAction(remove_label, menu)
+        remove_action.triggered.connect(
+            lambda: self.remove_requested.emit(list(ids)))
         menu.addAction(remove_action)
 
         menu.exec(self._view.viewport().mapToGlobal(pos))
+
+    # --- Public API for shortcut-driven select-all ---
+
+    def select_all_sources(self):
+        """Select every entry in the source list. Wired to MainWindow's
+        Ctrl+A action when keyboard focus is inside the Media Pool."""
+        self._view.selectAll()
+        self._view.setFocus()
+
+    def _selected_source_ids(self) -> list:
+        """Return distinct source IDs for currently selected rows, in row
+        order (matches the visual top-to-bottom order)."""
+        ids = []
+        seen = set()
+        for idx in sorted(self._view.selectedIndexes(),
+                           key=lambda i: i.row()):
+            if not idx.isValid():
+                continue
+            sid = self._model.data(idx, Qt.ItemDataRole.UserRole)
+            if sid and sid not in seen:
+                seen.add(sid)
+                ids.append(sid)
+        return ids
 
     # --- Helpers ---
 

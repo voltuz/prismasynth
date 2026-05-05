@@ -487,7 +487,7 @@ class MainWindow(QMainWindow):
 
         select_all_action = QAction(icon("select-all"), "Select All", self)
         select_all_action.setShortcut(QKeySequence("Ctrl+A"))
-        select_all_action.triggered.connect(self._timeline.select_all)
+        select_all_action.triggered.connect(self._on_select_all)
         edit_menu.addAction(select_all_action)
 
         select_gap_action = QAction(icon("select-gap"), "Select to Gap Left", self)
@@ -731,15 +731,29 @@ class MainWindow(QMainWindow):
             self._source_info_dialog = SourceInfoDialog(self)
         self._source_info_dialog.show_for(src)
 
-    def _on_source_relink_requested(self, source_id: str):
-        src = self._sources.get(source_id)
-        if not src:
+    def _on_source_relink_requested(self, source_ids):
+        """Open RelinkDialog for the given source IDs (one or many)."""
+        # Tolerate the legacy single-id call shape from older signal wiring.
+        if isinstance(source_ids, str):
+            source_ids = [source_ids]
+        sources = {sid: self._sources[sid] for sid in source_ids
+                   if sid in self._sources}
+        if not sources:
             return
-        # Reuse RelinkDialog with a single-source dict.
-        dlg = RelinkDialog({source_id: src}, parent=self)
+        dlg = RelinkDialog(sources, parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
         self._apply_relink_results(dlg.resolved_paths(), dlg.probe_cache())
+
+    def _on_select_all(self):
+        """Ctrl+A handler. Routes by current keyboard focus: when the
+        Media Pool (or any of its children) has focus, select all sources
+        there; otherwise fall through to the timeline's select-all."""
+        fw = self.focusWidget()
+        if fw is not None and self._media_panel.isAncestorOf(fw):
+            self._media_panel.select_all_sources()
+            return
+        self._timeline.select_all()
 
     def _on_tools_relink(self):
         """Tools → Relink… shows every imported source so the user can repoint
@@ -848,7 +862,21 @@ class MainWindow(QMainWindow):
             self._update_status()
             self._timeline_widget.update()
 
-    def _on_source_remove_requested(self, source_id: str):
+    def _on_source_remove_requested(self, source_ids):
+        """Remove one or many sources from the Media Pool. Single-source
+        keeps the original confirm flow; multi-source aggregates the clip
+        count and shows one batch prompt."""
+        if isinstance(source_ids, str):
+            source_ids = [source_ids]
+        valid = [sid for sid in source_ids if sid in self._sources]
+        if not valid:
+            return
+        if len(valid) == 1:
+            self._remove_single_source(valid[0])
+        else:
+            self._remove_multi_sources(valid)
+
+    def _remove_single_source(self, source_id: str):
         src = self._sources.get(source_id)
         if not src:
             return
@@ -856,7 +884,6 @@ class MainWindow(QMainWindow):
         name = _Path(src.file_path).name
         clip_count = self._timeline.count_clips_for_source(source_id)
         if clip_count == 0:
-            # No clips reference this source — quick confirmation.
             if QMessageBox.question(
                 self, "Remove Source",
                 f"Remove '{name}' from the media pool?",
@@ -864,7 +891,6 @@ class MainWindow(QMainWindow):
                 return
             self._do_remove_source(source_id, remove_clips=False)
             return
-        # Has clips — show the 3-button confirm.
         dlg = RemoveSourceDialog(name, clip_count, parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
@@ -872,6 +898,32 @@ class MainWindow(QMainWindow):
             self._do_remove_source(source_id, remove_clips=True)
         elif dlg.action == RemoveSourceAction.REMOVE_KEEP_CLIPS:
             self._do_remove_source(source_id, remove_clips=False)
+
+    def _remove_multi_sources(self, source_ids: list):
+        n = len(source_ids)
+        total_clips = sum(
+            self._timeline.count_clips_for_source(sid) for sid in source_ids)
+        if total_clips == 0:
+            if QMessageBox.question(
+                self, "Remove Sources",
+                f"Remove {n} sources from the media pool?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            for sid in source_ids:
+                self._do_remove_source(sid, remove_clips=False)
+            return
+        # source_name is unused when source_count > 1 (the dialog formats
+        # its own message), but the parameter is positional.
+        dlg = RemoveSourceDialog("", total_clips,
+                                  source_count=n, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        if dlg.action == RemoveSourceAction.REMOVE_WITH_CLIPS:
+            for sid in source_ids:
+                self._do_remove_source(sid, remove_clips=True)
+        elif dlg.action == RemoveSourceAction.REMOVE_KEEP_CLIPS:
+            for sid in source_ids:
+                self._do_remove_source(sid, remove_clips=False)
 
     def _do_remove_source(self, source_id: str, *, remove_clips: bool):
         src = self._sources.get(source_id)
