@@ -91,8 +91,12 @@ class ExportDialog(QDialog):
     def __init__(self, default_width: int = 1920, default_height: int = 1080,
                  default_fps: float = 24.0, total_frames: int = 0,
                  render_frames: int = None, clip_count: int = 0,
-                 source_width: int = 0, source_height: int = 0, parent=None):
+                 source_width: int = 0, source_height: int = 0,
+                 timeline=None, parent=None):
         super().__init__(parent)
+        self._timeline = timeline
+        self._has_render_range = (
+            render_frames is not None and render_frames != total_frames)
         self.setWindowTitle("Export")
         self.setMinimumWidth(500)
         self.setModal(True)
@@ -313,29 +317,27 @@ class ExportDialog(QDialog):
         al.addLayout(aform)
         self._tabs.addTab(audio_tab, "Audio only")
 
+        # People-group filter — shared across all tabs. Hidden when the
+        # project has zero groups.
+        self._group_filter_widget = None
+        if timeline is not None:
+            from ui.group_filter_widget import GroupFilterWidget
+            self._group_filter_widget = GroupFilterWidget(timeline)
+            self._group_filter_widget.selection_changed.connect(
+                self._refresh_info)
+            layout.addWidget(self._group_filter_widget)
+
+        # Cached defaults so _refresh_info can recompute under filter changes.
+        self._default_clip_count = clip_count
+        self._default_total_frames = total_frames
+        self._default_render_frames = render_frames
+        self._source_width = source_width
+        self._source_height = source_height
+
         # Info stats
-        fps = default_fps if default_fps > 0 else 24.0
-        export_frames = render_frames if render_frames is not None else total_frames
-        duration_secs = export_frames / fps
-        mins, secs = divmod(int(duration_secs), 60)
-        hours, mins = divmod(mins, 60)
-        if hours > 0:
-            duration_str = f"{hours:d}:{mins:02d}:{secs:02d}"
-        else:
-            duration_str = f"{mins:d}:{secs:02d}"
-
-        if render_frames is not None and render_frames != total_frames:
-            frames_str = f"{render_frames:,} frames (in/out range of {total_frames:,})"
-        else:
-            frames_str = f"{total_frames:,} frames"
-
-        res_str = f"{source_width}x{source_height}" if source_width and source_height else ""
-        parts = [f"Clips: {clip_count}", frames_str, f"Duration: {duration_str}"]
-        if res_str:
-            parts.append(f"Source: {res_str}")
-        info_label = QLabel("  |  ".join(parts))
-        info_label.setStyleSheet("color: #aaa;")
-        layout.addWidget(info_label)
+        self._info_label = QLabel("")
+        self._info_label.setStyleSheet("color: #aaa;")
+        layout.addWidget(self._info_label)
 
         # Progress
         self._progress = QProgressBar()
@@ -370,6 +372,60 @@ class ExportDialog(QDialog):
         # Dialog state: "idle" (before run), "running", "done" (finished or
         # cancelled). The cancel button's label and action depend on this.
         self._state = "idle"
+
+        # First-time render of the info bar with whatever filter is active
+        # at construction (default: no filter — same numbers as before).
+        self._refresh_info()
+
+    def _refresh_info(self):
+        """Recompute clip / frame counts under the current group filter and
+        render them into the info label. Disables the Export button + shows
+        'Nothing to export' when the filter would produce zero clips."""
+        gf = (self._group_filter_widget.current_filter()
+              if self._group_filter_widget is not None else None)
+        if gf is None or self._timeline is None:
+            # No filter active — fall back to the precomputed defaults.
+            clip_count = self._default_clip_count
+            export_frames = (self._default_render_frames
+                             if self._default_render_frames is not None
+                             else self._default_total_frames)
+        else:
+            use_range = self._has_render_range
+            clip_count, export_frames = self._timeline.compute_export_extent(
+                include_gaps=False,
+                use_render_range=use_range,
+                group_filter=gf)
+        # Update the running totals so progress / ETA stay coherent.
+        self._total_export_frames = export_frames
+        # Format duration / frames / size strings as before.
+        fps = self._export_fps if self._export_fps > 0 else 24.0
+        duration_secs = export_frames / fps if fps else 0
+        mins, secs = divmod(int(duration_secs), 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            duration_str = f"{hours:d}:{mins:02d}:{secs:02d}"
+        else:
+            duration_str = f"{mins:d}:{secs:02d}"
+        if (gf is None and self._default_render_frames is not None
+                and self._default_render_frames != self._default_total_frames):
+            frames_str = (f"{export_frames:,} frames "
+                          f"(in/out range of {self._default_total_frames:,})")
+        else:
+            frames_str = f"{export_frames:,} frames"
+        parts = [f"Clips: {clip_count}", frames_str,
+                 f"Duration: {duration_str}"]
+        if self._source_width and self._source_height:
+            parts.append(f"Source: {self._source_width}x{self._source_height}")
+        if clip_count <= 0:
+            self._info_label.setText("Nothing to export — adjust the group filter.")
+            self._info_label.setStyleSheet("color: #e8a735;")
+            self._export_btn.setEnabled(False)
+        else:
+            self._info_label.setText("  |  ".join(parts))
+            self._info_label.setStyleSheet("color: #aaa;")
+            # Don't re-enable mid-run — only when idle.
+            if self._state == "idle":
+                self._export_btn.setEnabled(True)
 
     def _selected_codec_key(self):
         btn = self._codec_group.checkedButton()
@@ -575,6 +631,12 @@ class ExportDialog(QDialog):
                 "audio_format": audio_format,
                 "audio_output_path": audio_output,
             }
+
+        # Attach the active group filter (None when no checkbox is ticked).
+        if self._group_filter_widget is not None:
+            settings["group_filter"] = self._group_filter_widget.current_filter()
+        else:
+            settings["group_filter"] = None
 
         self._export_btn.setEnabled(False)
         self._progress.setVisible(True)

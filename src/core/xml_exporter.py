@@ -121,7 +121,8 @@ def _tc_format(fps: float) -> str:
 def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
                   output_path: str, include_gaps: bool = False,
                   use_render_range: bool = False, title: Optional[str] = None,
-                  fps: float = None):
+                  fps: float = None,
+                  group_filter: Optional[dict] = None):
     """Export timeline as an FCPXML 1.9 file.
 
     Args:
@@ -134,7 +135,11 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
         title: Project/event name. If None, derived from output_path basename
                so Resolve's "Load XML" dialog defaults to the file's name.
         fps: Sequence frame rate. If None, uses first source's FPS.
+        group_filter: Optional People-group filter. None = export all clips
+                      (current behaviour). Otherwise a dict matching the
+                      shape used by ``core.group.clip_matches_filter``.
     """
+    from core.group import clip_matches_filter
     clips = timeline.clips
     if not clips:
         return
@@ -179,6 +184,8 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
         if clip_end < render_start or clip_start > render_end:
             continue
         if clip.is_gap:
+            continue
+        if not clip_matches_filter(clip, group_filter):
             continue
         if clip.source_id not in seen and clip.source_id in sources:
             seen.add(clip.source_id)
@@ -262,6 +269,8 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
                 continue
             if clip.is_gap:
                 continue
+            if not clip_matches_filter(clip, group_filter):
+                continue
             eff_start = max(clip_start, render_start)
             eff_end = min(clip_end, render_end)
             seq_duration_frames += eff_end - eff_start + 1
@@ -307,6 +316,9 @@ def export_fcpxml(timeline: TimelineModel, sources: Dict[str, VideoSource],
                     f'duration="{_time_str(eff_duration, frame_num, frame_den)}"/>'
                 )
                 gap_counter += 1
+            continue
+
+        if not clip_matches_filter(clip, group_filter):
             continue
 
         source = sources.get(clip.source_id)

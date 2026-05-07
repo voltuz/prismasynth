@@ -95,6 +95,9 @@ class Exporter(QObject):
         self._cancelled = False
         self._active_procs: List[subprocess.Popen] = []
         self._procs_lock = threading.Lock()
+        # People-group filter — set per-export from the settings dict in
+        # _run_export. None means "export all clips" (current behaviour).
+        self._group_filter: Optional[dict] = None
 
     def _register_proc(self, proc: subprocess.Popen):
         with self._procs_lock:
@@ -123,7 +126,9 @@ class Exporter(QObject):
 
     def _build_segments(self) -> List[Tuple]:
         """Build list of (source_path, source_in, frame_count, source_fps, source_id)
-        segments clipped to the render range."""
+        segments clipped to the render range. People-group filter (when set
+        on the Exporter) excludes non-matching clips."""
+        from core.group import clip_matches_filter
         clips = self._timeline.clips
         render_start, render_end = self._timeline.get_render_range()
         segments = []
@@ -135,6 +140,8 @@ class Exporter(QObject):
             if clip_end < render_start or clip_start > render_end:
                 continue
             if clip.is_gap:
+                continue
+            if not clip_matches_filter(clip, self._group_filter):
                 continue
             source = self._sources.get(clip.source_id)
             if source is None:
@@ -255,6 +262,9 @@ class Exporter(QObject):
 
     def _run_export(self, settings: dict):
         try:
+            # Capture the group filter once so every downstream method
+            # (_build_segments, _export_audio_only, etc.) sees the same value.
+            self._group_filter = settings.get("group_filter")
             if settings["mode"] == "video":
                 self._export_video(settings)
             elif settings["mode"] == "image_sequence":

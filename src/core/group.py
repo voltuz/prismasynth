@@ -46,3 +46,26 @@ class Group:
             color=d.get("color", "#888888"),
             digit=d.get("digit"),
         )
+
+
+def clip_matches_filter(clip, group_filter) -> bool:
+    """Decide whether a clip should be included under a group filter.
+
+    Filter encoding:
+      - ``None``                                → no filter (all clips pass)
+      - ``{"group_ids": [...], "include_untagged": bool}``
+                                                → filter active
+
+    Match rule:
+      - No filter active → always match.
+      - Clip with no groups → match iff ``include_untagged`` is true.
+      - Clip with groups → match iff at least one of its groups is in
+        ``group_ids``.
+    """
+    if group_filter is None:
+        return True
+    gids = clip.group_ids
+    if not gids:
+        return bool(group_filter.get("include_untagged", False))
+    selected = set(group_filter.get("group_ids", []))
+    return any(g in selected for g in gids)

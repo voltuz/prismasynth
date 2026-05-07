@@ -1710,6 +1710,7 @@ class MainWindow(QMainWindow):
             include_gaps=settings["include_gaps"],
             use_render_range=settings["use_render_range"],
             fps=fps,
+            group_filter=settings.get("group_filter"),
         )
 
     def _on_export_otio(self):
@@ -1735,6 +1736,7 @@ class MainWindow(QMainWindow):
             include_gaps=settings["include_gaps"],
             use_render_range=settings["use_render_range"],
             fps=fps,
+            group_filter=settings.get("group_filter"),
         )
 
     def _show_export_dialog(self, tab: int = 0):
@@ -1755,7 +1757,7 @@ class MainWindow(QMainWindow):
 
         dialog = ExportDialog(w, h, fps, export_frames, render_frames=render_frames,
                               clip_count=clip_count, source_width=w, source_height=h,
-                              parent=self)
+                              timeline=self._timeline, parent=self)
         dialog._tabs.setCurrentIndex(tab)
         dialog.export_requested.connect(
             lambda settings: self._run_export(settings, dialog)

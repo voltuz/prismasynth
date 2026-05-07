@@ -52,6 +52,12 @@ class XmlDialog(QDialog):
         self._range_check.stateChanged.connect(self._refresh_info)
         layout.addWidget(self._range_check)
 
+        # People-group filter (hidden when there are no groups).
+        from ui.group_filter_widget import GroupFilterWidget
+        self._group_filter_widget = GroupFilterWidget(timeline)
+        self._group_filter_widget.selection_changed.connect(self._refresh_info)
+        layout.addWidget(self._group_filter_widget)
+
         form = QFormLayout()
         self._output = QLineEdit()
         browse_btn = QPushButton("Browse...")
@@ -67,9 +73,9 @@ class XmlDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        export_btn = QPushButton("Export")
-        export_btn.clicked.connect(self._export)
-        btn_layout.addWidget(export_btn)
+        self._export_btn = QPushButton("Export")
+        self._export_btn.clicked.connect(self._export)
+        btn_layout.addWidget(self._export_btn)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
@@ -80,15 +86,25 @@ class XmlDialog(QDialog):
     def _refresh_info(self):
         include_gaps = self._gaps_check.isChecked()
         use_range = self._range_check.isChecked() and self._range_check.isEnabled()
-        clips, frames = self._timeline.compute_export_extent(include_gaps, use_range)
+        gf = self._group_filter_widget.current_filter()
+        clips, frames = self._timeline.compute_export_extent(
+            include_gaps, use_range, group_filter=gf)
         secs_total = int(frames / self._fps) if self._fps > 0 else 0
         h, rem = divmod(secs_total, 3600)
         m, s = divmod(rem, 60)
         time_str = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
-        self._info_label.setText(
-            f"{clips} clips  |  {frames:,} frames  |  {time_str}"
-        )
-        audio = self._timeline.get_export_audio_summary(self._sources, use_range)
+        if clips <= 0:
+            self._info_label.setText("Nothing to export — adjust the group filter.")
+            self._info_label.setStyleSheet("color: #e8a735;")
+            self._export_btn.setEnabled(False)
+        else:
+            self._info_label.setText(
+                f"{clips} clips  |  {frames:,} frames  |  {time_str}"
+            )
+            self._info_label.setStyleSheet("color: #aaa;")
+            self._export_btn.setEnabled(True)
+        audio = self._timeline.get_export_audio_summary(
+            self._sources, use_range, group_filter=gf)
         self._audio_label.setText(f"Audio: {audio}")
         # Highlight when the export will be silent so the user notices
         # before they spend minutes waiting for an audio-less file.
@@ -113,5 +129,6 @@ class XmlDialog(QDialog):
             "output_path": output,
             "include_gaps": self._gaps_check.isChecked(),
             "use_render_range": self._range_check.isChecked(),
+            "group_filter": self._group_filter_widget.current_filter(),
         })
         self._status.setText("FCPXML exported!")

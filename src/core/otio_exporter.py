@@ -124,7 +124,8 @@ def _gap_element(duration: int, rate: float) -> dict:
 def export_otio(timeline: TimelineModel, sources: Dict[str, VideoSource],
                 output_path: str, include_gaps: bool = False,
                 use_render_range: bool = False, title: Optional[str] = None,
-                fps: float = None):
+                fps: float = None,
+                group_filter: Optional[dict] = None):
     """Export timeline as an OpenTimelineIO (.otio) JSON file.
 
     Args:
@@ -138,7 +139,10 @@ def export_otio(timeline: TimelineModel, sources: Dict[str, VideoSource],
         title: Timeline name stored in the OTIO file. If None, derived from
                output_path basename so importers default to the file's name.
         fps: Sequence frame rate. If None, uses first source's FPS.
+        group_filter: Optional People-group filter. None = export all clips
+                      (current behaviour). See ``core.group.clip_matches_filter``.
     """
+    from core.group import clip_matches_filter
     clips = timeline.clips
     if not clips:
         return
@@ -194,6 +198,9 @@ def export_otio(timeline: TimelineModel, sources: Dict[str, VideoSource],
             if include_gaps:
                 track_children.append(_gap_element(eff_duration, fps))
                 emitted_any = True
+            continue
+
+        if not clip_matches_filter(clip, group_filter):
             continue
 
         source = sources.get(clip.source_id)

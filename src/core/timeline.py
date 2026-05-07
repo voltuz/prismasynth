@@ -499,11 +499,14 @@ class TimelineModel(QObject):
         end = min(end, total - 1)
         return (start, end)
 
-    def get_used_source_ids(self, use_render_range: bool) -> list:
+    def get_used_source_ids(self, use_render_range: bool,
+                            group_filter: Optional[dict] = None) -> list:
         """Return source IDs referenced by non-gap clips that would be exported,
         in first-encountered order. Mirrors the iteration in xml_exporter /
         otio_exporter so the export dialog's audio summary matches what the
-        actual exporter would emit."""
+        actual exporter would emit. ``group_filter`` (default None = no
+        filter) excludes clips that don't match the People-group selection."""
+        from core.group import clip_matches_filter
         if use_render_range:
             r_start, r_end = self.get_render_range()
         else:
@@ -521,6 +524,8 @@ class TimelineModel(QObject):
                 continue
             if c.is_gap or c.source_id is None:
                 continue
+            if not clip_matches_filter(c, group_filter):
+                continue
             if c.source_id in seen:
                 continue
             seen.add(c.source_id)
@@ -528,7 +533,8 @@ class TimelineModel(QObject):
         return used
 
     def get_export_audio_summary(self, sources: dict,
-                                 use_render_range: bool) -> str:
+                                 use_render_range: bool,
+                                 group_filter: Optional[dict] = None) -> str:
         """One-line audio summary for the sources that would be exported.
 
         Returns:
@@ -537,8 +543,10 @@ class TimelineModel(QObject):
             sources share the same audio config
           - 'mixed (N ch and silent)' when some have audio and others don't
           - 'mixed' when multiple distinct audio configs are present
+
+        ``group_filter`` mirrors ``compute_export_extent`` semantics.
         """
-        used = self.get_used_source_ids(use_render_range)
+        used = self.get_used_source_ids(use_render_range, group_filter)
         descs = []
         for sid in used:
             src = sources.get(sid)
@@ -557,11 +565,18 @@ class TimelineModel(QObject):
         return "mixed"
 
     def compute_export_extent(self, include_gaps: bool,
-                              use_render_range: bool) -> Tuple[int, int]:
-        """Counts (real_clips, frames) that would be exported under the given flags.
-        Mirrors what xml_exporter / otio_exporter actually emit so the export
-        dialog's info text matches the produced file.
+                              use_render_range: bool,
+                              group_filter: Optional[dict] = None
+                              ) -> Tuple[int, int]:
+        """Counts (real_clips, frames) that would be exported under the given
+        flags. Mirrors what xml_exporter / otio_exporter actually emit so the
+        export dialog's info text matches the produced file.
+
+        ``group_filter`` (default ``None`` = no filter) excludes clips that
+        don't match the People-group selection — see
+        ``core.group.clip_matches_filter`` for the encoding.
         """
+        from core.group import clip_matches_filter
         if use_render_range:
             r_start, r_end = self.get_render_range()
         else:
@@ -582,6 +597,8 @@ class TimelineModel(QObject):
                 if include_gaps:
                     frames += in_range_dur
             else:
+                if not clip_matches_filter(c, group_filter):
+                    continue
                 clips += 1
                 frames += in_range_dur
         return clips, frames
