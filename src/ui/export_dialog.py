@@ -103,7 +103,32 @@ class ExportDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Tabs for Video vs Image Sequence
+        # Shared options: gap inclusion + render-range opt-out. They sit
+        # ABOVE the tabs so the user sees them as project-wide and they
+        # apply to whichever export tab they trigger.
+        from PySide6.QtWidgets import QCheckBox
+        opts_row = QHBoxLayout()
+        self._include_gaps_check = QCheckBox("Include gaps between clips")
+        self._include_gaps_check.setToolTip(
+            "When checked, gap clips on the timeline are included in the\n"
+            "export — Video / Image / Audio render black frames + silence;\n"
+            "XML / OTIO emit gap markers."
+        )
+        self._include_gaps_check.stateChanged.connect(self._refresh_info)
+        opts_row.addWidget(self._include_gaps_check)
+        self._use_range_check = QCheckBox("Use in/out render range")
+        self._use_range_check.setToolTip(
+            "Restrict the export to clips inside the timeline's in/out\n"
+            "range. Disabled when no in/out points are set."
+        )
+        self._use_range_check.setEnabled(self._has_render_range)
+        self._use_range_check.setChecked(self._has_render_range)
+        self._use_range_check.stateChanged.connect(self._refresh_info)
+        opts_row.addWidget(self._use_range_check)
+        opts_row.addStretch()
+        layout.addLayout(opts_row)
+
+        # Tabs: Video / Image Seq / Audio Only / XML / OTIO
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs)
 
@@ -317,6 +342,42 @@ class ExportDialog(QDialog):
         al.addLayout(aform)
         self._tabs.addTab(audio_tab, "Audio only")
 
+        # --- XML (FCPXML) tab — output path only; shared options apply ---
+        xml_tab = QWidget()
+        xl = QVBoxLayout(xml_tab)
+        xform = QFormLayout()
+        self._xml_output = QLineEdit()
+        xml_browse_btn = QPushButton("Browse...")
+        xml_browse_btn.clicked.connect(self._browse_xml_output)
+        xml_out_layout = QHBoxLayout()
+        xml_out_layout.addWidget(self._xml_output, 1)
+        xml_out_layout.addWidget(xml_browse_btn)
+        xform.addRow("Output:", xml_out_layout)
+        xl.addLayout(xform)
+        xl.addWidget(QLabel(
+            "Final Cut Pro XML 1.9. Open in DaVinci Resolve / Premiere /"
+            " Final Cut Pro."))
+        xl.addStretch(1)
+        self._tabs.addTab(xml_tab, "XML")
+
+        # --- OTIO tab — output path only; shared options apply ---
+        otio_tab = QWidget()
+        ol = QVBoxLayout(otio_tab)
+        oform = QFormLayout()
+        self._otio_output = QLineEdit()
+        otio_browse_btn = QPushButton("Browse...")
+        otio_browse_btn.clicked.connect(self._browse_otio_output)
+        otio_out_layout = QHBoxLayout()
+        otio_out_layout.addWidget(self._otio_output, 1)
+        otio_out_layout.addWidget(otio_browse_btn)
+        oform.addRow("Output:", otio_out_layout)
+        ol.addLayout(oform)
+        ol.addWidget(QLabel(
+            "OpenTimelineIO native JSON. Imported directly by"
+            " DaVinci Resolve Studio."))
+        ol.addStretch(1)
+        self._tabs.addTab(otio_tab, "OTIO")
+
         # People-group filter — shared across all tabs. Hidden when the
         # project has zero groups.
         self._group_filter_widget = None
@@ -383,18 +444,29 @@ class ExportDialog(QDialog):
         'Nothing to export' when the filter would produce zero clips."""
         gf = (self._group_filter_widget.current_filter()
               if self._group_filter_widget is not None else None)
-        if gf is None or self._timeline is None:
-            # No filter active — fall back to the precomputed defaults.
+        include_gaps = (self._include_gaps_check.isChecked()
+                        if hasattr(self, "_include_gaps_check") else False)
+        use_range = (self._use_range_check.isChecked()
+                     and self._use_range_check.isEnabled()
+                     if hasattr(self, "_use_range_check")
+                     else self._has_render_range)
+        if (gf is None and self._timeline is None
+                and not include_gaps and use_range == self._has_render_range):
+            # Nothing affecting the count — fall back to the precomputed defaults.
             clip_count = self._default_clip_count
             export_frames = (self._default_render_frames
                              if self._default_render_frames is not None
                              else self._default_total_frames)
-        else:
-            use_range = self._has_render_range
+        elif self._timeline is not None:
             clip_count, export_frames = self._timeline.compute_export_extent(
-                include_gaps=False,
+                include_gaps=include_gaps,
                 use_render_range=use_range,
                 group_filter=gf)
+        else:
+            clip_count = self._default_clip_count
+            export_frames = (self._default_render_frames
+                             if self._default_render_frames is not None
+                             else self._default_total_frames)
         # Update the running totals so progress / ETA stay coherent.
         self._total_export_frames = export_frames
         # Format duration / frames / size strings as before.
@@ -522,6 +594,22 @@ class ExportDialog(QDialog):
         if path:
             self._img_output_dir.setText(path)
 
+    def _browse_xml_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save FCPXML", "", "Final Cut Pro XML (*.fcpxml)")
+        if path:
+            if not path.lower().endswith(".fcpxml"):
+                path += ".fcpxml"
+            self._xml_output.setText(path)
+
+    def _browse_otio_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save OpenTimelineIO", "", "OpenTimelineIO (*.otio)")
+        if path:
+            if not path.lower().endswith(".otio"):
+                path += ".otio"
+            self._otio_output.setText(path)
+
     def _browse_audio_tab_output(self):
         fmt_key = self._aud_format_combo.currentData() or "wav"
         ext = AUDIO_FORMAT_PRESETS[fmt_key]["ext"]
@@ -605,7 +693,7 @@ class ExportDialog(QDialog):
                 "width": self._img_width.value(),
                 "height": self._img_height.value(),
             }
-        else:
+        elif idx == 2:
             # Audio-only export
             audio_format = self._aud_format_combo.currentData() or "wav"
             ext = AUDIO_FORMAT_PRESETS[audio_format]["ext"]
@@ -631,12 +719,44 @@ class ExportDialog(QDialog):
                 "audio_format": audio_format,
                 "audio_output_path": audio_output,
             }
+        elif idx == 3:
+            # XML (FCPXML) export
+            output = self._xml_output.text().strip()
+            if not output:
+                self._status_label.setText(
+                    "Please specify an output path.")
+                return
+            if not output.lower().endswith(".fcpxml"):
+                output += ".fcpxml"
+            settings = {
+                "mode": "xml",
+                "output_path": output,
+            }
+        else:
+            # OTIO export
+            output = self._otio_output.text().strip()
+            if not output:
+                self._status_label.setText(
+                    "Please specify an output path.")
+                return
+            if not output.lower().endswith(".otio"):
+                output += ".otio"
+            settings = {
+                "mode": "otio",
+                "output_path": output,
+            }
 
         # Attach the active group filter (None when no checkbox is ticked).
         if self._group_filter_widget is not None:
             settings["group_filter"] = self._group_filter_widget.current_filter()
         else:
             settings["group_filter"] = None
+        # Shared options — always carried in every emitted settings dict so
+        # the exporter doesn't need a per-mode default.
+        settings["include_gaps"] = self._include_gaps_check.isChecked()
+        settings["use_render_range"] = (
+            self._use_range_check.isChecked()
+            and self._use_range_check.isEnabled())
 
         self._export_btn.setEnabled(False)
         self._progress.setVisible(True)

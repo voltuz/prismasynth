@@ -1688,19 +1688,8 @@ class MainWindow(QMainWindow):
         self._show_export_dialog(tab=2)
 
     def _on_export_xml(self):
-        if self._timeline.clip_count == 0:
-            QMessageBox.information(self, "Export XML", "No clips to export.")
-            return
-        from ui.xml_dialog import XmlDialog
-        first_source = next(iter(self._sources.values()), None)
-        fps = first_source.fps if first_source else 24.0
-        has_range = (self._timeline.in_point is not None
-                     or self._timeline.out_point is not None)
-        dialog = XmlDialog(self._timeline, self._sources, fps,
-                           has_render_range=has_range, parent=self)
-        dialog.export_requested.connect(
-            lambda s: self._run_xml_export(s, dialog))
-        dialog.exec()
+        # XML lives as a tab in the unified ExportDialog now.
+        self._show_export_dialog(tab=3)
 
     def _run_xml_export(self, settings: dict, dialog):
         first_source = next(iter(self._sources.values()), None)
@@ -1714,19 +1703,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_export_otio(self):
-        if self._timeline.clip_count == 0:
-            QMessageBox.information(self, "Export OTIO", "No clips to export.")
-            return
-        from ui.otio_dialog import OtioDialog
-        first_source = next(iter(self._sources.values()), None)
-        fps = first_source.fps if first_source else 24.0
-        has_range = (self._timeline.in_point is not None
-                     or self._timeline.out_point is not None)
-        dialog = OtioDialog(self._timeline, self._sources, fps,
-                            has_render_range=has_range, parent=self)
-        dialog.export_requested.connect(
-            lambda s: self._run_otio_export(s, dialog))
-        dialog.exec()
+        # OTIO lives as a tab in the unified ExportDialog now.
+        self._show_export_dialog(tab=4)
 
     def _run_otio_export(self, settings: dict, dialog):
         first_source = next(iter(self._sources.values()), None)
@@ -1765,6 +1743,17 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _run_export(self, settings: dict, dialog: ExportDialog):
+        mode = settings.get("mode", "video")
+        # XML and OTIO are timeline-interchange formats — single-shot export
+        # via their respective writers, no Exporter / progress signals.
+        if mode == "xml":
+            self._run_xml_export(settings, dialog)
+            dialog.export_finished()
+            return
+        if mode == "otio":
+            self._run_otio_export(settings, dialog)
+            dialog.export_finished()
+            return
         self._exporter = Exporter(
             self._timeline, self._sources
         )

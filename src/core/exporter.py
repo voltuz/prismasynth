@@ -98,6 +98,16 @@ class Exporter(QObject):
         # People-group filter — set per-export from the settings dict in
         # _run_export. None means "export all clips" (current behaviour).
         self._group_filter: Optional[dict] = None
+        # Render-range + gap flags, also set per-export from settings.
+        # Defaults preserve the historical behaviour: render range is
+        # always honoured, gaps are skipped.
+        self._use_render_range: bool = True
+        self._include_gaps: bool = False
+        # Cached export resolution / fps so gap segments can be rendered
+        # at the right size + frame rate via lavfi.
+        self._export_width: int = 0
+        self._export_height: int = 0
+        self._export_fps: float = 24.0
 
     def _register_proc(self, proc: subprocess.Popen):
         with self._procs_lock:
@@ -126,11 +136,22 @@ class Exporter(QObject):
 
     def _build_segments(self) -> List[Tuple]:
         """Build list of (source_path, source_in, frame_count, source_fps, source_id)
-        segments clipped to the render range. People-group filter (when set
-        on the Exporter) excludes non-matching clips."""
+        segments clipped to the render range.
+
+        - When ``self._include_gaps`` is True, gap clips are emitted as gap
+          segments (``source_path=None``, ``source_id=None``) which
+          downstream code renders as black + silence.
+        - When ``self._use_render_range`` is False, the in/out range is
+          ignored and the full timeline is used.
+        - The People-group filter applies only to non-gap clips."""
         from core.group import clip_matches_filter
         clips = self._timeline.clips
-        render_start, render_end = self._timeline.get_render_range()
+        if self._use_render_range:
+            render_start, render_end = self._timeline.get_render_range()
+        else:
+            total = self._timeline.get_total_duration_frames()
+            render_start, render_end = 0, max(total - 1, 0)
+        gap_fps = self._export_fps if self._export_fps > 0 else 24.0
         segments = []
         pos = 0
         for clip in clips:
@@ -139,28 +160,37 @@ class Exporter(QObject):
             pos += clip.duration_frames
             if clip_end < render_start or clip_start > render_end:
                 continue
+            effective_start = max(clip_start, render_start)
+            effective_end = min(clip_end, render_end)
+            frame_count = effective_end - effective_start + 1
             if clip.is_gap:
+                if not self._include_gaps:
+                    continue
+                # source_path=None signals a gap; downstream renders
+                # black + silence using lavfi color + anullsrc.
+                segments.append((None, 0, frame_count, gap_fps, None))
                 continue
             if not clip_matches_filter(clip, self._group_filter):
                 continue
             source = self._sources.get(clip.source_id)
             if source is None:
                 continue
-            effective_start = max(clip_start, render_start)
-            effective_end = min(clip_end, render_end)
             offset_in_clip = effective_start - clip_start
             src_in = clip.source_in + offset_in_clip
-            frame_count = effective_end - effective_start + 1
             segments.append((source.file_path, src_in, frame_count, source.fps, clip.source_id))
         return segments
 
     def _build_source_groups(self):
-        """Group segments by source and coalesce contiguous clips."""
+        """Group segments by source and coalesce contiguous clips. Gap
+        segments (sid=None) are excluded — they have no source to coalesce
+        into and flow through to the encoder as orphan flat segments."""
         segments = self._build_segments()
         if not segments:
             return {}
         groups = {}
         for path, src_in, count, fps, sid in segments:
+            if sid is None:
+                continue  # gap segment, handled separately
             if sid not in groups:
                 groups[sid] = {"path": path, "fps": fps, "segments": [],
                                "total_frames": 0}
@@ -265,6 +295,12 @@ class Exporter(QObject):
             # Capture the group filter once so every downstream method
             # (_build_segments, _export_audio_only, etc.) sees the same value.
             self._group_filter = settings.get("group_filter")
+            # Capture range + gap flags + export geometry for gap rendering.
+            self._use_render_range = settings.get("use_render_range", True)
+            self._include_gaps = settings.get("include_gaps", False)
+            self._export_width = int(settings.get("width", 0) or 0)
+            self._export_height = int(settings.get("height", 0) or 0)
+            self._export_fps = float(settings.get("fps", 0) or 24.0)
             if settings["mode"] == "video":
                 self._export_video(settings)
             elif settings["mode"] == "image_sequence":
@@ -317,8 +353,8 @@ class Exporter(QObject):
         audio_mode = settings.get("audio_mode", "embedded")
         strip_audio = (audio_mode == "none")
 
-        groups = self._build_source_groups()
-        if not groups:
+        raw_segments = self._build_segments()
+        if not raw_segments:
             self.status.emit("Nothing to export")
             return
 
@@ -329,14 +365,14 @@ class Exporter(QObject):
         cpu_count = os.cpu_count() or 8
         max_parallel = 6 if is_nvenc else max(2, cpu_count // 4)
 
-        # Flatten coalesced segments back out with per-source VF chains.
-        # Cache HDR detection on the group dict so probe_hdr runs once per
-        # source rather than 2-3x per export.
-        flat_segments = []  # [(source_path, src_in, count, fps, vf, hw_args, is_hdr, src_w, src_h, has_audio)]
-        for sid, group in groups.items():
+        # Pre-compute per-source render params (HDR / vf / hw args / etc.)
+        # so the timeline-walk below can look them up without re-probing.
+        source_params: dict = {}
+        for path, src_in, count, fps, sid in raw_segments:
+            if sid is None or sid in source_params:
+                continue
             source = self._sources.get(sid)
-            group["is_hdr"] = probe_hdr(group["path"])
-            is_hdr = group["is_hdr"]
+            is_hdr = probe_hdr(path)
             use_gpu_tm = gpu_available and is_hdr
             hw = self._gpu_hw_args(opencl_device) if use_gpu_tm else []
             src_w = source.width if source else 0
@@ -353,14 +389,33 @@ class Exporter(QObject):
                     width, height, use_gpu_tm, is_hdr=is_hdr,
                     source_width=src_w, source_height=src_h,
                 )
-            for src_in, count in group["segments"]:
+            source_params[sid] = {
+                "path": path, "fps": fps, "vf": vf, "hw": hw,
+                "is_hdr": is_hdr, "src_w": src_w, "src_h": src_h,
+                "has_audio": has_audio,
+            }
+
+        # Build flat_segments in TIMELINE ORDER (so concat produces a
+        # correctly-ordered output and gap segments slot into their place
+        # between real clips).
+        flat_segments = []  # [(source_path|None, src_in, count, fps, vf, hw, is_hdr, src_w, src_h, has_audio)]
+        for path, src_in, count, fps, sid in raw_segments:
+            if sid is None:
+                # Gap: synthetic params, rendered with lavfi color + anullsrc
+                # downstream in _build_segment_cmd.
                 flat_segments.append(
-                    (group["path"], src_in, count, group["fps"], vf, hw,
-                     is_hdr, src_w, src_h, has_audio))
+                    (None, 0, count, fps, None, [], False, 0, 0, False))
+            else:
+                p = source_params.get(sid)
+                if p is None:
+                    continue
+                flat_segments.append(
+                    (p["path"], src_in, count, p["fps"], p["vf"], p["hw"],
+                     p["is_hdr"], p["src_w"], p["src_h"], p["has_audio"]))
 
         total_frames = sum(s[2] for s in flat_segments)
         suffix = ""
-        if any(g["is_hdr"] for g in groups.values()):
+        if any(p["is_hdr"] for p in source_params.values()):
             suffix = " (GPU tonemap)" if gpu_available else " (CPU tonemap)"
         self.status.emit(
             f"Encoding {len(flat_segments)} segments to {output_path}...{suffix}")
@@ -368,6 +423,33 @@ class Exporter(QObject):
         def _build_segment_cmd(path, src_in, count, src_fps, vf, hw, hdr,
                                src_w, src_h, has_audio, out_file):
             """Build FFmpeg command for a single segment."""
+            # Gap branch: render black frames + (optionally) silent audio
+            # using lavfi sources. No source decode involved.
+            if path is None:
+                gap_dur = count / src_fps if src_fps > 0 else 0.0
+                gap_cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
+                           "-f", "lavfi", "-t", f"{gap_dur:.6f}",
+                           "-i", f"color=c=black:s={width}x{height}:r={fps}"]
+                if not strip_audio:
+                    gap_cmd += ["-f", "lavfi", "-t", f"{gap_dur:.6f}",
+                                "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+                if not is_nvenc:
+                    threads_per = max(2, cpu_count // max_parallel)
+                    gap_cmd += ["-threads", str(threads_per)]
+                gap_cmd += ["-map", "0:v:0"]
+                if strip_audio:
+                    gap_cmd += ["-an"]
+                else:
+                    out_ext_g = os.path.splitext(out_file)[1].lower()
+                    audio_codec_g, audio_extra_g = _AUDIO_CODEC_FOR_EXT.get(
+                        out_ext_g, ("pcm_s16le", []))
+                    gap_cmd += ["-map", "1:a:0",
+                                "-c:a", audio_codec_g, *audio_extra_g,
+                                "-ar", "48000", "-ac", "2"]
+                gap_cmd += ["-fps_mode", "passthrough",
+                            "-video_track_timescale", "24000000"]
+                gap_cmd += ffmpeg_args + [out_file]
+                return gap_cmd
             ss = self._frame_to_seek_ts(src_in, src_fps)
             hwaccel = ["-hwaccel", "cuda"]
             # SDR + NVENC: full GPU pipeline (zero-copy). scale_cuda
@@ -660,9 +742,32 @@ class Exporter(QObject):
             temp_ext.lower(), ("pcm_s16le", []))
 
         for i, (source_path, src_in, duration, src_fps, _sid) in enumerate(segments):
-            ss = self._frame_to_seek_ts(src_in, src_fps)
             tmp = os.path.join(temp_dir, f"seg_{i:04d}{temp_ext}")
             temp_files.append(tmp)
+            # Gap segment: render black + (optionally) silent audio with
+            # lavfi sources. No source decode involved.
+            if source_path is None:
+                gap_dur = duration / src_fps if src_fps > 0 else 0.0
+                gap_cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
+                           "-f", "lavfi", "-t", f"{gap_dur:.6f}",
+                           "-i", f"color=c=black:s={self._export_width}x{self._export_height}:r={fps}"]
+                if not strip_audio:
+                    gap_cmd += ["-f", "lavfi", "-t", f"{gap_dur:.6f}",
+                                "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+                gap_cmd += ["-map", "0:v:0"]
+                if strip_audio:
+                    gap_cmd += ["-an"]
+                else:
+                    gap_cmd += ["-map", "1:a:0",
+                                "-c:a", audio_codec, *audio_extra,
+                                "-ar", "48000", "-ac", "2"]
+                gap_cmd += ["-fps_mode", "passthrough",
+                            "-video_track_timescale", "24000000"]
+                gap_cmd += ffmpeg_args + [tmp]
+                commands.append((gap_cmd, duration))
+                continue
+
+            ss = self._frame_to_seek_ts(src_in, src_fps)
             src = self._sources.get(_sid)
             has_audio = bool(src and src.audio_channels > 0)
             audio_dur = duration / src_fps
@@ -841,6 +946,17 @@ class Exporter(QObject):
                 temp_files.append(tmp)
 
                 cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+                if src_path is None:
+                    # Gap segment — emit silence for the gap duration.
+                    cmd += [
+                        "-f", "lavfi", "-t", f"{audio_dur:.6f}",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        "-vn",
+                    ]
+                    cmd += ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", tmp]
+                    commands.append(cmd)
+                    continue
+
                 if has_audio:
                     # Same two-stage seek as video: pre-input cheap keyframe
                     # jump + post-input precise discard. The half-frame
@@ -1037,11 +1153,23 @@ class Exporter(QObject):
 
     def _iter_frames_ffmpeg(self, width: int, height: int):
         """Iterate frames using ffmpeg decode with HDR->SDR tone mapping.
-        Uses single-process-per-source with select filter for efficiency."""
+        Uses single-process-per-source with select filter for efficiency.
+
+        When ``self._include_gaps`` is True, gap-segment frames (black) are
+        yielded after the source frames. Image-sequence output isn't
+        strictly timeline-ordered already (each source's frames stream
+        contiguously), so gap frames at the tail keeps the existing
+        non-timeline semantic intact."""
         groups = self._build_source_groups()
-        if not groups:
+        # Compute gap-frame count up front so we know whether to emit any.
+        gap_frames_total = 0
+        if self._include_gaps:
+            for path, _src_in, count, _fps, sid in self._build_segments():
+                if sid is None:
+                    gap_frames_total += count
+        if not groups and gap_frames_total == 0:
             return
-        total = sum(g["total_frames"] for g in groups.values())
+        total = sum(g["total_frames"] for g in groups.values()) + gap_frames_total
         frame_count = 0
         frame_size = width * height * 3
 
@@ -1121,6 +1249,17 @@ class Exporter(QObject):
                 except (subprocess.TimeoutExpired, OSError):
                     pass
                 self._unregister_proc(proc)
+
+        # Gap frames — black images for include_gaps=True.
+        if gap_frames_total > 0:
+            black = np.zeros((height, width, 3), dtype=np.uint8)
+            for _ in range(gap_frames_total):
+                if self._cancelled:
+                    return
+                yield black
+                frame_count += 1
+                if total > 0 and frame_count % max(1, total // 200) == 0:
+                    self.progress.emit(min(99, int(frame_count / total * 100)))
 
     @staticmethod
     def _save_exr(frame_rgb: np.ndarray, path: str):
