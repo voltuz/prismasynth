@@ -9,7 +9,7 @@ panel is also the only path to manage groups without a digit.
 
 from typing import Dict, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QColorDialog, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from core.group import Group
 from core.timeline import TimelineModel
+from ui.icon_loader import icon
 
 
 _DIGIT_NONE = "—"
@@ -84,12 +85,14 @@ class _GroupRow(QWidget):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self._count_label)
 
-        self._delete_btn = QPushButton("✕")
+        self._delete_btn = QPushButton()
+        self._delete_btn.setIcon(icon("trash"))
+        self._delete_btn.setIconSize(QSize(14, 14))
         self._delete_btn.setFixedSize(22, 22)
         self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._delete_btn.setToolTip("Remove group")
         self._delete_btn.setStyleSheet(
-            "QPushButton { color: #e87a75; background: transparent;"
+            "QPushButton { background: transparent;"
             " border: 1px solid #555; border-radius: 3px; }"
             "QPushButton:hover { background: rgba(232, 122, 117, 40); }")
         self._delete_btn.clicked.connect(
