@@ -11,8 +11,8 @@ class Clip:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     label: str = ""
     color_index: int = 0
-    # Group (People) memberships. Order is preserved so the timeline
-    # label strip renders them in user-assigned order.
+    # Group (People) memberships. Stored in toggle order; the timeline
+    # label strip sorts by digit at paint time for stable chip ordering.
     group_ids: list = field(default_factory=list)
 
     @property

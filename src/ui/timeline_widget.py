@@ -602,10 +602,12 @@ class TimelineStrip(QWidget):
         if not clip.group_ids:
             return
         groups = self._model.groups
-        # Resolve in stored order; skip ids that no longer exist.
+        # Resolve, then sort by digit (1-9, 0, then unkeyed by name) so chip
+        # order is stable regardless of the toggle order the user pressed.
         my_groups = [groups[gid] for gid in clip.group_ids if gid in groups]
         if not my_groups:
             return
+        my_groups.sort(key=self._group_sort_key)
         visible = my_groups[:GROUP_LABEL_MAX_VISIBLE]
         extra = len(my_groups) - len(visible)
         font = QFont("Segoe UI", 8)
@@ -625,6 +627,18 @@ class TimelineStrip(QWidget):
                 rect.adjusted(4, 0, -4, 0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 label_text)
+
+    @staticmethod
+    def _group_sort_key(g):
+        # Keyboard-row order: 1,2,...,9,0, then unkeyed groups (by name).
+        d = g.digit
+        if d is None:
+            primary = 11
+        elif d == 0:
+            primary = 10
+        else:
+            primary = d
+        return (primary, g.name.casefold())
 
     @staticmethod
     def _readable_text_for(hex_str: str) -> QColor:
