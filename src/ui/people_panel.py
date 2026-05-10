@@ -253,10 +253,16 @@ class PeoplePanel(QWidget):
         self._empty_label.setVisible(len(groups) == 0)
 
     def _refresh_counts(self):
-        # Cheaper variant — only update clip counts on each row.
+        # Cheaper variant — only update clip counts on each row. ``_rows``
+        # can briefly hold stale gids when ``TimelineModel.clear()`` /
+        # ``_restore`` empties _groups: clips_changed fires BEFORE
+        # groups_changed, so this slot runs first while the row cache still
+        # mirrors the previous project. Skip stale rows here — the
+        # groups_changed emit a moment later runs _refresh and reconciles.
+        groups = self._timeline.groups
         for gid, row in self._rows.items():
-            row.update_from(
-                self._timeline.groups[gid], self._clip_count_for(gid))
+            if gid in groups:
+                row.update_from(groups[gid], self._clip_count_for(gid))
 
     # --- Row callbacks ---------------------------------------------------
 

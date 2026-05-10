@@ -27,17 +27,43 @@ import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout,
+    QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from core.timebase_remuxer import RemuxJob
 from core.video_source import VideoSource, _frame_duration_for_fps
 
 
-# Plan tuple: (source_id, input_path, output_path, target_timescale)
-RemuxPlan = Tuple[str, str, str, int]
+# Plan tuple: (source_id, input_path, output_path, target_timescale,
+#             duration_seconds)
+RemuxPlan = Tuple[str, str, str, int, float]
+
+
+# QSettings key — the user's most-recent audio-mode pick is restored on
+# next launch so a workflow that consistently wants "Force stereo"
+# doesn't have to re-select on every project.
+_AUDIO_MODE_SETTING = "timebase_autofix/audio_mode"
+
+
+_AUDIO_MODE_CHOICES = (
+    (RemuxJob.AUDIO_KEEP,
+     "Keep audio (stream copy)",
+     "Fastest. Preserves the source's original codec + layout exactly. "
+     "Use if Resolve already plays the source's audio."),
+    (RemuxJob.AUDIO_REENCODE_SAME,
+     "Re-encode (PCM, same channels)",
+     "Convert to 16-bit PCM at 48 kHz. Channel layout preserved (5.1 stays "
+     "5.1). Use when Resolve struggles with the codec but you want surround."),
+    (RemuxJob.AUDIO_STEREO,
+     "Force stereo (PCM 2.0)",
+     "Convert to 16-bit PCM stereo at 48 kHz. Surround sources are "
+     "downmixed via ffmpeg's standard matrix — no audio is lost, channels "
+     "are condensed into the stereo pair. Mono is upmixed. Best "
+     "compatibility for editing."),
+)
 
 
 @dataclass
@@ -94,9 +120,10 @@ def _truncate_middle(text: str, max_len: int = 56) -> str:
 class TimebaseWarningDialog(QDialog):
     """Lists unsafe sources, shows the remux plan per row, and offers
     Auto-fix / Dismiss. Auto-fix emits ``auto_fix_requested`` with a list
-    of ``RemuxPlan`` tuples so the caller can run the worker."""
+    of ``RemuxPlan`` tuples and the chosen audio mode so the caller can
+    run the worker."""
 
-    auto_fix_requested = Signal(list)  # List[RemuxPlan]
+    auto_fix_requested = Signal(list, str)  # (List[RemuxPlan], audio_mode)
 
     def __init__(self, unsafe_sources: List[VideoSource], parent=None):
         super().__init__(parent)
@@ -115,14 +142,16 @@ class TimebaseWarningDialog(QDialog):
             "clip start/end frames by ±1 because the NLE seeks the source "
             "by time and rounds onto the broken tick grid. Video / audio "
             "/ image-sequence exports are unaffected.\n\n"
-            "Auto-fix runs ffmpeg with -c copy (no re-encode, no quality "
-            "loss) and writes a *_fixed.mov next to each original. "
-            "PrismaSynth then relinks the project to the fixed file — "
-            "your timeline edits are preserved."
+            "Auto-fix runs ffmpeg to remux the video stream copy with the "
+            "right timebase and writes a *_fixed.mov next to each original. "
+            "PrismaSynth then relinks the project to the fixed file — your "
+            "timeline edits are preserved."
         )
         header.setWordWrap(True)
         header.setStyleSheet("color: #ccc;")
         layout.addWidget(header)
+
+        layout.addWidget(self._build_audio_selector())
 
         # Per-source rows in a scroll area so a project with many sources
         # doesn't push the buttons off-screen.
@@ -153,6 +182,55 @@ class TimebaseWarningDialog(QDialog):
         layout.addWidget(btns)
 
     # --- internals ----------------------------------------------------
+
+    def _build_audio_selector(self) -> QWidget:
+        """Single global audio-mode dropdown that applies to every source
+        in the run. Selection is persisted via QSettings so a user who
+        consistently picks 'Force stereo' doesn't have to re-select."""
+        host = QFrame()
+        host.setStyleSheet(
+            "QFrame { background-color: #232323; border-radius: 4px; }"
+            "QLabel { background: transparent; }"
+        )
+        form = QFormLayout(host)
+        form.setContentsMargins(10, 8, 10, 8)
+        form.setSpacing(4)
+
+        self._audio_combo = QComboBox()
+        for mode, label, tooltip in _AUDIO_MODE_CHOICES:
+            self._audio_combo.addItem(label, mode)
+            self._audio_combo.setItemData(
+                self._audio_combo.count() - 1, tooltip, Qt.ItemDataRole.ToolTipRole)
+
+        saved = QSettings().value(_AUDIO_MODE_SETTING, RemuxJob.AUDIO_KEEP)
+        idx = self._audio_combo.findData(saved)
+        if idx >= 0:
+            self._audio_combo.setCurrentIndex(idx)
+
+        self._audio_combo.currentIndexChanged.connect(self._on_audio_changed)
+
+        self._audio_help = QLabel("")
+        self._audio_help.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._audio_help.setWordWrap(True)
+        self._refresh_audio_help()
+
+        label = QLabel("Audio handling:")
+        label.setStyleSheet("color: #ccc;")
+        form.addRow(label, self._audio_combo)
+        form.addRow(QLabel(""), self._audio_help)
+        return host
+
+    def _on_audio_changed(self, _idx: int):
+        self._refresh_audio_help()
+        QSettings().setValue(_AUDIO_MODE_SETTING, self._current_audio_mode())
+
+    def _refresh_audio_help(self):
+        idx = self._audio_combo.currentIndex()
+        tooltip = self._audio_combo.itemData(idx, Qt.ItemDataRole.ToolTipRole)
+        self._audio_help.setText(tooltip or "")
+
+    def _current_audio_mode(self) -> str:
+        return self._audio_combo.currentData() or RemuxJob.AUDIO_KEEP
 
     def _build_row(self, plan: _RowPlan) -> QWidget:
         row = QFrame()
@@ -197,8 +275,9 @@ class TimebaseWarningDialog(QDialog):
 
     def _on_auto_fix(self):
         plans: List[RemuxPlan] = [
-            (p.source.id, p.input_path, p.output_path, p.target_timescale)
+            (p.source.id, p.input_path, p.output_path, p.target_timescale,
+             max(0.0, p.source.duration_seconds))
             for p in self._plans
         ]
-        self.auto_fix_requested.emit(plans)
+        self.auto_fix_requested.emit(plans, self._current_audio_mode())
         self.accept()

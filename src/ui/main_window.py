@@ -922,15 +922,18 @@ class MainWindow(QMainWindow):
         dlg.auto_fix_requested.connect(self._run_timebase_autofix)
         dlg.exec()
 
-    def _run_timebase_autofix(self, jobs: list):
+    def _run_timebase_autofix(self, jobs: list, audio_mode: str = "keep"):
         """jobs: list of (source_id, input_path, output_path,
-        target_timescale). Spawns a modal progress dialog that drives a
-        sequential ffmpeg remux and relinks each fixed file as it lands.
+        target_timescale, duration_seconds). audio_mode: one of the
+        ``RemuxJob.AUDIO_*`` constants — picked by the user in the
+        warning dialog's audio-handling selector. Spawns a modal progress
+        dialog that drives a sequential ffmpeg remux and relinks each
+        fixed file as it lands.
         """
         if not jobs:
             return
         from ui.remux_progress_dialog import RemuxProgressDialog
-        progress = RemuxProgressDialog(jobs, parent=self)
+        progress = RemuxProgressDialog(jobs, audio_mode=audio_mode, parent=self)
         progress.source_succeeded.connect(self._apply_single_remux_relink)
         progress.exec()
 

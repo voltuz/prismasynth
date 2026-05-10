@@ -1,9 +1,9 @@
 """Modal progress dialog for the timebase auto-fix run.
 
 Owns a ``RemuxJob`` worker thread and surfaces its lifecycle to the user:
-status label, indeterminate progress bar (ffmpeg ``-c copy`` doesn't expose
-a meaningful percentage without parsing stderr, and a multi-GB Bluray remux
-finishes in tens of seconds — a spinner conveys the right shape of wait).
+status label + a fine-grained overall progress bar that combines the
+"X of N source files" outer counter with each source's intra-ffmpeg
+percentage parsed from ``-progress pipe:1`` stdout.
 
 Per-source completion fans out via ``source_succeeded`` so MainWindow can
 relink each fixed file as it lands; partial cancels keep the already-fixed
@@ -22,31 +22,38 @@ from PySide6.QtWidgets import (
 from core.timebase_remuxer import RemuxJob, RemuxJobSpec
 
 
+# Sub-percent precision avoids the visual "stair-step" of integer-percent
+# bars on long remuxes — important when one source can take 30-90s.
+_BAR_RESOLUTION = 1000
+
+
 class RemuxProgressDialog(QDialog):
     """Hosts the RemuxJob worker. Buttons morph Cancel→Cancelling…→Close
     just like ``cache_thumbnails_dialog.CacheThumbnailsDialog``."""
 
     source_succeeded = Signal(str, str)  # (source_id, fixed_path)
 
-    def __init__(self, jobs: List[RemuxJobSpec], parent=None):
+    def __init__(self, jobs: List[RemuxJobSpec],
+                 audio_mode: str = RemuxJob.AUDIO_KEEP, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Remuxing source files")
         self.setModal(True)
         self.setMinimumWidth(540)
 
-        self._total = len(jobs)
+        self._total = max(1, len(jobs))
+        self._current_idx = 0
+        self._current_basename = ""
+        self._current_pct = 0.0
         self._failures: list = []  # (source_id, message)
 
         layout = QVBoxLayout(self)
 
-        self._status = QLabel(f"Preparing {self._total} file(s)…")
+        self._status = QLabel(f"Preparing {len(jobs)} file(s)…")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
         self._bar = QProgressBar()
-        # Indeterminate while a single ffmpeg runs; flips to determinate
-        # for the per-source step counter via setRange/setValue.
-        self._bar.setRange(0, self._total)
+        self._bar.setRange(0, _BAR_RESOLUTION)
         self._bar.setValue(0)
         layout.addWidget(self._bar)
 
@@ -62,8 +69,9 @@ class RemuxProgressDialog(QDialog):
         btn_row.addWidget(self._right_btn)
         layout.addLayout(btn_row)
 
-        self._job = RemuxJob(jobs, parent=self)
+        self._job = RemuxJob(jobs, audio_mode=audio_mode, parent=self)
         self._job.progress.connect(self._on_progress)
+        self._job.source_progress.connect(self._on_source_progress)
         self._job.source_done.connect(self._on_source_done)
         self._job.error.connect(self._on_error)
         self._job.cancelled.connect(self._on_cancelled)
@@ -73,12 +81,31 @@ class RemuxProgressDialog(QDialog):
     # --- worker signals -----------------------------------------------
 
     def _on_progress(self, done: int, total: int, current_basename: str):
-        self._bar.setValue(min(done, total))
-        if current_basename:
+        # Outer step counter. Resets the per-source pct so the bar
+        # advances cleanly into the next source's 0..1 range.
+        self._current_idx = done
+        self._current_basename = current_basename
+        self._current_pct = 0.0
+        self._refresh_bar(total)
+
+    def _on_source_progress(self, _source_id: str, fraction: float):
+        self._current_pct = max(0.0, min(1.0, fraction))
+        self._refresh_bar(self._total)
+
+    def _refresh_bar(self, total: int):
+        total = max(1, total)
+        # Combined overall progress: completed sources + the in-flight
+        # source's intra-ffmpeg fraction. Both contribute proportionally.
+        overall = (self._current_idx + self._current_pct) / total
+        overall = max(0.0, min(1.0, overall))
+        self._bar.setValue(int(round(overall * _BAR_RESOLUTION)))
+        if self._current_basename:
+            pct_int = int(round(self._current_pct * 100))
             self._status.setText(
-                f"Remuxing {done + 1} of {total}: {current_basename}")
+                f"Remuxing {self._current_idx + 1} of {total} "
+                f"({pct_int}%): {self._current_basename}")
         else:
-            self._status.setText(f"Done: {done} of {total}")
+            self._status.setText(f"Done: {self._current_idx} of {total}")
 
     def _on_source_done(self, source_id: str, fixed_path: str):
         # Forward to MainWindow so the fixed file gets relinked
@@ -93,7 +120,11 @@ class RemuxProgressDialog(QDialog):
         self._status.setText("Cancelled.")
 
     def _on_finished_all(self, succeeded: int, total: int):
+        # Force the bar to 100% on a clean finish — _on_source_progress
+        # may have stopped at 99% if ffmpeg's last out_time_us tick
+        # arrived before the progress=end marker.
         if succeeded == total:
+            self._bar.setValue(_BAR_RESOLUTION)
             self._status.setText(
                 f"Remuxed {succeeded} of {total} file(s) successfully.")
         else:
