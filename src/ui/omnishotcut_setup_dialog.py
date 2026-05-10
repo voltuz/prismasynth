@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.omnishotcut_runner import is_setup_complete
+from core.ui_scale import ui_scale
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,8 @@ class OmnishotcutSetupDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Set up OmniShotCut")
-        self.setMinimumSize(700, 500)
+        _s = ui_scale()
+        self.setMinimumSize(_s.px(700), _s.px(500))
         self.setModal(True)
 
         layout = QVBoxLayout(self)
@@ -86,7 +88,7 @@ class OmnishotcutSetupDialog(QDialog):
 
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
-        f = QFont("Consolas", 9)
+        f = QFont("Consolas", ui_scale().font_pt(9))
         f.setStyleHint(QFont.StyleHint.Monospace)
         self._log.setFont(f)
         self._log.setStyleSheet("QPlainTextEdit { background: #1e1e1e; color: #ddd; }")

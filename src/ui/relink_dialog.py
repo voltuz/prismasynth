@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.video_source import VideoSource
+from core.ui_scale import ui_scale
 from utils.ffprobe import probe_video, VideoInfo
 
 logger = logging.getLogger(__name__)
@@ -37,8 +38,9 @@ class RelinkDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Relink Sources")
         self.setModal(True)
-        self.setMinimumWidth(720)
-        self.setMinimumHeight(380)
+        _s = ui_scale()
+        self.setMinimumWidth(_s.px(720))
+        self.setMinimumHeight(_s.px(380))
 
         self._missing: dict[str, VideoSource] = dict(missing)
         self._resolved: dict[str, Optional[str]] = {}

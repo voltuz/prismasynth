@@ -12,6 +12,7 @@ from core.video_source import VideoSource
 from core.scene_detector import SceneDetector, DEFAULT_THRESHOLD, Detector
 from core.omnishotcut_runner import is_setup_complete, default_checkpoint_path
 from core.clip import Clip
+from core.ui_scale import ui_scale
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class DetectDialog(QDialog):
         self._segments = segments
         self._sources = sources
         self.setWindowTitle("Detect Cuts")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(ui_scale().px(450))
         self.setModal(True)
 
         layout = QVBoxLayout(self)

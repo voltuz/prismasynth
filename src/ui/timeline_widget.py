@@ -13,6 +13,7 @@ from PySide6.QtGui import (
 
 from core.timeline import TimelineModel
 from core.clip import Clip
+from core.ui_scale import ui_scale
 from ui.icon_loader import icon
 
 # Custom MIMEs for media-pool drags (kept in sync with ui/media_panel.py).
@@ -42,27 +43,31 @@ CLIP_COLORS = [
     QColor(100, 130, 70),   # olive drab
 ]
 
+# User-controlled clip body height — kept in absolute pixels so the
+# user's manual drag preference retains its meaning when the UI scale
+# changes. (Per the v0.14 UI-scale design: chrome scales, the user's
+# clip-height drag stays an absolute pixel value.)
 CLIP_HEIGHT_DEFAULT = 60
 CLIP_HEIGHT_MIN = 30
 CLIP_HEIGHT_MAX = 200
-HEADER_HEIGHT = 48
-TIMELINE_H_PADDING = 4  # small internal padding for playhead clearance
-RESIZE_HANDLE_HEIGHT = 5  # pixels at bottom edge for drag resize
-THUMB_HIDE_THRESHOLD = 15  # px clip width — below this, skip thumbnail paint and generation
-                            # (hard floor is ~13px: 6px color border on each side)
-# People — group label strip rendered below each clip body. Each label is
-# GROUP_LABEL_HEIGHT tall; we reserve space for up to MAX_VISIBLE on the
-# track and surface "+N" on the last visible label when a clip has more.
-GROUP_LABEL_HEIGHT = 14
+# Group-strip layout — count, not a pixel dimension.
 GROUP_LABEL_MAX_VISIBLE = 3
-GROUP_STRIP_RESERVE = GROUP_LABEL_HEIGHT * GROUP_LABEL_MAX_VISIBLE
+# Design-pixel baselines for chrome metrics. Multiplied by the active
+# UI scale into per-instance attributes (self.HEADER_HEIGHT, etc.) by
+# TimelineStrip._refresh_scale_metrics() — paint code reads the
+# instance attributes rather than these module-level baselines.
+_DH_HEADER = 48
+_DH_PAD = 4
+_DH_RESIZE_HANDLE = 5
+_DH_THUMB_HIDE = 15  # below this clip width, skip thumbnail paint
+_DH_GROUP_LABEL = 14
+_DH_LABEL_FONT_PT = 8
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
 GAP_COLOR = QColor(30, 30, 30)
 BG_COLOR = QColor(40, 40, 40)
 RULER_BG = QColor(50, 50, 50)
 RULER_TEXT = QColor(180, 180, 180)
-THUMBNAIL_WIDTH = 64
 
 
 class TimelineStrip(QWidget):
@@ -119,9 +124,14 @@ class TimelineStrip(QWidget):
         # drop preview can render each dragged source's media-pool thumbnail.
         self._sources_ref: dict = {}
 
+        # Materialise scaled chrome metrics BEFORE any size-dependent calls
+        # below — setMinimumHeight reads self.HEADER_HEIGHT etc.
+        self._refresh_scale_metrics()
+
         # Reserve room for the group-label strip below the clip body.
         self.setMinimumHeight(
-            CLIP_HEIGHT_MIN + HEADER_HEIGHT + 4 + GROUP_STRIP_RESERVE)
+            CLIP_HEIGHT_MIN + self.HEADER_HEIGHT
+            + ui_scale().px(4) + self.GROUP_STRIP_RESERVE)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
@@ -130,6 +140,28 @@ class TimelineStrip(QWidget):
         self._model.selection_changed.connect(self.update)
         self._model.in_out_changed.connect(self.update)
         self._model.groups_changed.connect(self.update)
+        ui_scale().changed.connect(self._on_ui_scale_changed)
+
+    def _refresh_scale_metrics(self):
+        """(Re)compute scaled chrome metrics from the design baselines and
+        the current UI scale. Called once in __init__ and again whenever
+        the user picks a new scale via the View menu."""
+        s = ui_scale()
+        self.HEADER_HEIGHT = s.px(_DH_HEADER)
+        self.TIMELINE_H_PADDING = s.px(_DH_PAD)
+        self.RESIZE_HANDLE_HEIGHT = s.px(_DH_RESIZE_HANDLE)
+        self.THUMB_HIDE_THRESHOLD = s.px(_DH_THUMB_HIDE)
+        self.GROUP_LABEL_HEIGHT = s.px(_DH_GROUP_LABEL)
+        self.GROUP_STRIP_RESERVE = self.GROUP_LABEL_HEIGHT * GROUP_LABEL_MAX_VISIBLE
+        self._label_font_pt = s.font_pt(_DH_LABEL_FONT_PT)
+
+    def _on_ui_scale_changed(self):
+        self._refresh_scale_metrics()
+        self.setMinimumHeight(
+            CLIP_HEIGHT_MIN + self.HEADER_HEIGHT
+            + ui_scale().px(4) + self.GROUP_STRIP_RESERVE)
+        self.updateGeometry()
+        self.update()
 
     @property
     def pixels_per_frame(self) -> float:
@@ -357,7 +389,7 @@ class TimelineStrip(QWidget):
         self._paint_ruler(painter, w)
 
         # Clips
-        clip_y = HEADER_HEIGHT + 2
+        clip_y = self.HEADER_HEIGHT + ui_scale().px(2)
         self._paint_clips(painter, clip_y, w)
 
         # In/Out overlay
@@ -424,21 +456,23 @@ class TimelineStrip(QWidget):
                         painter.drawPixmap(seg_x + pad, clip_y + pad, tw, th, pix)
                         painter.restore()
             if 0 <= ix <= w:
-                painter.setPen(QPen(_DROP_INDICATOR_COLOR, 3))
-                painter.drawLine(ix, HEADER_HEIGHT, ix, h)
+                _arr = ui_scale().px(5)
+                _arr_h = ui_scale().px(6)
+                painter.setPen(QPen(_DROP_INDICATOR_COLOR, ui_scale().px(3)))
+                painter.drawLine(ix, self.HEADER_HEIGHT, ix, h)
                 painter.setBrush(QBrush(_DROP_INDICATOR_COLOR))
                 painter.drawPolygon([
-                    QPoint(ix - 5, HEADER_HEIGHT),
-                    QPoint(ix + 5, HEADER_HEIGHT),
-                    QPoint(ix, HEADER_HEIGHT + 6),
+                    QPoint(ix - _arr, self.HEADER_HEIGHT),
+                    QPoint(ix + _arr, self.HEADER_HEIGHT),
+                    QPoint(ix, self.HEADER_HEIGHT + _arr_h),
                 ])
 
         painter.end()
 
     def _paint_ruler(self, painter: QPainter, width: int):
-        painter.fillRect(0, 0, width, HEADER_HEIGHT, RULER_BG)
+        painter.fillRect(0, 0, width, self.HEADER_HEIGHT, RULER_BG)
         painter.setPen(QPen(RULER_TEXT))
-        font = QFont("Segoe UI", 8)
+        font = QFont("Segoe UI", self._label_font_pt)
         painter.setFont(font)
 
         # Compute tick interval based on zoom
@@ -456,41 +490,44 @@ class TimelineStrip(QWidget):
                 interval = ni
                 break
 
-        start_sec = max(0, self._scroll_offset - TIMELINE_H_PADDING) / (self._pixels_per_frame * self._fps)
-        end_sec = max(0, self._scroll_offset + width - TIMELINE_H_PADDING) / (self._pixels_per_frame * self._fps)
+        start_sec = max(0, self._scroll_offset - self.TIMELINE_H_PADDING) / (self._pixels_per_frame * self._fps)
+        end_sec = max(0, self._scroll_offset + width - self.TIMELINE_H_PADDING) / (self._pixels_per_frame * self._fps)
         t = (int(start_sec / interval)) * interval
         while t <= end_sec:
             x = self._frame_to_pixel(int(t * self._fps)) - self._scroll_offset
             if 0 <= x <= width:
-                painter.drawLine(x, HEADER_HEIGHT - 6, x, HEADER_HEIGHT)
+                _tick = ui_scale().px(6)
+                painter.drawLine(x, self.HEADER_HEIGHT - _tick, x, self.HEADER_HEIGHT)
                 ti = int(t)
                 if interval >= 3600:
                     label = f"{ti // 3600}:{(ti % 3600) // 60:02d}:{ti % 60:02d}"
                 else:
                     label = f"{ti // 60}:{ti % 60:02d}"
-                painter.drawText(x + 3, HEADER_HEIGHT - 8, label)
+                painter.drawText(
+                    x + ui_scale().px(3),
+                    self.HEADER_HEIGHT - ui_scale().px(8), label)
             t += interval
 
     def _frame_to_pixel(self, frame: int) -> int:
         """Convert a timeline frame number to pixel position. Single source of truth."""
-        return TIMELINE_H_PADDING + int(frame * self._pixels_per_frame)
+        return self.TIMELINE_H_PADDING + int(frame * self._pixels_per_frame)
 
     def _pixel_to_frame(self, screen_x: float) -> int:
         """Convert a screen x coordinate to timeline frame number.
         Clamps to content area so the playhead can't enter the padding."""
         # Clamp screen_x to content bounds
-        x = max(TIMELINE_H_PADDING, screen_x)
+        x = max(self.TIMELINE_H_PADDING, screen_x)
         total = self._model.get_total_duration_frames()
         if total > 0:
             max_px = self._frame_to_pixel(total - 1) - self._scroll_offset
             x = min(x, max_px)
-        return max(0, int((x + self._scroll_offset - TIMELINE_H_PADDING)
+        return max(0, int((x + self._scroll_offset - self.TIMELINE_H_PADDING)
                           / self._pixels_per_frame))
 
     def get_visible_clip_ids(self):
         """Return IDs of non-gap clips currently visible in the viewport.
 
-        Clips narrower than THUMB_HIDE_THRESHOLD are excluded so the thumbnail
+        Clips narrower than self.THUMB_HIDE_THRESHOLD are excluded so the thumbnail
         cache doesn't burn workers generating frames that won't be painted.
         """
         visible = []
@@ -504,7 +541,7 @@ class TimelineStrip(QWidget):
             screen_x = start_px - self._scroll_offset
             if screen_x + clip_w < 0 or screen_x > vw:
                 continue
-            if clip_w < THUMB_HIDE_THRESHOLD:
+            if clip_w < self.THUMB_HIDE_THRESHOLD:
                 continue
             if not clip.is_gap:
                 visible.append(clip.id)
@@ -561,7 +598,7 @@ class TimelineStrip(QWidget):
             th = self._clip_height - pad * 2
             tw = int(th * 16 / 9)
 
-            if self._thumbnails_enabled and clip_w >= THUMB_HIDE_THRESHOLD:
+            if self._thumbnails_enabled and clip_w >= self.THUMB_HIDE_THRESHOLD:
                 # First frame thumbnail — always shown, cropped to clip bounds with border
                 thumb_first = self._thumbnails.get((clip.id, "first"))
                 if thumb_first and clip_w > pad * 2 and th > 0:
@@ -579,7 +616,7 @@ class TimelineStrip(QWidget):
             # Duration label in center
             if clip_w > tw * 2 + 40:
                 painter.setPen(QPen(QColor(240, 240, 240)))
-                font = QFont("Segoe UI", 8)
+                font = QFont("Segoe UI", self._label_font_pt)
                 painter.setFont(font)
                 dur_secs = clip.duration_frames / self._fps if self._fps > 0 else 0
                 if dur_secs >= 60:
@@ -610,11 +647,11 @@ class TimelineStrip(QWidget):
         my_groups.sort(key=self._group_sort_key)
         visible = my_groups[:GROUP_LABEL_MAX_VISIBLE]
         extra = len(my_groups) - len(visible)
-        font = QFont("Segoe UI", 8)
+        font = QFont("Segoe UI", self._label_font_pt)
         painter.setFont(font)
         for i, g in enumerate(visible):
-            ly = y + i * GROUP_LABEL_HEIGHT
-            rect = QRect(x, ly, w, GROUP_LABEL_HEIGHT - 1)
+            ly = y + i * self.GROUP_LABEL_HEIGHT
+            rect = QRect(x, ly, w, self.GROUP_LABEL_HEIGHT - 1)
             painter.fillRect(rect, QColor(g.color))
             # Name on the chip — high-contrast text colour.
             text_color = self._readable_text_for(g.color)
@@ -693,11 +730,13 @@ class TimelineStrip(QWidget):
             painter.setPen(QPen(PLAYHEAD_COLOR, 2))
             painter.drawLine(px, 0, px, total_height)
             # Playhead handle (triangle at top)
+            _w = ui_scale().px(6)
+            _h = ui_scale().px(8)
             painter.setBrush(QBrush(PLAYHEAD_COLOR))
             painter.drawPolygon([
-                QPoint(px - 6, 0),
-                QPoint(px + 6, 0),
-                QPoint(px, 8),
+                QPoint(px - _w, 0),
+                QPoint(px + _w, 0),
+                QPoint(px, _h),
             ])
 
     # --- Mouse interaction ---
@@ -705,7 +744,8 @@ class TimelineStrip(QWidget):
     def _track_bottom_y(self) -> int:
         # Bottom of the clip body + the reserved group-label strip — this is
         # where the resize handle sits and where the marquee area starts.
-        return HEADER_HEIGHT + 2 + self._clip_height + GROUP_STRIP_RESERVE
+        return (self.HEADER_HEIGHT + ui_scale().px(2)
+                + self._clip_height + self.GROUP_STRIP_RESERVE)
 
     def mousePressEvent(self, event: QMouseEvent):
         # Quick-cut: right-click while scrubbing (drag or scrub-follow mode)
@@ -729,7 +769,7 @@ class TimelineStrip(QWidget):
 
             # Check if dragging the track bottom edge to resize
             bottom = self._track_bottom_y()
-            if abs(y - bottom) <= RESIZE_HANDLE_HEIGHT:
+            if abs(y - bottom) <= self.RESIZE_HANDLE_HEIGHT:
                 self._resizing_track = True
                 self._resize_start_y = int(y)
                 self._resize_start_height = self._clip_height
@@ -737,7 +777,7 @@ class TimelineStrip(QWidget):
                 return
 
             # Below track area: start marquee selection
-            if y > bottom + RESIZE_HANDLE_HEIGHT:
+            if y > bottom + self.RESIZE_HANDLE_HEIGHT:
                 self._marquee_active = True
                 self._marquee_start = QPoint(int(x), int(y))
                 self._marquee_end = QPoint(int(x), int(y))
@@ -745,7 +785,7 @@ class TimelineStrip(QWidget):
                 return
 
             # Click in ruler area = set playhead (works in both modes)
-            if y < HEADER_HEIGHT:
+            if y < self.HEADER_HEIGHT:
                 self._dragging_playhead = True
                 self.scrub_started.emit()
                 frame = self._pixel_to_frame(x)
@@ -783,7 +823,8 @@ class TimelineStrip(QWidget):
             new_h = max(CLIP_HEIGHT_MIN, min(CLIP_HEIGHT_MAX, self._resize_start_height + dy))
             if new_h != self._clip_height:
                 self._clip_height = new_h
-                self.setMinimumHeight(self._clip_height + HEADER_HEIGHT + 4)
+                self.setMinimumHeight(
+                    self._clip_height + self.HEADER_HEIGHT + ui_scale().px(4))
                 self.update()
             return
 
@@ -808,11 +849,11 @@ class TimelineStrip(QWidget):
         y = event.position().y()
         bottom = self._track_bottom_y()
 
-        if abs(y - bottom) <= RESIZE_HANDLE_HEIGHT:
+        if abs(y - bottom) <= self.RESIZE_HANDLE_HEIGHT:
             self.setCursor(Qt.CursorShape.SizeVerCursor)
             self._cut_preview_x = None
         elif self._edit_mode == EditMode.CUT:
-            if HEADER_HEIGHT <= y <= bottom:
+            if self.HEADER_HEIGHT <= y <= bottom:
                 frame = self._pixel_to_frame(x)
                 result = self._model.get_clip_at_position(frame)
                 if result and not result[0].is_gap:
@@ -890,13 +931,13 @@ class TimelineStrip(QWidget):
             delta = event.angleDelta().y()
             mouse_x = event.position().x()
             # Frame under mouse before zoom
-            frame_under_mouse = (mouse_x + self._scroll_offset - TIMELINE_H_PADDING) / self._pixels_per_frame
+            frame_under_mouse = (mouse_x + self._scroll_offset - self.TIMELINE_H_PADDING) / self._pixels_per_frame
 
             factor = 1.15 if delta > 0 else 1 / 1.15
             self._pixels_per_frame = max(0.001, min(20.0, self._pixels_per_frame * factor))
 
             # Adjust scroll so the frame under mouse stays in place
-            new_px = TIMELINE_H_PADDING + frame_under_mouse * self._pixels_per_frame
+            new_px = self.TIMELINE_H_PADDING + frame_under_mouse * self._pixels_per_frame
             self._scroll_offset = max(0, int(new_px - mouse_x))
             self.update()
             # Notify parent to update scrollbar
@@ -999,16 +1040,17 @@ class TimelineWidget(QWidget):
         layout.addWidget(self._strip, 1)
         layout.addWidget(self._scrollbar)
 
+        _us = ui_scale()
         # Thumbnail toggle — small checkable overlay in the strip's top-right.
         self._thumb_toggle = QToolButton(self._strip)
         self._thumb_toggle.setIcon(icon("thumbnails"))
-        self._thumb_toggle.setIconSize(QSize(14, 14))
+        self._thumb_toggle.setIconSize(QSize(_us.px(14), _us.px(14)))
         self._thumb_toggle.setCheckable(True)
         self._thumb_toggle.setChecked(True)
         self._thumb_toggle.setToolTip("Toggle clip thumbnails")
         self._thumb_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self._thumb_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._thumb_toggle.setFixedSize(22, 22)
+        self._thumb_toggle.setFixedSize(_us.px(22), _us.px(22))
         self._thumb_toggle.setStyleSheet(
             "QToolButton {"
             " background-color: rgba(58, 58, 58, 220);"
@@ -1030,13 +1072,13 @@ class TimelineWidget(QWidget):
         # running cancels.
         self._cache_thumb_btn = QToolButton(self._strip)
         self._cache_thumb_btn.setIcon(icon("save"))
-        self._cache_thumb_btn.setIconSize(QSize(14, 14))
+        self._cache_thumb_btn.setIconSize(QSize(_us.px(14), _us.px(14)))
         self._cache_thumb_btn.setToolTip(
             "Cache clip-boundary thumbnails to disk\n"
             "Respects in/out range if set")
         self._cache_thumb_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._cache_thumb_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._cache_thumb_btn.setFixedSize(22, 22)
+        self._cache_thumb_btn.setFixedSize(_us.px(22), _us.px(22))
         self._cache_thumb_btn.setStyleSheet(
             "QToolButton {"
             " background-color: rgba(58, 58, 58, 220);"
@@ -1049,6 +1091,7 @@ class TimelineWidget(QWidget):
 
         self._strip.installEventFilter(self)
         self._position_thumb_toggle()
+        ui_scale().changed.connect(self._on_ui_scale_changed)
 
         # HQ generation is part of the advanced options — default on.
         self._hq_thumbnails_enabled = True
@@ -1112,8 +1155,9 @@ class TimelineWidget(QWidget):
             icon("thumbnails-degraded") if degraded else icon("thumbnails"))
 
     def _position_thumb_toggle(self):
-        margin = 6
-        gap = 4
+        s = ui_scale()
+        margin = s.px(6)
+        gap = s.px(4)
         x = self._strip.width() - self._thumb_toggle.width() - margin
         y = margin
         self._thumb_toggle.move(x, y)
@@ -1121,6 +1165,13 @@ class TimelineWidget(QWidget):
         cx = x - gap - self._cache_thumb_btn.width()
         self._cache_thumb_btn.move(cx, y)
         self._cache_thumb_btn.raise_()
+
+    def _on_ui_scale_changed(self):
+        s = ui_scale()
+        for btn in (self._thumb_toggle, self._cache_thumb_btn):
+            btn.setIconSize(QSize(s.px(14), s.px(14)))
+            btn.setFixedSize(s.px(22), s.px(22))
+        self._position_thumb_toggle()
 
     def eventFilter(self, obj, event):
         if obj is self._strip and event.type() == event.Type.Resize:

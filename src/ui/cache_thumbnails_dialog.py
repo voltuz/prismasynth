@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.thumbnail_cache import BulkCacheJob, ThumbnailCache
+from core.ui_scale import ui_scale
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class CacheThumbnailsDialog(QDialog):
         self._last_done: int = 0
 
         self.setWindowTitle("Cache Thumbnails")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(ui_scale().px(500))
         self.setModal(True)
 
         layout = QVBoxLayout(self)

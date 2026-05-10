@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
+from core.ui_scale import ui_scale
+
 
 class RemoveSourceAction(Enum):
     CANCEL = "cancel"
@@ -28,7 +30,7 @@ class RemoveSourceDialog(QDialog):
         super().__init__(parent)
         title = "Remove Source" if source_count == 1 else "Remove Sources"
         self.setWindowTitle(title)
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(ui_scale().px(440))
         self.setModal(True)
         self.action: RemoveSourceAction = RemoveSourceAction.CANCEL
 

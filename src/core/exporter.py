@@ -225,6 +225,29 @@ class Exporter(QObject):
         return (frame - 0.5) / fps
 
     @staticmethod
+    def _exact_audio_samples(frame_count: int, src_fps: float,
+                             out_sample_rate: int = 48000) -> int:
+        """Sample count for ``frame_count`` video frames at ``src_fps`` rendered
+        at ``out_sample_rate``. Uses rational math for the common NTSC rates so
+        cumulative drift across many segments is exactly zero — atrim's
+        ``end_sample=N`` form takes integer samples, so we compute N here.
+
+        Integer rates (24, 25, 30, 50, 60) divide cleanly. NTSC rates
+        (23.976=24000/1001, 29.97=30000/1001, 59.94=60000/1001) become
+        ``frame_count * out_sample_rate * den / num`` — exact when
+        ``out_sample_rate * den`` is divisible by ``num``, which it is for
+        48000 Hz (48000 * 1001 = 48048000; 48048000 / 24000 = 2002 exact).
+        """
+        if frame_count <= 0 or src_fps <= 0:
+            return 0
+        # Detect rational NTSC rates by float proximity, then compute exactly.
+        for num, den in ((24000, 1001), (30000, 1001), (60000, 1001)):
+            if abs(src_fps - num / den) < 1e-3:
+                return frame_count * out_sample_rate * den // num
+        # Integer rates: clean division.
+        return round(frame_count * out_sample_rate / src_fps)
+
+    @staticmethod
     def _build_select_expr(segments, seek_frame):
         """Build FFmpeg select filter expression for given segments."""
         terms = []
@@ -530,55 +553,134 @@ class Exporter(QObject):
             audio_codec, audio_extra = _AUDIO_CODEC_FOR_EXT.get(
                 out_ext, ("pcm_s16le", []))
             cmd += ["-map", f"{video_idx}:v:0"]
-            if strip_audio:
-                # No audio stream in the output at all.
-                cmd += ["-an"]
-            elif has_audio:
-                # asetpts=PTS-STARTPTS is the audio analogue of setpts above.
-                # atrim bounds the audio to the same window as -frames:v so
-                # decoder-tail packets can't bleed past the video's last frame.
-                # The atrim runs INSIDE the -af filter graph, which executes
-                # BEFORE the output-side -ss discard, so we must add post_ss
-                # to the duration — the trim then keeps (audio_dur + post_ss)
-                # seconds, output -ss drops the first post_ss, leaving exactly
-                # audio_dur to match the video. Without this compensation,
-                # audio would be (audio_dur - post_ss) — a 1s shortfall.
-                # aresample=async=1:first_pts=0 flushes leading samples that
-                # fell before the seek point and resets PTS to 0.
-                trim_dur = audio_dur + post_ss
-                cmd += [
-                    "-map", f"{video_idx}:a:0?",
-                    "-af",
-                    "asetpts=PTS-STARTPTS,"
-                    f"atrim=duration={trim_dur:.6f},"
-                    "aresample=async=1:first_pts=0,"
-                    "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
-                ]
-                cmd += ["-c:a", audio_codec, *audio_extra,
-                        "-ar", "48000", "-ac", "2"]
-            else:
-                cmd += ["-map", "0:a:0"]
-                cmd += ["-c:a", audio_codec, *audio_extra,
-                        "-ar", "48000", "-ac", "2"]
+            # Audio is ALWAYS encoded in a separate ffmpeg pass for source
+            # segments — see _build_audio_cmd below for the rationale. The
+            # video pass strips audio entirely; the audio pass uses a
+            # single-stage input -ss so its decoded samples don't get
+            # truncated by the video pipeline's two-stage seek + -frames:v
+            # interaction. The mux stage joins them with -c copy.
+            cmd += ["-an"]
             cmd += ["-fps_mode", "passthrough",
                     "-video_track_timescale", "24000000"]
             cmd += ffmpeg_args + [out_file]
             return cmd
 
+        def _build_audio_cmd(path, src_in, count, src_fps, has_audio, out_wav):
+            """Build a single-stage-seek audio-only command.
+
+            Why a separate pass: when video and audio share one ffmpeg
+            invocation that uses the two-stage seek (pre-input -ss + output
+            -ss for the OpenCL tonemap warmup), -frames:v stops the encoder
+            pipeline as soon as the video frame count is hit, truncating
+            the audio's atrim output. Separately-encoded audio with a
+            single-stage input -ss is sample-precise (verified by
+            scripts/audio_drift_check.py: drift drops from -11 ms/segment
+            to 0).
+            """
+            n_samples = self._exact_audio_samples(count, src_fps, 48000)
+            ss = self._frame_to_seek_ts(src_in, src_fps)
+            cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+            if not has_audio:
+                # Silent source — emit silence sized to the segment.
+                audio_dur = count / src_fps if src_fps > 0 else 0.0
+                cmd += [
+                    "-f", "lavfi", "-t", f"{audio_dur:.6f}",
+                    "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                ]
+            else:
+                if ss > 0:
+                    cmd += ["-ss", f"{ss:.6f}"]
+                cmd += ["-i", path]
+                cmd += [
+                    "-vn",
+                    "-map", "0:a:0?",
+                    "-af",
+                    "asetpts=PTS-STARTPTS,"
+                    "aresample=48000,"
+                    "aformat=sample_fmts=s16:channel_layouts=stereo,"
+                    f"atrim=end_sample={n_samples}",
+                ]
+            cmd += ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", out_wav]
+            return cmd
+
+        def _build_mux_cmd(video_in, audio_in, out_file):
+            """Stream-copy mux of a video file and an audio WAV into one
+            container. -shortest is intentionally NOT used — both streams
+            are sample-/frame-precise by construction."""
+            out_ext = os.path.splitext(out_file)[1].lower()
+            audio_codec, audio_extra = _AUDIO_CODEC_FOR_EXT.get(
+                out_ext, ("pcm_s16le", []))
+            return [
+                "ffmpeg", "-y", "-nostdin", "-v", "error",
+                "-i", video_in, "-i", audio_in,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", audio_codec, *audio_extra,
+                "-ar", "48000", "-ac", "2",
+                "-video_track_timescale", "24000000",
+                out_file,
+            ]
+
+        def _build_segment_pipeline(path, src_in, count, src_fps, vf, hw, hdr,
+                                    src_w, src_h, has_audio, out_file):
+            """Return (commands, intermediate_files) for one segment.
+
+            Source segments with audio (and not strip_audio) are encoded as
+            three sequential ffmpeg calls — video pass, audio pass, mux.
+            Gap segments and strip-audio segments stay single-pass.
+            """
+            cmd_v_alone = _build_segment_cmd(
+                path, src_in, count, src_fps, vf, hw, hdr,
+                src_w, src_h, has_audio, out_file)
+            # Gaps already include silence in the same cmd via lavfi inputs;
+            # strip_audio paths emit -an from the video pass.
+            if path is None or strip_audio:
+                return [cmd_v_alone], []
+            # Source segment with audio: split into video + audio + mux.
+            base, ext = os.path.splitext(out_file)
+            out_v = base + ".v" + ext
+            out_a = base + ".a.wav"
+            # Rebuild the video command targeting the temp video file.
+            cmd_v = _build_segment_cmd(
+                path, src_in, count, src_fps, vf, hw, hdr,
+                src_w, src_h, has_audio, out_v)
+            cmd_a = _build_audio_cmd(path, src_in, count, src_fps,
+                                     has_audio, out_a)
+            cmd_m = _build_mux_cmd(out_v, out_a, out_file)
+            return [cmd_v, cmd_a, cmd_m], [out_v, out_a]
+
+        def _run_pipeline(commands):
+            """Run a list of ffmpeg commands sequentially. Returns
+            (returncode, stderr) of the first failing command, or (0, b'')
+            if all succeed."""
+            for cmd in commands:
+                if self._cancelled:
+                    return -1, b"cancelled"
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                self._register_proc(proc)
+                try:
+                    _, stderr_data = proc.communicate()
+                finally:
+                    self._unregister_proc(proc)
+                if proc.returncode != 0:
+                    return proc.returncode, stderr_data or b""
+            return 0, b""
+
         # Single segment: encode directly to output (no temp files, no concat)
         if len(flat_segments) == 1:
             (path, src_in, count, src_fps, vf, hw, hdr,
              src_w, src_h, has_audio) = flat_segments[0]
-            cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
-                                     hdr, src_w, src_h, has_audio, output_path)
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            self._register_proc(proc)
-            try:
-                _, stderr_data = proc.communicate()
-            finally:
-                self._unregister_proc(proc)
-            if proc.returncode != 0 and not self._cancelled:
+            cmds, intermediates = _build_segment_pipeline(
+                path, src_in, count, src_fps, vf, hw,
+                hdr, src_w, src_h, has_audio, output_path)
+            rc, stderr_data = _run_pipeline(cmds)
+            for f in intermediates:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            if rc != 0 and not self._cancelled:
                 err = (stderr_data or b"").decode(errors="replace")[-500:]
                 raise RuntimeError(f"Encoding failed: {err}")
             self.progress.emit(100)
@@ -597,13 +699,16 @@ class Exporter(QObject):
         try:
             temp_files = []
             commands = []
+            all_intermediates = []
             for i, (path, src_in, count, src_fps, vf, hw, hdr,
                     src_w, src_h, has_audio) in enumerate(flat_segments):
                 tmp = os.path.join(temp_dir, f"seg_{i:04d}{temp_ext}")
                 temp_files.append(tmp)
-                cmd = _build_segment_cmd(path, src_in, count, src_fps, vf, hw,
-                                         hdr, src_w, src_h, has_audio, tmp)
-                commands.append((cmd, count))
+                cmds, intermediates = _build_segment_pipeline(
+                    path, src_in, count, src_fps, vf, hw,
+                    hdr, src_w, src_h, has_audio, tmp)
+                commands.append((cmds, count, intermediates))
+                all_intermediates.extend(intermediates)
 
             # Thread pool: as-soon-as-done scheduling (no batch-wait)
             frames_done = 0
@@ -612,15 +717,18 @@ class Exporter(QObject):
             def _encode_segment(idx):
                 if self._cancelled or failed.is_set():
                     return idx, -1, b"cancelled"
-                cmd, _ = commands[idx]
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                self._register_proc(proc)
-                try:
-                    _, stderr_data = proc.communicate()
-                finally:
-                    self._unregister_proc(proc)
-                return idx, proc.returncode, stderr_data or b""
+                cmds, _, intermediates = commands[idx]
+                rc, stderr_data = _run_pipeline(cmds)
+                # Best-effort cleanup of per-segment intermediate files.
+                # The temp_dir gets blown away in the outer finally, but
+                # cleaning here keeps disk pressure down across long exports.
+                if rc == 0:
+                    for f in intermediates:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                return idx, rc, stderr_data
 
             def _kill_active():
                 with self._procs_lock:
@@ -800,14 +908,18 @@ class Exporter(QObject):
             if strip_audio:
                 cmd += ["-an"]
             elif has_audio:
-                trim_dur = audio_dur + post_ss
+                # See _build_segment_cmd in the parallel path for the
+                # rationale behind this sample-precise audio chain.
+                n_samples = self._exact_audio_samples(duration, src_fps, 48000)
+                post_ss_samples = int(round(post_ss * 48000))
+                trim_end_sample = n_samples + post_ss_samples
                 cmd += [
                     "-map", f"{video_idx}:a:0?",
                     "-af",
                     "asetpts=PTS-STARTPTS,"
-                    f"atrim=duration={trim_dur:.6f},"
-                    "aresample=async=1:first_pts=0,"
-                    "aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo",
+                    "aresample=48000,"
+                    "aformat=sample_fmts=s16:channel_layouts=stereo,"
+                    f"atrim=end_sample={trim_end_sample}",
                 ]
                 cmd += ["-c:a", audio_codec, *audio_extra,
                         "-ar", "48000", "-ac", "2"]
@@ -958,31 +1070,23 @@ class Exporter(QObject):
                     continue
 
                 if has_audio:
-                    # Same two-stage seek as video: pre-input cheap keyframe
-                    # jump + post-input precise discard. The half-frame
-                    # margin in _frame_to_seek_ts defeats the IEEE-754 off-
-                    # by-one near segment boundaries.
+                    # Single-stage seek: there's no video pipeline to warm
+                    # up here, so the two-stage seek pattern used by the
+                    # video exporter is unnecessary. Single-stage with
+                    # atrim=end_sample=N gives sample-precise output.
                     ss = self._frame_to_seek_ts(src_in, src_fps)
-                    PRE_SEEK_MARGIN = 1.0
-                    if ss > PRE_SEEK_MARGIN:
-                        pre_ss, post_ss = ss - PRE_SEEK_MARGIN, PRE_SEEK_MARGIN
-                    else:
-                        pre_ss, post_ss = 0.0, ss
-                    trim_dur = audio_dur + post_ss
-                    if pre_ss > 0:
-                        cmd += ["-ss", f"{pre_ss:.6f}"]
+                    n_samples = self._exact_audio_samples(count, src_fps, 48000)
+                    if ss > 0:
+                        cmd += ["-ss", f"{ss:.6f}"]
                     cmd += ["-i", src_path]
-                    if post_ss > 0:
-                        cmd += ["-ss", f"{post_ss:.6f}"]
                     cmd += [
                         "-vn",
                         "-map", "0:a:0?",
                         "-af",
                         "asetpts=PTS-STARTPTS,"
-                        f"atrim=duration={trim_dur:.6f},"
-                        "aresample=async=1:first_pts=0,"
-                        "aformat=sample_fmts=s16:sample_rates=48000:"
-                        "channel_layouts=stereo",
+                        "aresample=48000,"
+                        "aformat=sample_fmts=s16:channel_layouts=stereo,"
+                        f"atrim=end_sample={n_samples}",
                     ]
                 else:
                     # No-audio source — feed silence sized to the segment.

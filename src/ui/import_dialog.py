@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal
 
 from core.video_source import VideoSource
+from core.ui_scale import ui_scale
 from utils.ffprobe import probe_video
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ class ImportDialog(QDialog):
                  ref_fps: float = 0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import Video")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(ui_scale().px(450))
         self.setModal(True)
 
         self._ref_width = ref_width
@@ -123,6 +124,8 @@ class ImportDialog(QDialog):
                 audio_codec=info.audio_codec,
                 audio_sample_rate=info.audio_sample_rate,
                 audio_channels=info.audio_channels,
+                time_base_num=info.time_base_num,
+                time_base_den=info.time_base_den,
             ))
 
         self.import_complete.emit(sources)

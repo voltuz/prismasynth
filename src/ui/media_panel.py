@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from core.video_source import VideoSource
 from core.source_thumbnail import cache_path_for, THUMB_HEIGHT, THUMB_WIDTH
+from core.ui_scale import ui_scale
 from ui.icon_loader import icon
 
 
@@ -283,12 +284,14 @@ class MediaPanel(QWidget):
         # Resizable in a horizontal QSplitter; Preferred lets the user drag
         # the splitter handle, with a sensible floor so the panel never
         # collapses below readable.
+        s = ui_scale()
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        self.setMinimumWidth(180)
+        self.setMinimumWidth(s.px(180))
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(s.px(6), s.px(6), s.px(6), s.px(6))
+        layout.setSpacing(s.px(4))
+        self._outer_layout = layout
 
         # --- Header (title + view-mode toggles) ---
         header = QHBoxLayout()
@@ -303,7 +306,7 @@ class MediaPanel(QWidget):
         self._grid_btn = QToolButton()
         self._grid_btn.setCheckable(True)
         self._grid_btn.setIcon(icon("grid"))
-        self._grid_btn.setIconSize(QSize(16, 16))
+        self._grid_btn.setIconSize(QSize(s.px(16), s.px(16)))
         self._grid_btn.setToolTip("Grid view")
         self._grid_btn.setAutoRaise(True)
         self._grid_btn.clicked.connect(lambda: self._set_view_mode("grid"))
@@ -312,7 +315,7 @@ class MediaPanel(QWidget):
         self._list_btn = QToolButton()
         self._list_btn.setCheckable(True)
         self._list_btn.setIcon(icon("list"))
-        self._list_btn.setIconSize(QSize(16, 16))
+        self._list_btn.setIconSize(QSize(s.px(16), s.px(16)))
         self._list_btn.setToolTip("List view")
         self._list_btn.setAutoRaise(True)
         self._list_btn.clicked.connect(lambda: self._set_view_mode("list"))
@@ -345,6 +348,20 @@ class MediaPanel(QWidget):
         mode = settings.value(self._SETTINGS_VIEW_MODE, "grid", type=str)
         self._set_view_mode(mode if mode in ("grid", "list") else "grid")
 
+        ui_scale().changed.connect(self._on_ui_scale_changed)
+
+    def _on_ui_scale_changed(self):
+        s = ui_scale()
+        self.setMinimumWidth(s.px(180))
+        self._outer_layout.setContentsMargins(
+            s.px(6), s.px(6), s.px(6), s.px(6))
+        self._outer_layout.setSpacing(s.px(4))
+        self._grid_btn.setIconSize(QSize(s.px(16), s.px(16)))
+        self._list_btn.setIconSize(QSize(s.px(16), s.px(16)))
+        # Re-apply view-mode sizing (icon + grid sizes scale with the rest).
+        current = "grid" if self._grid_btn.isChecked() else "list"
+        self._set_view_mode(current)
+
     # --- Public API ---
 
     def set_sources(self, sources: Dict[str, VideoSource]):
@@ -372,18 +389,20 @@ class MediaPanel(QWidget):
     # --- View mode ---
 
     def _set_view_mode(self, mode: str):
+        s = ui_scale()
         if mode == "grid":
             self._view.setViewMode(QListView.ViewMode.IconMode)
-            self._view.setIconSize(QSize(THUMB_WIDTH, THUMB_HEIGHT))
-            self._view.setGridSize(QSize(THUMB_WIDTH + 12, THUMB_HEIGHT + 28))
+            self._view.setIconSize(QSize(s.px(THUMB_WIDTH), s.px(THUMB_HEIGHT)))
+            self._view.setGridSize(
+                QSize(s.px(THUMB_WIDTH + 12), s.px(THUMB_HEIGHT + 28)))
             self._view.setWordWrap(True)
             self._view.setResizeMode(QListView.ResizeMode.Adjust)
             self._view.setMovement(QListView.Movement.Static)
             self._view.setFlow(QListView.Flow.LeftToRight)
-            self._view.setSpacing(4)
+            self._view.setSpacing(s.px(4))
         else:  # list
             self._view.setViewMode(QListView.ViewMode.ListMode)
-            self._view.setIconSize(QSize(48, 27))
+            self._view.setIconSize(QSize(s.px(48), s.px(27)))
             self._view.setGridSize(QSize())  # use default per-row sizing
             self._view.setWordWrap(False)
             self._view.setResizeMode(QListView.ResizeMode.Fixed)

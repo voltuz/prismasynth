@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from utils.paths import get_cache_dir
+from core.ui_scale import ui_scale
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,9 @@ class CacheManagerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Cache Manager")
         self.setModal(True)
-        self.setMinimumWidth(600)
-        self.setMinimumHeight(300)
+        _s = ui_scale()
+        self.setMinimumWidth(_s.px(600))
+        self.setMinimumHeight(_s.px(300))
 
         self._proxy_manager = proxy_manager
         # get_cache_dir() returns %LOCALAPPDATA%/prismasynth/cache/.

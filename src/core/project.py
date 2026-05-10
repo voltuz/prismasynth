@@ -28,7 +28,10 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
                  scroll_offset: int = 0,
                  pixels_per_frame: float = 0.5,
                  orphan_paths: Optional[dict] = None,
-                 groups: Optional[dict] = None):
+                 groups: Optional[dict] = None,
+                 top_splitter_sizes: Optional[list] = None,
+                 vertical_splitter_sizes: Optional[list] = None,
+                 right_tab_index: Optional[int] = None):
     data = {
         "version": PROJECT_VERSION,
         "playhead_position": playhead,
@@ -47,6 +50,16 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
         # but kept on the timeline. Re-importing the same path revives them.
         "orphan_paths": dict(orphan_paths) if orphan_paths else {},
     }
+    # Per-project workspace layout: column widths (Media | Preview | Tabs),
+    # vertical split (panels area | timeline), and active right-column tab
+    # (0 = Clip Info, 1 = People). All optional — absent on legacy projects;
+    # callers fall back to QSettings then hardcoded defaults.
+    if top_splitter_sizes is not None:
+        data["top_splitter_sizes"] = [int(s) for s in top_splitter_sizes]
+    if vertical_splitter_sizes is not None:
+        data["vertical_splitter_sizes"] = [int(s) for s in vertical_splitter_sizes]
+    if right_tab_index is not None:
+        data["right_tab_index"] = int(right_tab_index)
     project_dir = os.path.dirname(filepath)
     for s in sources.values():
         try:
@@ -66,6 +79,11 @@ def save_project(filepath: str, sources: dict, clips: list, playhead: int = 0,
             "audio_codec": s.audio_codec,
             "audio_sample_rate": s.audio_sample_rate,
             "audio_channels": s.audio_channels,
+            # Container time_base of the video stream — used to detect
+            # NLE-import seek drift (see VideoSource.is_seek_safe). Legacy
+            # projects load with 0/0 = unknown and re-probe on first open.
+            "time_base_num": s.time_base_num,
+            "time_base_den": s.time_base_den,
         })
     for c in clips:
         data["clips"].append(c.to_dict())
@@ -98,6 +116,8 @@ def load_project(filepath: str):
             audio_codec=sd.get("audio_codec", ""),
             audio_sample_rate=sd.get("audio_sample_rate", 0),
             audio_channels=sd.get("audio_channels", 0),
+            time_base_num=sd.get("time_base_num", 0),
+            time_base_den=sd.get("time_base_den", 0),
         )
         # If the absolute path is gone, try the relative path (project + sources
         # transferred together). Only the relink dialog handles the rest.
@@ -107,18 +127,26 @@ def load_project(filepath: str):
                 candidate = os.path.normpath(os.path.join(project_dir, rel))
                 if os.path.exists(candidate):
                     s.file_path = candidate
-        # Retroactive audio probe: legacy projects (saved before audio support)
-        # have no audio fields. Re-probe so the project becomes audio-aware on
-        # first load — no manual migration step.
-        if not s.audio_codec and s.audio_channels == 0:
+        # Retroactive probe: legacy projects (saved before audio / time_base
+        # support) lack those fields. Re-probe so the project becomes
+        # audio- and timebase-aware on first load — no manual migration step.
+        needs_reprobe = (
+            (not s.audio_codec and s.audio_channels == 0)
+            or (s.time_base_num <= 0 or s.time_base_den <= 0)
+        )
+        if needs_reprobe:
             try:
                 info = probe_video(s.file_path)
             except Exception:
                 info = None
             if info is not None:
-                s.audio_codec = info.audio_codec
-                s.audio_sample_rate = info.audio_sample_rate
-                s.audio_channels = info.audio_channels
+                if not s.audio_codec and s.audio_channels == 0:
+                    s.audio_codec = info.audio_codec
+                    s.audio_sample_rate = info.audio_sample_rate
+                    s.audio_channels = info.audio_channels
+                if s.time_base_num <= 0 or s.time_base_den <= 0:
+                    s.time_base_num = info.time_base_num
+                    s.time_base_den = info.time_base_den
         sources[s.id] = s
 
     # People / group registry — each entry round-tripped via Group.from_dict.
@@ -157,4 +185,8 @@ def load_project(filepath: str):
         # uses it to revive orphan clips on a same-path re-import.
         "orphan_paths": dict(data.get("orphan_paths", {})),
         "version": data.get("version", 1),
+        # Workspace layout — None when the project pre-dates the feature.
+        "top_splitter_sizes": data.get("top_splitter_sizes"),
+        "vertical_splitter_sizes": data.get("vertical_splitter_sizes"),
+        "right_tab_index": data.get("right_tab_index"),
     }

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.shortcuts import ShortcutManager
+from core.ui_scale import ui_scale
 
 
 class _CaptureDialog(QDialog):
@@ -26,7 +27,7 @@ class _CaptureDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Press Shortcut")
         self.setModal(True)
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(ui_scale().px(380))
         self._captured: str = ""
 
         layout = QVBoxLayout(self)
@@ -70,8 +71,9 @@ class KeyboardShortcutsDialog(QDialog):
     def __init__(self, manager: ShortcutManager, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Keyboard Shortcuts")
-        self.setMinimumWidth(560)
-        self.setMinimumHeight(520)
+        _s = ui_scale()
+        self.setMinimumWidth(_s.px(560))
+        self.setMinimumHeight(_s.px(520))
         self.setModal(True)
         self._manager = manager
 

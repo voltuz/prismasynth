@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 
 from core.clip import Clip
 from core.video_source import VideoSource
+from core.ui_scale import ui_scale
 
 
 class ClipInfoPanel(QWidget):
@@ -16,11 +17,14 @@ class ClipInfoPanel(QWidget):
         super().__init__(parent)
         # Resizable in a horizontal QSplitter; Preferred lets the user drag
         # the splitter handle, with a sensible floor.
-        self.setMinimumWidth(180)
+        s = ui_scale()
+        self.setMinimumWidth(s.px(180))
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(s.px(8), s.px(8), s.px(8), s.px(8))
+        self._outer_layout = layout
+        ui_scale().changed.connect(self._on_ui_scale_changed)
 
         self._title = QLabel("No clip selected")
         self._title.setStyleSheet("font-weight: bold; font-size: 13px; color: #ddd;")
@@ -52,6 +56,12 @@ class ClipInfoPanel(QWidget):
         layout.addWidget(self._group)
 
         layout.addStretch()
+
+    def _on_ui_scale_changed(self):
+        s = ui_scale()
+        self.setMinimumWidth(s.px(180))
+        self._outer_layout.setContentsMargins(
+            s.px(8), s.px(8), s.px(8), s.px(8))
 
     def update_clip(self, clip: Optional[Clip], sources: Dict[str, VideoSource]):
         if clip is None:

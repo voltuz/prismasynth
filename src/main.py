@@ -11,9 +11,10 @@ os.environ['PATH'] = _src_dir + os.pathsep + os.environ['PATH']
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QFont
 
 from ui.main_window import MainWindow
+from core.ui_scale import ui_scale
 
 _CRASH_LOG = os.path.join(_src_dir, "crash.log")
 
@@ -57,6 +58,20 @@ def main():
     app.setApplicationName("PrismaSynth")
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
+
+    # Capture the system base font BEFORE any scaling so live re-scales
+    # always derive from the same anchor (re-scaling a derived font would
+    # compound).
+    _base_font = QFont(app.font())
+    _base_pt = _base_font.pointSize() if _base_font.pointSize() > 0 else 9
+
+    def _apply_app_font():
+        f = QFont(_base_font)
+        f.setPointSize(ui_scale().font_pt(_base_pt))
+        app.setFont(f)
+
+    _apply_app_font()
+    ui_scale().changed.connect(_apply_app_font)
 
     icon_path = os.path.join(_src_dir, "app.ico")
     if os.path.exists(icon_path):

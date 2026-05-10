@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from core.group import Group
 from core.timeline import TimelineModel
+from core.ui_scale import ui_scale
 from ui.icon_loader import icon
 
 
@@ -52,12 +53,13 @@ class _GroupRow(QWidget):
         # lets us suppress the signal during programmatic refresh.
         self._suppress_signals = False
 
+        s = ui_scale()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(s.px(6))
 
         self._swatch = QPushButton()
-        self._swatch.setFixedSize(24, 24)
+        self._swatch.setFixedSize(s.px(24), s.px(24))
         self._swatch.setCursor(Qt.CursorShape.PointingHandCursor)
         self._swatch.setToolTip("Click to change colour")
         self._swatch.clicked.connect(self._on_swatch_clicked)
@@ -73,13 +75,13 @@ class _GroupRow(QWidget):
         # Keyboard number-row order: 1-9 first, 0 last.
         for d in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0):
             self._digit_combo.addItem(str(d), d)
-        self._digit_combo.setFixedWidth(56)
+        self._digit_combo.setFixedWidth(s.px(56))
         self._digit_combo.setToolTip("Keyboard digit (0-9) bound to this group")
         self._digit_combo.currentIndexChanged.connect(self._on_digit_changed)
         layout.addWidget(self._digit_combo)
 
         self._count_label = QLabel()
-        self._count_label.setMinimumWidth(56)
+        self._count_label.setMinimumWidth(s.px(56))
         self._count_label.setStyleSheet("color: #aaa;")
         self._count_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -87,8 +89,8 @@ class _GroupRow(QWidget):
 
         self._delete_btn = QPushButton()
         self._delete_btn.setIcon(icon("trash"))
-        self._delete_btn.setIconSize(QSize(14, 14))
-        self._delete_btn.setFixedSize(22, 22)
+        self._delete_btn.setIconSize(QSize(s.px(14), s.px(14)))
+        self._delete_btn.setFixedSize(s.px(22), s.px(22))
         self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._delete_btn.setToolTip("Remove group")
         self._delete_btn.setStyleSheet(
@@ -100,6 +102,16 @@ class _GroupRow(QWidget):
         layout.addWidget(self._delete_btn)
 
         self.update_from(group, clip_count)
+
+    def refresh_scale(self):
+        """Re-apply scaled sizes after a UI-scale change."""
+        s = ui_scale()
+        self.layout().setSpacing(s.px(6))
+        self._swatch.setFixedSize(s.px(24), s.px(24))
+        self._digit_combo.setFixedWidth(s.px(56))
+        self._count_label.setMinimumWidth(s.px(56))
+        self._delete_btn.setIconSize(QSize(s.px(14), s.px(14)))
+        self._delete_btn.setFixedSize(s.px(22), s.px(22))
 
     def update_from(self, group: Group, clip_count: int):
         """Refresh widgets from the latest group state. Suppresses signals
@@ -155,9 +167,11 @@ class PeoplePanel(QWidget):
         self._timeline = timeline
         self._rows: Dict[str, _GroupRow] = {}
 
+        s = ui_scale()
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(6)
+        outer.setContentsMargins(s.px(8), s.px(8), s.px(8), s.px(8))
+        outer.setSpacing(s.px(6))
+        self._outer_layout = outer
 
         # Header
         hdr = QHBoxLayout()
@@ -177,7 +191,7 @@ class PeoplePanel(QWidget):
         self._rows_host = QWidget()
         self._rows_layout = QVBoxLayout(self._rows_host)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._rows_layout.setSpacing(4)
+        self._rows_layout.setSpacing(s.px(4))
         self._rows_layout.addStretch(1)
         self._scroll.setWidget(self._rows_host)
         outer.addWidget(self._scroll, 1)
@@ -193,8 +207,18 @@ class PeoplePanel(QWidget):
         # Refresh hooks
         self._timeline.groups_changed.connect(self._refresh)
         self._timeline.clips_changed.connect(self._refresh_counts)
+        ui_scale().changed.connect(self._on_ui_scale_changed)
 
         self._refresh()
+
+    def _on_ui_scale_changed(self):
+        s = ui_scale()
+        self._outer_layout.setContentsMargins(
+            s.px(8), s.px(8), s.px(8), s.px(8))
+        self._outer_layout.setSpacing(s.px(6))
+        self._rows_layout.setSpacing(s.px(4))
+        for row in self._rows.values():
+            row.refresh_scale()
 
     # ------------------------------------------------------------------
 

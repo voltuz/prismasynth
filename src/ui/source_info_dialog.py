@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from core.video_source import VideoSource
 from core.source_thumbnail import cache_path_for
+from core.ui_scale import ui_scale
 
 
 class SourceInfoDialog(QDialog):
@@ -23,8 +24,9 @@ class SourceInfoDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        s = ui_scale()
         self.setModal(False)
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(s.px(420))
         self.setWindowTitle("Source Info")
         # Stay on top of the parent without blocking it
         self.setWindowFlag(Qt.WindowType.Tool, True)
@@ -32,7 +34,7 @@ class SourceInfoDialog(QDialog):
         layout = QVBoxLayout(self)
 
         self._thumb = QLabel()
-        self._thumb.setFixedSize(320, 180)
+        self._thumb.setFixedSize(s.px(320), s.px(180))
         self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._thumb.setStyleSheet("background: #1e1e1e; border: 1px solid #444;")
         layout.addWidget(self._thumb, 0, Qt.AlignmentFlag.AlignCenter)
@@ -52,9 +54,11 @@ class SourceInfoDialog(QDialog):
         self._duration_label = QLabel("-")
         self._frames_label = QLabel("-")
         self._audio_label = QLabel("-")
+        self._timebase_label = QLabel("-")
+        self._timebase_label.setWordWrap(True)
         for lbl in (self._codec_label, self._resolution_label, self._fps_label,
                     self._duration_label, self._frames_label, self._audio_label,
-                    self._path_label):
+                    self._path_label, self._timebase_label):
             lbl.setStyleSheet("color: #ccc;")
 
         form.addRow("File:", self._path_label)
@@ -64,6 +68,7 @@ class SourceInfoDialog(QDialog):
         form.addRow("Duration:", self._duration_label)
         form.addRow("Frames:", self._frames_label)
         form.addRow("Audio:", self._audio_label)
+        form.addRow("Timebase:", self._timebase_label)
         layout.addLayout(form)
 
         btn_row = QHBoxLayout()
@@ -97,6 +102,29 @@ class SourceInfoDialog(QDialog):
         self._audio_label.setStyleSheet(
             "color: #e8a735;" if audio == "none" else "color: #ccc;"
         )
+
+        tb_str = source.time_base_str
+        if not tb_str:
+            self._timebase_label.setText("unknown")
+            self._timebase_label.setStyleSheet("color: #888;")
+            self._timebase_label.setToolTip("")
+        elif source.is_seek_safe():
+            self._timebase_label.setText(f"1/{source.time_base_den} (exact)")
+            self._timebase_label.setStyleSheet("color: #ccc;")
+            self._timebase_label.setToolTip("")
+        else:
+            self._timebase_label.setText(
+                f"1/{source.time_base_den} — drift risk for FCPXML / OTIO")
+            self._timebase_label.setStyleSheet("color: #e8a735;")
+            self._timebase_label.setToolTip(
+                "This container time_base can't exactly represent "
+                f"{source.fps:.3f} fps. NLE imports of FCPXML / OTIO "
+                "referencing this source may drift by ±1 frame.\n\n"
+                "Fix by re-remuxing with an exact timebase, e.g.:\n"
+                "  ffmpeg -i input.mkv -c copy "
+                "-video_track_timescale 24000 output.mov\n"
+                "Then use Tools → Relink…"
+            )
 
         # Thumbnail (best-effort — extract_thumbnail is called at import time
         # so the cache should already be warm)

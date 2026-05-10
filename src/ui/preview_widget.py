@@ -14,6 +14,7 @@ os.environ['PATH'] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + o
 import mpv
 
 from ui.icon_loader import icon
+from core.ui_scale import ui_scale
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,10 @@ class PreviewWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        _us = ui_scale()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background-color: #1a1a1a;")
-        self.setMinimumSize(320, 180)
+        self.setMinimumSize(_us.px(320), _us.px(180))
 
         # Black overlay for gaps — sits on top of mpv, hidden by default
         self._black_overlay = QWidget(self)
@@ -114,7 +116,7 @@ class PreviewWidget(QWidget):
             " selection-background-color: transparent;"
             "}"
         )
-        self._zoom_combo.setFixedWidth(90)
+        self._zoom_combo.setFixedWidth(_us.px(90))
         self._zoom_combo.activated.connect(self._on_combo_activated)
         self._zoom_combo.raise_()
 
@@ -125,8 +127,8 @@ class PreviewWidget(QWidget):
         self._mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mute_btn.setAutoRaise(True)
-        self._mute_btn.setFixedSize(22, 22)
-        self._mute_btn.setIconSize(QSize(16, 16))
+        self._mute_btn.setFixedSize(_us.px(22), _us.px(22))
+        self._mute_btn.setIconSize(QSize(_us.px(16), _us.px(16)))
         self._mute_icon_unmuted = icon("volume")
         self._mute_icon_muted = icon("volume-muted")
         self._mute_btn.setIcon(self._mute_icon_unmuted)
@@ -151,7 +153,7 @@ class PreviewWidget(QWidget):
         self._volume_slider = QSlider(Qt.Orientation.Horizontal, self)
         self._volume_slider.setRange(0, 100)
         self._volume_slider.setValue(100)
-        self._volume_slider.setFixedWidth(100)
+        self._volume_slider.setFixedWidth(_us.px(100))
         self._volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._volume_slider.setToolTip("Volume")
         self._volume_slider.setStyleSheet(
@@ -177,6 +179,17 @@ class PreviewWidget(QWidget):
         )
         self._volume_slider.valueChanged.connect(self._on_volume_changed)
         self._volume_slider.raise_()
+
+        ui_scale().changed.connect(self._on_ui_scale_changed)
+
+    def _on_ui_scale_changed(self):
+        s = ui_scale()
+        self.setMinimumSize(s.px(320), s.px(180))
+        self._zoom_combo.setFixedWidth(s.px(90))
+        self._mute_btn.setFixedSize(s.px(22), s.px(22))
+        self._mute_btn.setIconSize(QSize(s.px(16), s.px(16)))
+        self._volume_slider.setFixedWidth(s.px(100))
+        self._reposition_overlays()
 
     def init_player(self):
         """Initialize the mpv player. Must be called after the widget is shown
@@ -351,8 +364,9 @@ class PreviewWidget(QWidget):
     def _reposition_overlays(self):
         if not hasattr(self, "_zoom_combo"):
             return
-        inset = 8
-        gap = 6
+        s = ui_scale()
+        inset = s.px(8)
+        gap = s.px(6)
         geo = self._container.geometry()
         combo_h = self._zoom_combo.sizeHint().height()
         combo_w = self._zoom_combo.width()
@@ -372,7 +386,7 @@ class PreviewWidget(QWidget):
 
         slider_w = self._volume_slider.width()
         slider_h = self._volume_slider.sizeHint().height()
-        slider_x = mute_x + mute_w + 4
+        slider_x = mute_x + mute_w + ui_scale().px(4)
         slider_y = y + (combo_h - slider_h) // 2
         self._volume_slider.setGeometry(slider_x, slider_y, slider_w, slider_h)
         self._volume_slider.raise_()

@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Signal, Qt
 
+from core.ui_scale import ui_scale
+
 
 VIDEO_PRESETS = {
     "h264": {
@@ -98,7 +100,7 @@ class ExportDialog(QDialog):
         self._has_render_range = (
             render_frames is not None and render_frames != total_frames)
         self.setWindowTitle("Export")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(ui_scale().px(500))
         self.setModal(True)
 
         layout = QVBoxLayout(self)

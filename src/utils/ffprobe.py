@@ -15,6 +15,12 @@ class VideoInfo:
     audio_codec: str = ""
     audio_sample_rate: int = 0
     audio_channels: int = 0
+    # Container time_base of the video stream (e.g. ("1", "16000")). 0/0 if
+    # the probe couldn't read it. Used by VideoSource.is_seek_safe to flag
+    # sources whose container can't exactly represent their declared fps —
+    # FCPXML/OTIO imports of those drift in NLEs that time-seek the source.
+    time_base_num: int = 0
+    time_base_den: int = 0
 
 
 def probe_video(file_path: str) -> Optional[VideoInfo]:
@@ -43,6 +49,15 @@ def probe_video(file_path: str) -> Optional[VideoInfo]:
     width = int(video_stream.get("width", 0))
     height = int(video_stream.get("height", 0))
     codec = video_stream.get("codec_name", "unknown")
+
+    tb_num, tb_den = 0, 0
+    tb_str = video_stream.get("time_base", "")
+    if isinstance(tb_str, str) and "/" in tb_str:
+        try:
+            n, d = tb_str.split("/", 1)
+            tb_num, tb_den = int(n), int(d)
+        except ValueError:
+            tb_num, tb_den = 0, 0
 
     # Frame count: try nb_frames, then compute from duration * fps
     nb_frames = video_stream.get("nb_frames")
@@ -99,6 +114,8 @@ def probe_video(file_path: str) -> Optional[VideoInfo]:
         audio_codec=audio_codec,
         audio_sample_rate=audio_sample_rate,
         audio_channels=audio_channels,
+        time_base_num=tb_num,
+        time_base_den=tb_den,
     )
 
 

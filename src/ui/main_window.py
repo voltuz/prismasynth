@@ -10,9 +10,10 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QTabWidget, QInputDialog,
 )
 from PySide6.QtCore import Qt, QTimer, QEvent, QRunnable, QThreadPool, QSettings, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 
 from version import __version__
+from core.ui_scale import ui_scale
 from core.timeline import TimelineModel
 from core.clip import Clip
 from core.video_source import VideoSource
@@ -225,8 +226,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"PrismaSynth v{__version__}")
-        self.setMinimumSize(1024, 600)
-        self.resize(1400, 800)
+        _s = ui_scale()
+        self.setMinimumSize(_s.px(1024), _s.px(600))
+        self.resize(_s.px(1400), _s.px(800))
         self.setAcceptDrops(True)
 
         # Core state
@@ -305,9 +307,10 @@ class MainWindow(QMainWindow):
         # the QSplitter handles so the toolbar feels visually divorced from
         # the panels in the same way the timeline / panels divider does.
         top_separator = QWidget()
-        top_separator.setFixedHeight(4)
+        top_separator.setFixedHeight(ui_scale().px(4))
         top_separator.setStyleSheet("background-color: #444;")
         main_layout.addWidget(top_separator)
+        self._top_separator = top_separator
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         main_layout.addWidget(splitter)
@@ -316,7 +319,7 @@ class MainWindow(QMainWindow):
         # Horizontal splitter so the side panels are user-resizable.
         self._top_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._top_splitter.setChildrenCollapsible(False)
-        self._top_splitter.setHandleWidth(4)
+        self._top_splitter.setHandleWidth(ui_scale().px(4))
 
         self._media_panel = MediaPanel()
         self._top_splitter.addWidget(self._media_panel)
@@ -333,6 +336,17 @@ class MainWindow(QMainWindow):
         self._right_tabs.setTabPosition(QTabWidget.TabPosition.West)
         self._right_tabs.addTab(self._clip_info, "Clip Info")
         self._right_tabs.addTab(self._people_panel, "People")
+        # Restore last-used right-tab from QSettings (project file, when a
+        # project loads, will override this via _load_from).
+        _saved_tab = QSettings().value("main_window/right_tab_index")
+        if _saved_tab is not None:
+            try:
+                _idx = int(_saved_tab)
+                if 0 <= _idx < self._right_tabs.count():
+                    self._right_tabs.setCurrentIndex(_idx)
+            except (TypeError, ValueError):
+                pass
+        self._right_tabs.currentChanged.connect(self._on_right_tab_changed)
         self._right_tabs.setDocumentMode(True)
         self._right_tabs.setStyleSheet(
             "QTabWidget::pane { border: none; }"
@@ -357,15 +371,20 @@ class MainWindow(QMainWindow):
         self._top_splitter.setStretchFactor(2, 0)
 
         # Restore saved sizes (per-user, across launches) or fall back to defaults.
+        # Saved sizes are absolute pixels — left untouched on UI-scale change so
+        # the user's deliberate splitter drag isn't overwritten. Only the first-
+        # run default scales to the current UI scale.
         _settings = QSettings()
         _saved_sizes = _settings.value("main_window/top_splitter_sizes")
+        _s = ui_scale()
+        _default_sizes = [_s.px(250), _s.px(800), _s.px(250)]
         if _saved_sizes:
             try:
                 self._top_splitter.setSizes([int(s) for s in _saved_sizes])
             except (TypeError, ValueError):
-                self._top_splitter.setSizes([250, 800, 250])
+                self._top_splitter.setSizes(_default_sizes)
         else:
-            self._top_splitter.setSizes([250, 800, 250])
+            self._top_splitter.setSizes(_default_sizes)
         self._top_splitter.splitterMoved.connect(self._on_top_splitter_moved)
 
         splitter.addWidget(self._top_splitter)
@@ -378,11 +397,30 @@ class MainWindow(QMainWindow):
         self._timeline_widget.set_sources_ref(self._sources)
         timeline_container = QWidget()
         tl_layout = QVBoxLayout(timeline_container)
-        tl_layout.setContentsMargins(16, 0, 16, 0)
+        _m = ui_scale().px(16)
+        tl_layout.setContentsMargins(_m, 0, _m, 0)
         tl_layout.addWidget(self._timeline_widget)
         splitter.addWidget(timeline_container)
+        self._timeline_container_layout = tl_layout
 
-        splitter.setSizes([400, 200])
+        # Restore vertical (panels|timeline) split from QSettings, falling
+        # back to the UI-scaled default. Project file overrides on load.
+        _default_vert = [ui_scale().px(400), ui_scale().px(200)]
+        _saved_vert = _settings.value("main_window/vertical_splitter_sizes")
+        if _saved_vert:
+            try:
+                splitter.setSizes([int(s) for s in _saved_vert])
+            except (TypeError, ValueError):
+                splitter.setSizes(_default_vert)
+        else:
+            splitter.setSizes(_default_vert)
+        self._main_splitter = splitter
+        splitter.splitterMoved.connect(self._on_main_splitter_moved)
+
+        # Live UI-scale: re-apply sizes that the user can't manually drag
+        # (separator, splitter handles, layout margins). Splitter sizes and
+        # _clip_height are deliberately left absolute.
+        ui_scale().changed.connect(self._on_ui_scale_changed)
 
         # Timeline signals
         self._timeline_widget.playhead_changed.connect(self._on_playhead_changed)
@@ -655,6 +693,27 @@ class MainWindow(QMainWindow):
         scrub_follow_action.triggered.connect(self._toggle_scrub_follow)
         edit_menu.addAction(scrub_follow_action)
 
+        # --- View menu ---
+        view_menu = menu.addMenu("View")
+        scale_menu = view_menu.addMenu("UI Scale")
+        self._scale_action_group = QActionGroup(self)
+        self._scale_action_group.setExclusive(True)
+        current_pct = ui_scale().percent
+        from core.ui_scale import UIScale
+        for pct in UIScale.PRESETS:
+            act = QAction(f"{pct}%", self)
+            act.setCheckable(True)
+            if pct == current_pct:
+                act.setChecked(True)
+            act.triggered.connect(
+                lambda _checked=False, p=pct: ui_scale().set_percent(p))
+            self._scale_action_group.addAction(act)
+            scale_menu.addAction(act)
+        self._scale_actions = {
+            int(a.text().rstrip("%")): a
+            for a in self._scale_action_group.actions()
+        }
+
         # --- Timeline menu ---
         timeline_menu = menu.addMenu("Timeline")
 
@@ -783,6 +842,8 @@ class MainWindow(QMainWindow):
             audio_codec=info.audio_codec,
             audio_sample_rate=info.audio_sample_rate,
             audio_channels=info.audio_channels,
+            time_base_num=info.time_base_num,
+            time_base_den=info.time_base_den,
         ) for path, info in probed]
 
         self._on_import_complete(sources)
@@ -838,6 +899,59 @@ class MainWindow(QMainWindow):
         self._update_status()
         for source in sources:
             logger.info("Imported %s", source.file_path)
+
+        self._warn_unsafe_timebases(sources)
+
+    def _warn_unsafe_timebases(self, sources: list):
+        """Inform the user, once per import / relink / project load, when
+        any source's container time_base can't exactly represent its
+        declared fps. Such sources cause ±1 frame drift on FCPXML / OTIO
+        import into NLEs that time-seek the source (Resolve, Premiere).
+
+        The dialog offers an in-app Auto-fix that runs ffmpeg ``-c copy
+        -video_track_timescale <N>`` against each unsafe source and
+        relinks the project to the produced ``*_fixed.mov``. ``-c copy``
+        preserves frame count + ordering so all existing clip edits stay
+        aligned with the new file.
+        """
+        unsafe = [s for s in sources if not s.is_seek_safe()]
+        if not unsafe:
+            return
+        from ui.timebase_warning_dialog import TimebaseWarningDialog
+        dlg = TimebaseWarningDialog(unsafe, parent=self)
+        dlg.auto_fix_requested.connect(self._run_timebase_autofix)
+        dlg.exec()
+
+    def _run_timebase_autofix(self, jobs: list):
+        """jobs: list of (source_id, input_path, output_path,
+        target_timescale). Spawns a modal progress dialog that drives a
+        sequential ffmpeg remux and relinks each fixed file as it lands.
+        """
+        if not jobs:
+            return
+        from ui.remux_progress_dialog import RemuxProgressDialog
+        progress = RemuxProgressDialog(jobs, parent=self)
+        progress.source_succeeded.connect(self._apply_single_remux_relink)
+        progress.exec()
+
+    def _apply_single_remux_relink(self, source_id: str, fixed_path: str):
+        """Pipe one freshly-remuxed file through the existing relink
+        machinery (probe + _apply_relink_results). The relink updates
+        VideoSource.file_path + new time_base, re-registers reader/proxy,
+        refreshes thumbnails, and re-fires the timebase warning — which
+        now sees the source as safe and stays silent.
+        """
+        from utils.ffprobe import probe_video
+        info = probe_video(fixed_path)
+        if info is None:
+            QMessageBox.warning(
+                self, "Relink failed",
+                f"Remuxed file probed empty:\n{fixed_path}\n\n"
+                "The fix-file was created but PrismaSynth couldn't read "
+                "it back. Try Tools → Relink… manually.")
+            return
+        self._apply_relink_results({source_id: fixed_path},
+                                   {source_id: info})
 
     # --- Media Panel handlers ---
 
@@ -941,7 +1055,7 @@ class MainWindow(QMainWindow):
         refreshes the source thumbnail. Shared by per-source relink (Media
         Pool) and the Tools menu's bulk-relink entry."""
         clamp_total = 0
-        touched = False
+        touched_sources: list = []
         from core.source_thumbnail import extract_thumbnail
         for source_id, new_path in resolved.items():
             if not new_path:
@@ -961,6 +1075,8 @@ class MainWindow(QMainWindow):
                 src.audio_codec = info.audio_codec
                 src.audio_sample_rate = info.audio_sample_rate
                 src.audio_channels = info.audio_channels
+                src.time_base_num = info.time_base_num
+                src.time_base_den = info.time_base_den
                 if info.total_frames < old_total_frames:
                     new_max = info.total_frames - 1
                     for c in self._timeline.clips:
@@ -976,17 +1092,18 @@ class MainWindow(QMainWindow):
             self._proxy_manager.load_or_open(src, force_reopen=True)
             extract_thumbnail(src, force=True)
             self._media_panel.refresh_thumbnail(src)
-            touched = True
+            touched_sources.append(src)
         if clamp_total:
             QMessageBox.warning(
                 self, "Clips Clamped",
                 f"{clamp_total} clip(s) had their out-points trimmed because "
                 "a relinked source has fewer frames.",
             )
-        if touched:
+        if touched_sources:
             self._dirty = True
             self._update_status()
             self._timeline_widget.update()
+            self._warn_unsafe_timebases(touched_sources)
 
     def _on_source_remove_requested(self, source_ids):
         """Remove one or many sources from the Media Pool. Single-source
@@ -1073,6 +1190,39 @@ class MainWindow(QMainWindow):
     def _on_top_splitter_moved(self, *_):
         QSettings().setValue(
             "main_window/top_splitter_sizes", self._top_splitter.sizes())
+
+    def _on_main_splitter_moved(self, *_):
+        QSettings().setValue(
+            "main_window/vertical_splitter_sizes", self._main_splitter.sizes())
+
+    def _on_right_tab_changed(self, idx: int):
+        QSettings().setValue("main_window/right_tab_index", int(idx))
+
+    def _on_ui_scale_changed(self):
+        """Re-apply scaled chrome sizes when the user picks a new UI scale.
+        Splitter sizes and the user's draggable clip-height are intentionally
+        left absolute (they reflect deliberate user gestures). Persistent
+        panels manage their own re-apply via their own UIScale.changed slots."""
+        s = ui_scale()
+        # Top separator + splitter handle (visual chrome only).
+        try:
+            self._top_separator.setFixedHeight(s.px(4))
+        except AttributeError:
+            pass
+        try:
+            self._top_splitter.setHandleWidth(s.px(4))
+        except AttributeError:
+            pass
+        # Timeline container's left/right margin scales with the rest of the chrome.
+        try:
+            m = s.px(16)
+            self._timeline_container_layout.setContentsMargins(m, 0, m, 0)
+        except AttributeError:
+            pass
+        # Re-check the matching menu radio item (handles programmatic changes).
+        act = self._scale_actions.get(s.percent) if hasattr(self, "_scale_actions") else None
+        if act is not None and not act.isChecked():
+            act.setChecked(True)
 
     # --- Timeline drop handlers (from Media Panel drag) ---
 
@@ -1830,7 +1980,10 @@ class MainWindow(QMainWindow):
                          scroll_offset=scroll,
                          pixels_per_frame=zoom,
                          orphan_paths=self._orphan_paths,
-                         groups=self._timeline.groups)
+                         groups=self._timeline.groups,
+                         top_splitter_sizes=self._top_splitter.sizes(),
+                         vertical_splitter_sizes=self._main_splitter.sizes(),
+                         right_tab_index=self._right_tabs.currentIndex())
             self._project_path = path
             self._dirty = False
             self._autosave_timer.stop()
@@ -1887,6 +2040,8 @@ class MainWindow(QMainWindow):
                     src.audio_codec = info.audio_codec
                     src.audio_sample_rate = info.audio_sample_rate
                     src.audio_channels = info.audio_channels
+                    src.time_base_num = info.time_base_num
+                    src.time_base_den = info.time_base_den
                     if info.total_frames < old_total_frames:
                         shrunk_sources.add(sid)
                 relinks_applied = True
@@ -1975,9 +2130,40 @@ class MainWindow(QMainWindow):
         if out_pt is not None:
             self._timeline.set_out_point(out_pt)
 
+        # Surface the seek-drift warning for any source whose container
+        # time_base can't exactly represent its declared fps. Fires once per
+        # project load; users dismiss the dialog after acting on it.
+        self._warn_unsafe_timebases(list(self._sources.values()))
+
         # Restore selection follows + sync toolbar toggle
         self._selection_follows_playhead = data.get("selection_follows_playhead", True)
         self._toolbar._selection_follows_action.setChecked(self._selection_follows_playhead)
+
+        # Restore per-project workspace layout (project wins; absent on
+        # legacy projects, in which case the QSettings/default layout
+        # already in effect at startup is preserved untouched).
+        saved_top = data.get("top_splitter_sizes")
+        if saved_top:
+            try:
+                self._top_splitter.setSizes([int(s) for s in saved_top])
+            except (TypeError, ValueError):
+                pass
+
+        saved_vert = data.get("vertical_splitter_sizes")
+        if saved_vert:
+            try:
+                self._main_splitter.setSizes([int(s) for s in saved_vert])
+            except (TypeError, ValueError):
+                pass
+
+        saved_tab = data.get("right_tab_index")
+        if saved_tab is not None:
+            try:
+                idx = int(saved_tab)
+                if 0 <= idx < self._right_tabs.count():
+                    self._right_tabs.setCurrentIndex(idx)
+            except (TypeError, ValueError):
+                pass
 
         # Start thumbnails
         self._start_thumbnail_cache()
