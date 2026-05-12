@@ -1005,8 +1005,10 @@ class MainWindow(QMainWindow):
 
     def _on_import(self):
         ref_w, ref_h, ref_fps = self._get_timeline_ref()
+        start_dir = QSettings().value("dialogs/last_import_dir", "", str)
         dialog = ImportDialog(ref_width=ref_w, ref_height=ref_h,
-                              ref_fps=ref_fps, parent=self)
+                              ref_fps=ref_fps, start_dir=start_dir,
+                              parent=self)
         dialog.import_complete.connect(self._on_import_complete)
         dialog.exec()
 
@@ -1093,6 +1095,9 @@ class MainWindow(QMainWindow):
         clips bind back automatically."""
         if not sources:
             return
+        QSettings().setValue(
+            "dialogs/last_import_dir",
+            os.path.dirname(sources[0].file_path))
         for source in sources:
             # Orphan revival: exact file_path match against the removed-paths
             # registry. The new source takes the old UUID so existing clips
@@ -2118,9 +2123,22 @@ class MainWindow(QMainWindow):
         render_frames = self._get_render_frame_count() if has_in_out else None
         clip_count = self._timeline.real_clip_count
 
+        # Browse buttons default to the project's directory (when saved), else
+        # to the first timeline source's directory.
+        default_dir = ""
+        if self._project_path:
+            default_dir = os.path.dirname(self._project_path)
+        elif self._sources:
+            first_clip = next(
+                (c for c in self._timeline.clips if not c.is_gap), None)
+            src = (self._sources.get(first_clip.source_id)
+                   if first_clip else next(iter(self._sources.values()), None))
+            if src is not None:
+                default_dir = os.path.dirname(src.file_path)
         dialog = ExportDialog(w, h, fps, export_frames, render_frames=render_frames,
                               clip_count=clip_count, source_width=w, source_height=h,
-                              timeline=self._timeline, parent=self)
+                              timeline=self._timeline, default_dir=default_dir,
+                              parent=self)
         dialog._tabs.setCurrentIndex(tab)
         dialog.export_requested.connect(
             lambda settings: self._run_export(settings, dialog)
@@ -2198,12 +2216,18 @@ class MainWindow(QMainWindow):
             self._on_save_project_as()
 
     def _on_save_project_as(self):
+        settings = QSettings()
+        if self._project_path:
+            start = os.path.dirname(self._project_path)
+        else:
+            start = settings.value("dialogs/last_project_dir", "", str)
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Project", "", "PrismaSynth Project (*.psynth)"
+            self, "Save Project", start, "PrismaSynth Project (*.psynth)"
         )
         if path:
             if not path.endswith(".psynth"):
                 path += ".psynth"
+            settings.setValue("dialogs/last_project_dir", os.path.dirname(path))
             self._save_to(path)
 
     def _save_to(self, path: str):
@@ -2240,10 +2264,13 @@ class MainWindow(QMainWindow):
     def _on_open_project(self):
         if not self._confirm_discard():
             return
+        settings = QSettings()
+        start = settings.value("dialogs/last_project_dir", "", str)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Project", "", "PrismaSynth Project (*.psynth)"
+            self, "Open Project", start, "PrismaSynth Project (*.psynth)"
         )
         if path:
+            settings.setValue("dialogs/last_project_dir", os.path.dirname(path))
             self._load_from(path)
 
     def _load_from(self, path: str, project_path_override: Optional[str] = None):

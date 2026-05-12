@@ -94,9 +94,10 @@ class ExportDialog(QDialog):
                  default_fps: float = 24.0, total_frames: int = 0,
                  render_frames: int = None, clip_count: int = 0,
                  source_width: int = 0, source_height: int = 0,
-                 timeline=None, parent=None):
+                 timeline=None, default_dir: str = "", parent=None):
         super().__init__(parent)
         self._timeline = timeline
+        self._default_dir = default_dir
         self._has_render_range = (
             render_frames is not None and render_frames != total_frames)
         self.setWindowTitle("Export")
@@ -515,7 +516,7 @@ class ExportDialog(QDialog):
         codec_key = self._selected_codec_key()
         ext = VIDEO_PRESETS[codec_key]["ext"]
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Video", "", f"Video (*{ext})"
+            self, "Save Video", self._default_dir, f"Video (*{ext})"
         )
         if path:
             self._vid_output.setText(path)
@@ -557,7 +558,7 @@ class ExportDialog(QDialog):
         fmt_key = self._audio_format_combo.currentData() or "wav"
         ext = AUDIO_FORMAT_PRESETS[fmt_key]["ext"]
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Audio", "", f"Audio (*{ext})"
+            self, "Save Audio", self._default_dir, f"Audio (*{ext})"
         )
         if path:
             if not path.lower().endswith(ext):
@@ -592,13 +593,15 @@ class ExportDialog(QDialog):
         self._audio_path_auto_value = derived
 
     def _browse_image_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", self._default_dir)
         if path:
             self._img_output_dir.setText(path)
 
     def _browse_xml_output(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save FCPXML", "", "Final Cut Pro XML (*.fcpxml)")
+            self, "Save FCPXML", self._default_dir,
+            "Final Cut Pro XML (*.fcpxml)")
         if path:
             if not path.lower().endswith(".fcpxml"):
                 path += ".fcpxml"
@@ -606,7 +609,8 @@ class ExportDialog(QDialog):
 
     def _browse_otio_output(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save OpenTimelineIO", "", "OpenTimelineIO (*.otio)")
+            self, "Save OpenTimelineIO", self._default_dir,
+            "OpenTimelineIO (*.otio)")
         if path:
             if not path.lower().endswith(".otio"):
                 path += ".otio"
@@ -616,7 +620,7 @@ class ExportDialog(QDialog):
         fmt_key = self._aud_format_combo.currentData() or "wav"
         ext = AUDIO_FORMAT_PRESETS[fmt_key]["ext"]
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Audio", "", f"Audio (*{ext})"
+            self, "Save Audio", self._default_dir, f"Audio (*{ext})"
         )
         if path:
             if not path.lower().endswith(ext):

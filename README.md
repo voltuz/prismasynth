@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![PySide6](https://img.shields.io/badge/PySide6-6.8+-green.svg)
-![Version](https://img.shields.io/badge/version-v0.15.0-green.svg)
+![Version](https://img.shields.io/badge/version-v0.15.1-green.svg)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey.svg)
 
 PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with a GPU neural network, review/trim/split clips on a timeline, tag clips with People (groups) for keyboard-fast curation, and export selected groups as video, audio, image sequence, FCPXML, or OpenTimelineIO. Single-track editor — no layers, no compositing.

@@ -27,7 +27,7 @@ class ImportDialog(QDialog):
     import_complete = Signal(list)  # List[VideoSource]
 
     def __init__(self, ref_width: int = 0, ref_height: int = 0,
-                 ref_fps: float = 0.0, parent=None):
+                 ref_fps: float = 0.0, start_dir: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import Video")
         self.setMinimumWidth(ui_scale().px(450))
@@ -36,6 +36,7 @@ class ImportDialog(QDialog):
         self._ref_width = ref_width
         self._ref_height = ref_height
         self._ref_fps = ref_fps
+        self._start_dir = start_dir
 
         layout = QVBoxLayout(self)
 
@@ -54,7 +55,7 @@ class ImportDialog(QDialog):
 
     def _browse(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Video File(s)", "", VIDEO_FILTERS
+            self, "Select Video File(s)", self._start_dir, VIDEO_FILTERS
         )
         if not paths:
             return
