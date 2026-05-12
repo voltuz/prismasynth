@@ -24,6 +24,8 @@ from core.exporter import Exporter
 from core.thumbnail_cache import ThumbnailCache
 from core.proxy_cache import ProxyManager
 from core.project import save_project, load_project
+from core.project_versions import ProjectVersionStore
+from core.frame_snapshot import snapshot_frame_to_png
 from core.source_thumbnail import extract_thumbnail
 from utils.paths import get_config_dir
 from ui.icon_loader import icon
@@ -248,6 +250,9 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._recent_files: list = []
         self._load_recent_files()
+        # Version-snapshot store, lazily bound to the current project path
+        # by _ensure_version_store(). None until the project is saved.
+        self._version_store: Optional[ProjectVersionStore] = None
 
         # Autosave timer (every 60 seconds when dirty)
         self._autosave_timer = QTimer()
@@ -332,6 +337,8 @@ class MainWindow(QMainWindow):
         # tightened via stylesheet so it doesn't eat horizontal space.
         self._clip_info = ClipInfoPanel()
         self._people_panel = PeoplePanel(self._timeline)
+        self._people_panel.group_delete_confirmed.connect(
+            lambda _gid: self._take_pre_op_snapshot("pre_group_delete"))
         self._right_tabs = QTabWidget()
         self._right_tabs.setTabPosition(QTabWidget.TabPosition.West)
         self._right_tabs.addTab(self._clip_info, "Clip Info")
@@ -556,6 +563,192 @@ class MainWindow(QMainWindow):
         dlg = KeyboardShortcutsDialog(self._shortcut_mgr, parent=self)
         dlg.exec()
 
+    # ------------------------------------------------------------------
+    # Frame snapshot
+    # ------------------------------------------------------------------
+
+    def _snapshot_dir(self) -> Optional[str]:
+        """Return the per-project snapshots directory, creating it if needed.
+        None when the project has no path on disk yet."""
+        if not self._project_path:
+            return None
+        stem, _ = os.path.splitext(self._project_path)
+        path = stem + "_snapshots"
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as e:
+            logger.warning("snapshot dir creation failed: %s", e)
+            return None
+        return path
+
+    def _snapshot_target_under_playhead(self):
+        """Return (source, source_frame) for the playhead position, or None
+        when on a gap / past the timeline."""
+        if not self._project_path:
+            return None
+        try:
+            playhead = self._timeline_widget.strip.playhead_frame
+        except AttributeError:
+            return None
+        result = self._timeline.timeline_frame_to_source_frame(playhead)
+        if result is None:
+            return None
+        clip, src_frame = result
+        source = self._sources.get(clip.source_id)
+        if source is None or not os.path.exists(source.file_path):
+            return None
+        return (source, src_frame)
+
+    def _refresh_snapshot_action(self):
+        """Recompute Snapshot Frame action enabled state. Called whenever the
+        playhead, selection, or project path could have changed."""
+        if not hasattr(self, "_snapshot_frame_action"):
+            return
+        target = self._snapshot_target_under_playhead()
+        if target is None:
+            self._snapshot_frame_action.setEnabled(False)
+            if not self._project_path:
+                tt = "Save the project first to enable snapshots."
+            else:
+                tt = "Move the playhead to a clip to snapshot a frame."
+            self._snapshot_frame_action.setToolTip(tt)
+        else:
+            self._snapshot_frame_action.setEnabled(True)
+            self._snapshot_frame_action.setToolTip(
+                "Save current preview frame to PNG (F12)")
+
+    def _on_snapshot_frame(self):
+        target = self._snapshot_target_under_playhead()
+        if target is None:
+            return
+        source, src_frame = target
+        out_dir = self._snapshot_dir()
+        if out_dir is None:
+            return
+        from pathlib import Path
+        src_stem = os.path.splitext(os.path.basename(source.file_path))[0]
+        ts = time.strftime("%H%M%S")
+        out_path = Path(out_dir) / f"{src_stem}_f{src_frame}_{ts}.png"
+        result = snapshot_frame_to_png(
+            source.file_path, src_frame, source.fps, out_path)
+        if result:
+            self._status_bar.showMessage(
+                f"Saved snapshot: {os.path.basename(result)}", 3000)
+        else:
+            self._status_bar.showMessage(
+                "Snapshot failed — see logs", 5000)
+
+    # ------------------------------------------------------------------
+    # Project version snapshots
+    # ------------------------------------------------------------------
+
+    def _refresh_version_actions(self):
+        """Enable/disable the version-related actions based on whether the
+        project has a path on disk yet."""
+        has_path = bool(self._project_path)
+        for attr in ("_versions_action", "_manual_snapshot_action"):
+            act = getattr(self, attr, None)
+            if act is None:
+                continue
+            act.setEnabled(has_path)
+            if not has_path:
+                act.setToolTip("Save the project to enable versions.")
+            else:
+                act.setToolTip("")
+
+    def _ensure_version_store(self):
+        """Re-bind the version store to the current project path. Called from
+        save / load. Returns the store, or None when the project has no path."""
+        if not self._project_path:
+            self._version_store = None
+            return None
+        store = getattr(self, "_version_store", None)
+        if store is None or store.project_path != self._project_path:
+            self._version_store = ProjectVersionStore(self._project_path)
+        return self._version_store
+
+    def _take_pre_op_snapshot(self, trigger: str):
+        """Best-effort pre-op snapshot. No-op when there's no project path or
+        the on-disk file doesn't exist yet."""
+        store = self._ensure_version_store()
+        if store is None:
+            return
+        # Pre-op snapshots reflect the *saved* state right before the op. If
+        # the project is dirty, flush to disk first so the version actually
+        # captures the working state.
+        if self._dirty and self._project_path:
+            try:
+                self._save_to(self._project_path)
+            except Exception:
+                logger.exception("pre-op flush save failed")
+        try:
+            store.create(trigger=trigger)
+        except Exception:
+            logger.exception("pre-op snapshot failed (non-fatal)")
+
+    def _on_project_versions(self):
+        store = self._ensure_version_store()
+        if store is None:
+            QMessageBox.information(
+                self, "Project Versions",
+                "Save the project first — versions live alongside the .psynth file.")
+            return
+        from ui.versions_dialog import VersionsDialog
+        dlg = VersionsDialog(store, parent=self)
+        dlg.restore_requested.connect(self._on_restore_version)
+        dlg.exec()
+
+    def _on_manual_project_snapshot(self):
+        store = self._ensure_version_store()
+        if store is None:
+            QMessageBox.information(
+                self, "Snapshot Project",
+                "Save the project first — versions live alongside the .psynth file.")
+            return
+        label, ok = QInputDialog.getText(
+            self, "Snapshot Project",
+            "Optional label for this snapshot:")
+        if not ok:
+            return
+        # Flush dirty state so the snapshot reflects what's in front of the user.
+        if self._dirty:
+            self._save_to(self._project_path)
+        entry = store.create(trigger="manual", label=label.strip() or None)
+        if entry is None:
+            QMessageBox.warning(
+                self, "Snapshot Failed",
+                "Could not create the snapshot. See logs for details.")
+            return
+        self._status_bar.showMessage(
+            f"Snapshot saved ({entry.filename})", 3000)
+
+    def _on_restore_version(self, filename: str):
+        store = self._ensure_version_store()
+        if store is None:
+            return
+        version_path = store.restore(filename)
+        if version_path is None:
+            QMessageBox.warning(
+                self, "Restore Failed",
+                "The selected version file is missing on disk.")
+            return
+        # Flush current state to disk first so the pre-restore snapshot
+        # captures the user's working version (not whatever was last saved).
+        if self._project_path and self._dirty:
+            self._save_to(self._project_path)
+        try:
+            store.create(trigger="pre_restore")
+        except Exception:
+            logger.exception("pre_restore snapshot failed (non-fatal)")
+        # Load the chosen version into memory but keep the live project path.
+        original_path = self._project_path
+        self._load_from(str(version_path), project_path_override=original_path)
+        # Mark dirty so the restored state gets written to the live .psynth
+        # on the next autosave / explicit save.
+        self._mark_dirty()
+        self._status_bar.showMessage(
+            f"Restored version {filename}", 4000)
+
     def _dump_diag(self):
         """Diagnostic shortcut handler — writes a thread dump to diag.log."""
         from utils.diag import diag, dump_all_thread_stacks
@@ -597,7 +790,7 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._on_open_project)
         file_menu.addAction(open_action)
 
-        self._recent_menu = file_menu.addMenu("Recent Projects")
+        self._recent_menu = file_menu.addMenu(icon("history"), "Recent Projects")
         self._rebuild_recent_menu()
 
         file_menu.addSeparator()
@@ -614,7 +807,21 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        shortcuts_action = QAction("Keyboard Shortcuts...", self)
+        self._versions_action = QAction(icon("history"), "Project Versions…", self)
+        self._shortcut_mgr.attach_action("project_versions", self._versions_action)
+        self._versions_action.triggered.connect(self._on_project_versions)
+        file_menu.addAction(self._versions_action)
+
+        self._manual_snapshot_action = QAction(
+            icon("history"), "Snapshot Project Now…", self)
+        self._shortcut_mgr.attach_action(
+            "manual_project_snapshot", self._manual_snapshot_action)
+        self._manual_snapshot_action.triggered.connect(self._on_manual_project_snapshot)
+        file_menu.addAction(self._manual_snapshot_action)
+
+        file_menu.addSeparator()
+
+        shortcuts_action = QAction(icon("keyboard"), "Keyboard Shortcuts...", self)
         shortcuts_action.triggered.connect(self._on_keyboard_shortcuts)
         file_menu.addAction(shortcuts_action)
 
@@ -695,7 +902,7 @@ class MainWindow(QMainWindow):
 
         # --- View menu ---
         view_menu = menu.addMenu("View")
-        scale_menu = view_menu.addMenu("UI Scale")
+        scale_menu = view_menu.addMenu(icon("scaling"), "UI Scale")
         self._scale_action_group = QActionGroup(self)
         self._scale_action_group.setExclusive(True)
         current_pct = ui_scale().percent
@@ -774,6 +981,16 @@ class MainWindow(QMainWindow):
         cut_inspect_action = QAction(icon("cut-inspect"), "Cut Inspect…", self)
         cut_inspect_action.triggered.connect(self._on_tools_cut_inspect)
         tools_menu.addAction(cut_inspect_action)
+
+        tools_menu.addSeparator()
+
+        self._snapshot_frame_action = QAction(icon("camera"), "Snapshot Frame", self)
+        self._shortcut_mgr.attach_action("snapshot_frame", self._snapshot_frame_action)
+        self._snapshot_frame_action.triggered.connect(self._on_snapshot_frame)
+        tools_menu.addAction(self._snapshot_frame_action)
+        # Disabled state and tooltip are recomputed on every selection /
+        # playhead change via _refresh_dynamic_actions.
+        self._snapshot_frame_action.setEnabled(False)
 
     # --- Import ---
 
@@ -1172,6 +1389,9 @@ class MainWindow(QMainWindow):
                 self._do_remove_source(sid, remove_clips=False)
 
     def _do_remove_source(self, source_id: str, *, remove_clips: bool):
+        # Pre-op project version: source removal is irreversible at the
+        # project-file level once autosave overwrites the saved .psynth.
+        self._take_pre_op_snapshot("pre_source_removal")
         src = self._sources.get(source_id)
         if remove_clips:
             self._timeline.remove_source_clips(source_id)
@@ -1356,6 +1576,11 @@ class MainWindow(QMainWindow):
                     sub_clips.append(suffix)
         self._detect_partials = {}
 
+        # Project version snapshot before the wholesale replace_detected swap
+        # — in-memory undo covers single-session rollback, this is durable.
+        if results:
+            self._take_pre_op_snapshot("pre_detect_cuts")
+
         self._timeline.replace_detected(results)
 
         # Reload proxies saved by scene detector (force reopen to pick up new data)
@@ -1450,6 +1675,7 @@ class MainWindow(QMainWindow):
         # Playback-driven update — just sync UI, don't touch mpv
         if self._playback_updating:
             self._status_frame.setText(f"Frame {frame}")
+            self._refresh_snapshot_action()
             return
 
         # User moved the playhead — restart playback from new position if playing
@@ -1457,6 +1683,7 @@ class MainWindow(QMainWindow):
             self._stop_playback()
             self._timeline_widget.strip._playhead_frame = frame
             self._start_playback()
+            self._refresh_snapshot_action()
             return
 
         self._status_frame.setText(f"Frame {frame}")
@@ -1466,6 +1693,7 @@ class MainWindow(QMainWindow):
         if self._selection_follows_playhead and result:
             clip, _ = result
             self._timeline.select_clip(clip.id)
+        self._refresh_snapshot_action()
 
         # EXPERIMENT v0.9.x: don't pause the thumbnail coordinator during
         # scrub. With a full pre-bake on disk, the coordinator's work is
@@ -1560,6 +1788,8 @@ class MainWindow(QMainWindow):
             return
         # Teleport playhead only when deleting gaps
         selected = self._timeline.selected_ids
+        if len(selected) > 5:
+            self._take_pre_op_snapshot("pre_multi_delete")
         deleting_gaps = all(
             c.is_gap for c in self._timeline.clips if c.id in selected)
         target_frame = self._earliest_selected_frame() if deleting_gaps else -1
@@ -1575,6 +1805,8 @@ class MainWindow(QMainWindow):
             return
         # Only teleport playhead when deleting gaps
         selected = self._timeline.selected_ids
+        if len(selected) > 5:
+            self._take_pre_op_snapshot("pre_multi_delete")
         deleting_gaps = all(
             c.is_gap for c in self._timeline.clips if c.id in selected)
         target_frame = self._earliest_selected_frame() if deleting_gaps else -1
@@ -1955,6 +2187,9 @@ class MainWindow(QMainWindow):
         self._autosave_timer.stop()
         self._update_title()
         self._update_status()
+        self._version_store = None
+        self._refresh_version_actions()
+        self._refresh_snapshot_action()
 
     def _on_save_project(self):
         if self._project_path:
@@ -1992,6 +2227,11 @@ class MainWindow(QMainWindow):
             self._autosave_timer.stop()
             self._add_recent_file(path)
             self._update_title()
+            # Refresh per-project state tied to the path (versions store +
+            # snapshot/version action enabled flags).
+            self._ensure_version_store()
+            self._refresh_version_actions()
+            self._refresh_snapshot_action()
             logger.info("Project saved to %s", path)
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save project:\n{e}")
@@ -2006,7 +2246,11 @@ class MainWindow(QMainWindow):
         if path:
             self._load_from(path)
 
-    def _load_from(self, path: str):
+    def _load_from(self, path: str, project_path_override: Optional[str] = None):
+        """Load project state from `path`. By default the live `_project_path`
+        is set to `path`; pass `project_path_override` to load a file (e.g. a
+        version snapshot) into memory while keeping the live path pointed at
+        a different file. The override path is also used for Recent Files."""
         try:
             data = load_project(path)
         except Exception as e:
@@ -2172,22 +2416,35 @@ class MainWindow(QMainWindow):
         self._start_thumbnail_cache()
 
         # Update state
-        self._project_path = path
+        live_path = project_path_override if project_path_override else path
+        self._project_path = live_path
         self._dirty = relinks_applied
         if relinks_applied:
             # Restart autosave so the new paths get persisted within 60s.
             self._autosave_timer.start()
         else:
             self._autosave_timer.stop()
-        self._add_recent_file(path)
+        self._add_recent_file(live_path)
         self._update_title()
         self._update_status()
+        # Re-bind per-project state to the live project path.
+        self._ensure_version_store()
+        self._refresh_version_actions()
+        self._refresh_snapshot_action()
         logger.info("Project loaded from %s: %d sources, %d clips",
                      path, len(self._sources), self._timeline.clip_count)
 
     def _autosave(self):
         if self._dirty and self._project_path:
             self._save_to(self._project_path)
+            # Roll the just-saved state into the version history. Best-effort:
+            # any failure is logged inside the store and never propagates.
+            store = self._ensure_version_store()
+            if store is not None:
+                try:
+                    store.create(trigger="autosave")
+                except Exception:
+                    logger.exception("autosave version create failed (non-fatal)")
 
     def _confirm_discard(self) -> bool:
         """Ask user to save if there are unsaved changes. Returns True to proceed."""

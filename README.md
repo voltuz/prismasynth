@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![PySide6](https://img.shields.io/badge/PySide6-6.8+-green.svg)
-![Version](https://img.shields.io/badge/version-v0.14.1-green.svg)
+![Version](https://img.shields.io/badge/version-v0.15.0-green.svg)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey.svg)
 
 PrismaSynth is a PySide6 video editing tool for curating deepfake training datasets. Import movies, auto-detect shot boundaries with a GPU neural network, review/trim/split clips on a timeline, tag clips with People (groups) for keyboard-fast curation, and export selected groups as video, audio, image sequence, FCPXML, or OpenTimelineIO. Single-track editor — no layers, no compositing.
@@ -15,6 +15,8 @@ Built for speed: the entire preview pipeline stays on GPU (NVDEC decode → GPU 
 - **GPU scrubbing** — libmpv-backed preview at full quality, NVDEC → GPU buffer → display, never falls back to proxies.
 - **Scene detection** — TransNetV2 (GPU, default) or OmniShotCut transformer (sidecar venv, hard-cuts mode); HSV-differencing fallback when CUDA isn't available.
 - **People (group) tagging** — colored tags with optional digit shortcuts (0–9). Press a digit to toggle the group on selected clips. Multi-clip behaviour: tags all clips if any are missing the group, untags all if every clip already had it.
+- **Project Versions** — durable `.psynth` snapshots in a sibling `*.versions/` folder. Captured on every autosave, on demand, and before risky operations (Detect Cuts, multi-delete, group delete, source removal, restore). Older versions are thinned automatically (1/hour for a day, 1/day for a week, 1/week beyond). Restore is itself reversible — a fresh pre-restore snapshot is always taken first.
+- **Frame Snapshot (F12)** — `Tools → Snapshot Frame` writes the current preview frame to a full-resolution PNG in a per-project `_snapshots/` folder. Reuses the exporter's `(frame − 0.5) / fps` seek margin so the saved frame is exactly the one on screen.
 - **Five export formats, one dialog** — Video, Image Sequence, Audio Only, FCPXML, OpenTimelineIO. Shared "Include gaps" and "Use in/out range" toggles; shared People-group filter to export only tagged subsets.
 - **Audio export modes** — none, embedded, standalone sidecar, or both. Standalone supports WAV, FLAC, MP3, M4A.
 - **Source timebase audit & Auto-fix** — flags sources whose container `time_base` can't exactly represent their fps (the cause of ±1-frame drift on FCPXML/OTIO import in NLEs that time-seek the source). One-click in-app FFmpeg remux fixes them, with audio re-encode options (keep / PCM same channels / PCM stereo) and live progress.

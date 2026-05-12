@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import time
+from typing import Optional
 
 import numpy as np
 from PySide6.QtWidgets import (
@@ -265,6 +266,14 @@ class PreviewWidget(QWidget):
             except Exception:
                 pass
         return -1.0
+
+    def current_source_path(self) -> Optional[str]:
+        """Path of the source currently loaded in mpv, or None."""
+        return self._current_source
+
+    def is_on_gap(self) -> bool:
+        """True when the black gap overlay is visible (no real frame on screen)."""
+        return bool(self._black_overlay.isVisible())
 
     def show_black(self):
         """Show black screen for gaps. No mpv state change — just overlay."""

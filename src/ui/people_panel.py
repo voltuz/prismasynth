@@ -161,6 +161,9 @@ class PeoplePanel(QWidget):
 
     # Reserved for a future "filter timeline by group" feature.
     group_clicked = Signal(str)
+    # Emitted right after the user confirms a group deletion but BEFORE the
+    # timeline mutation. MainWindow uses it to take a project version snapshot.
+    group_delete_confirmed = Signal(str)  # group_id
 
     def __init__(self, timeline: TimelineModel, parent=None):
         super().__init__(parent)
@@ -315,4 +318,5 @@ class PeoplePanel(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if ret == QMessageBox.StandardButton.Yes:
+            self.group_delete_confirmed.emit(group_id)
             self._timeline.remove_group(group_id)

@@ -38,6 +38,12 @@ SHORTCUTS: List[ShortcutDef] = [
     ShortcutDef("open_project",       "File",     "Open Project",               "Ctrl+O"),
     ShortcutDef("save_project",       "File",     "Save Project",               "Ctrl+S"),
     ShortcutDef("save_as",            "File",     "Save Project As",            "Ctrl+Shift+S"),
+    # Project history — versions live in <project>.psynth.versions/ alongside
+    # the project file. Menu-only by default; users can bind keys themselves.
+    ShortcutDef("project_versions",         "File", "Project Versions",         ""),
+    ShortcutDef("manual_project_snapshot",  "File", "Snapshot Project Now",     ""),
+    # Tools
+    ShortcutDef("snapshot_frame",     "Tools",    "Snapshot Frame",             "F12"),
     # Edit
     ShortcutDef("split",              "Edit",     "Split at Playhead",          "S"),
     ShortcutDef("delete",             "Edit",     "Delete Selected",            "W"),
