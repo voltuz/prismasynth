@@ -65,6 +65,8 @@ SHORTCUTS: List[ShortcutDef] = [
     ShortcutDef("import_video",       "Timeline", "Import Video",               "Ctrl+I"),
     ShortcutDef("export_video",       "Timeline", "Export Video",               "Ctrl+E"),
     ShortcutDef("export_images",      "Timeline", "Export Image Sequence",      "Ctrl+Shift+E"),
+    # 81-frame@16fps per-crop export. No default key (user can bind one).
+    ShortcutDef("export_crops",       "Timeline", "Export Crops",               ""),
     ShortcutDef("detect_cuts",        "Timeline", "Detect Cuts",                "Ctrl+D"),
     ShortcutDef("play_pause",         "Timeline", "Play / Pause",               "Space"),
     ShortcutDef("playhead_left",      "Timeline", "Step Playhead Left",         "Left"),

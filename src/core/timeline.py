@@ -366,7 +366,8 @@ class TimelineModel(QObject):
         return g
 
     def remove_group(self, group_id: str):
-        """Delete a group and strip its id from every clip's group_ids."""
+        """Delete a group and strip its id from every clip's group_ids
+        and every crop region's group_id."""
         if group_id not in self._groups:
             return
         self._push_undo()
@@ -374,6 +375,9 @@ class TimelineModel(QObject):
         for c in self._clips:
             if group_id in c.group_ids:
                 c.group_ids = [gid for gid in c.group_ids if gid != group_id]
+            for cr in c.crop_regions:
+                if cr.group_id == group_id:
+                    cr.group_id = None
         self.groups_changed.emit()
         self.clips_changed.emit()
 
@@ -437,6 +441,78 @@ class TimelineModel(QObject):
         Used by project load. Does NOT push undo (load is a fresh state)."""
         self._groups = {g.id: g for g in groups_iter}
         self.groups_changed.emit()
+
+    # --- Crop Regions ---
+
+    def add_crop_region(self, clip_id: str, crop) -> Optional[str]:
+        """Append a ``CropRegion`` to the clip. Returns the crop's id, or
+        None if the clip doesn't exist or is a gap. Caller is responsible
+        for validating the geometry / anchor against the source — this
+        method just stores what it was given."""
+        clip = self.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return None
+        self._push_undo()
+        clip.crop_regions = list(clip.crop_regions) + [crop]
+        self.clips_changed.emit()
+        return crop.id
+
+    def update_crop_region(self, clip_id: str, crop_id: str, **fields) -> bool:
+        """Apply partial updates to one crop region. Returns True on success.
+        Unknown field names are ignored. Always pushes undo so geometry
+        changes from preview drags accumulate as undoable history."""
+        clip = self.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return False
+        for cr in clip.crop_regions:
+            if cr.id == crop_id:
+                self._push_undo()
+                for k, v in fields.items():
+                    if hasattr(cr, k):
+                        setattr(cr, k, v)
+                self.clips_changed.emit()
+                return True
+        return False
+
+    def remove_crop_region(self, clip_id: str, crop_id: str) -> bool:
+        """Remove a crop region by id. Returns True on success."""
+        clip = self.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return False
+        new_list = [cr for cr in clip.crop_regions if cr.id != crop_id]
+        if len(new_list) == len(clip.crop_regions):
+            return False
+        self._push_undo()
+        clip.crop_regions = new_list
+        self.clips_changed.emit()
+        return True
+
+    def toggle_crop_active(self, clip_id: str, crop_id: str) -> bool:
+        """Flip a crop's ``active`` flag. Returns True on success."""
+        clip = self.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return False
+        for cr in clip.crop_regions:
+            if cr.id == crop_id:
+                self._push_undo()
+                cr.active = not cr.active
+                self.clips_changed.emit()
+                return True
+        return False
+
+    def iter_crops(self):
+        """Yield ``(clip, crop)`` for every non-gap clip's crops in
+        timeline order. Used by the crop exporter and the export dialog
+        for total-count / filter checks."""
+        for c in self._clips:
+            if c.is_gap:
+                continue
+            for cr in c.crop_regions:
+                yield (c, cr)
+
+    def crop_count(self) -> int:
+        """Total crop regions across all non-gap clips."""
+        return sum(1 for _ in self.iter_crops())
 
     # --- In/Out Points ---
 

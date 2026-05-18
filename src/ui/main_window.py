@@ -21,6 +21,7 @@ from core.video_reader import VideoReaderPool
 from core.xml_exporter import export_fcpxml
 from core.otio_exporter import export_otio
 from core.exporter import Exporter
+from core.crop_exporter import CropExporter
 from core.thumbnail_cache import ThumbnailCache
 from core.proxy_cache import ProxyManager
 from core.project import save_project, load_project
@@ -40,6 +41,7 @@ from ui.remove_source_dialog import RemoveSourceDialog, RemoveSourceAction
 from ui.import_dialog import ImportDialog
 from ui.detect_dialog import DetectDialog
 from ui.export_dialog import ExportDialog
+from ui.export_crops_dialog import ExportCropsDialog
 from ui.relink_dialog import RelinkDialog
 
 
@@ -239,6 +241,10 @@ class MainWindow(QMainWindow):
         self._reader_pool = VideoReaderPool(use_gpu=True)
         self._proxy_manager = ProxyManager()
         self._exporter: Optional[Exporter] = None
+        self._crop_exporter: Optional[CropExporter] = None
+        # Tracks which clip's crops are currently being edited in the preview
+        # (so clips_changed can rebuild the overlay with the right crop list).
+        self._crop_edit_clip_id: Optional[str] = None
         self._detect_partials: dict = {}
         self._last_clicked_clip_id: Optional[str] = None
         self._thumbnail_cache: Optional[ThumbnailCache] = None
@@ -335,13 +341,13 @@ class MainWindow(QMainWindow):
         # Right column: Clip Info + People, switchable via vertical
         # text-tabs on the left edge of the column. Tab strip width is
         # tightened via stylesheet so it doesn't eat horizontal space.
-        self._clip_info = ClipInfoPanel()
+        self._clip_info = ClipInfoPanel(self._timeline)
         self._people_panel = PeoplePanel(self._timeline)
         self._people_panel.group_delete_confirmed.connect(
             lambda _gid: self._take_pre_op_snapshot("pre_group_delete"))
         self._right_tabs = QTabWidget()
         self._right_tabs.setTabPosition(QTabWidget.TabPosition.West)
-        self._right_tabs.addTab(self._clip_info, "Clip Info")
+        self._right_tabs.addTab(self._clip_info, "Clip")
         self._right_tabs.addTab(self._people_panel, "People")
         # Restore last-used right-tab from QSettings (project file, when a
         # project loads, will override this via _load_from).
@@ -449,6 +455,26 @@ class MainWindow(QMainWindow):
         self._timeline_widget.files_dropped.connect(self._on_timeline_files_dropped)
         self._timeline.selection_changed.connect(self._on_selection_changed)
 
+        # ---- Cropping Regions wiring -------------------------------------
+        # The Clip panel owns the per-clip crop list UI; the preview's
+        # CropOverlay does the drawing. MainWindow plumbs the signals
+        # between them and routes overlay mutations back through
+        # TimelineModel so they're undo-able.
+        self._clip_info.crop_edit_mode_changed.connect(
+            self._on_crop_edit_mode_changed)
+        self._clip_info.crop_selected.connect(
+            self._on_crop_selected_in_panel)
+        overlay = self._preview.crop_overlay
+        overlay.crop_selected.connect(self._on_crop_selected_in_preview)
+        overlay.new_crop_drawn.connect(self._on_new_crop_drawn)
+        overlay.crop_geometry_changed.connect(
+            self._on_crop_geometry_changed)
+        overlay.delete_requested.connect(self._on_crop_delete_requested)
+        # Push fresh crop data into the overlay whenever the model changes
+        # while edit mode is on (e.g. undo/redo, panel-driven edits).
+        self._timeline.clips_changed.connect(self._refresh_crop_overlay)
+        self._timeline.groups_changed.connect(self._refresh_crop_overlay)
+
         # Media Panel signals
         self._media_panel.source_double_clicked.connect(self._on_source_double_clicked)
         self._media_panel.relink_requested.connect(self._on_source_relink_requested)
@@ -480,10 +506,12 @@ class MainWindow(QMainWindow):
 
         self._timeline.clips_changed.connect(self._update_status)
         self._timeline.clips_changed.connect(self._mark_dirty)
+        self._timeline.clips_changed.connect(self._refresh_export_crops_action)
         self._timeline.in_out_changed.connect(self._mark_dirty)
 
         # Menu bar
         self._setup_menus()
+        self._refresh_export_crops_action()
         self._update_title()
 
         # Completion-sound effect must be constructed on the UI thread
@@ -603,6 +631,16 @@ class MainWindow(QMainWindow):
         if source is None or not os.path.exists(source.file_path):
             return None
         return (source, src_frame)
+
+    def _refresh_export_crops_action(self):
+        """Enable Export Crops only when the timeline has at least one crop."""
+        if not hasattr(self, "_export_crops_action"):
+            return
+        has = self._timeline.crop_count() > 0
+        self._export_crops_action.setEnabled(has)
+        self._export_crops_action.setToolTip(
+            "Export each crop region as 81 frames @ 16fps"
+            if has else "Draw at least one crop in the Clip panel first.")
 
     def _refresh_snapshot_action(self):
         """Recompute Snapshot Frame action enabled state. Called whenever the
@@ -971,6 +1009,14 @@ class MainWindow(QMainWindow):
         otio_action = QAction(icon("document"), "Export OTIO...", self)
         otio_action.triggered.connect(self._on_export_otio)
         timeline_menu.addAction(otio_action)
+
+        export_crops_action = QAction(icon("scissors"),
+                                       "Export Crops...", self)
+        self._shortcut_mgr.attach_action(
+            "export_crops", export_crops_action)
+        export_crops_action.triggered.connect(self._on_export_crops)
+        timeline_menu.addAction(export_crops_action)
+        self._export_crops_action = export_crops_action
 
         timeline_menu.addSeparator()
 
@@ -1735,6 +1781,7 @@ class MainWindow(QMainWindow):
         if self._playback_updating:
             self._status_frame.setText(f"Frame {frame}")
             self._refresh_snapshot_action()
+            self._sync_clip_panel_playhead(frame)
             return
 
         # User moved the playhead — restart playback from new position if playing
@@ -1743,9 +1790,11 @@ class MainWindow(QMainWindow):
             self._timeline_widget.strip._playhead_frame = frame
             self._start_playback()
             self._refresh_snapshot_action()
+            self._sync_clip_panel_playhead(frame)
             return
 
         self._status_frame.setText(f"Frame {frame}")
+        self._sync_clip_panel_playhead(frame)
 
         result = self._timeline.get_clip_at_position(frame)
 
@@ -2149,6 +2198,171 @@ class MainWindow(QMainWindow):
     def _on_export_otio(self):
         # OTIO lives as a tab in the unified ExportDialog now.
         self._show_export_dialog(tab=4)
+
+    def _on_export_crops(self):
+        """Open the standalone "Export Crops" dialog. Skips when there are
+        no crops on the timeline (the menu action is also disabled in that
+        state, but the keyboard shortcut can still fire)."""
+        if self._timeline.crop_count() == 0:
+            QMessageBox.information(
+                self, "Export Crops",
+                "No crop regions to export.\n\n"
+                "Open the Clip panel, select a clip, click "
+                "\"Edit crops in preview\", and draw one or more crop "
+                "rectangles on the preview.")
+            return
+        default_dir = ""
+        if self._project_path:
+            default_dir = os.path.dirname(self._project_path)
+        elif self._sources:
+            first_clip = next(
+                (c for c in self._timeline.clips if not c.is_gap), None)
+            src = (self._sources.get(first_clip.source_id)
+                   if first_clip else next(iter(self._sources.values()), None))
+            if src is not None:
+                default_dir = os.path.dirname(src.file_path)
+        dialog = ExportCropsDialog(
+            self._timeline, self._sources,
+            default_dir=default_dir, parent=self)
+        self._crop_exporter = CropExporter(self._timeline, self._sources)
+        # Queued so worker thread emissions cross the thread boundary safely.
+        self._crop_exporter.progress.connect(
+            dialog.set_progress, Qt.ConnectionType.QueuedConnection)
+        self._crop_exporter.status.connect(
+            dialog.set_status, Qt.ConnectionType.QueuedConnection)
+        self._crop_exporter.finished.connect(
+            dialog.export_finished, Qt.ConnectionType.QueuedConnection)
+        self._crop_exporter.cancelled.connect(
+            dialog.export_cancelled, Qt.ConnectionType.QueuedConnection)
+        self._crop_exporter.error.connect(
+            dialog.export_errored, Qt.ConnectionType.QueuedConnection)
+        dialog.export_requested.connect(self._crop_exporter.export)
+        dialog.cancel_requested.connect(self._crop_exporter.cancel)
+        dialog.exec()
+        # Drop our reference so the next dialog gets a fresh exporter.
+        self._crop_exporter = None
+
+    # ------------------------------------------------------------------
+    # Crop editing — Clip panel ⇄ preview overlay plumbing
+    # ------------------------------------------------------------------
+
+    def _on_crop_edit_mode_changed(self, checked: bool):
+        """User toggled "Edit crops in preview" in the Clip panel."""
+        selected = self._timeline.get_selected_clips()
+        clip = selected[0] if selected else None
+        if not checked or clip is None or clip.is_gap:
+            self._crop_edit_clip_id = None
+            self._preview.set_crop_edit_mode(False)
+            return
+        source = self._sources.get(clip.source_id)
+        if source is None:
+            self._preview.set_crop_edit_mode(False)
+            return
+        self._crop_edit_clip_id = clip.id
+        self._preview.set_crop_edit_mode(
+            True,
+            clip_id=clip.id,
+            source_w=source.width,
+            source_h=source.height,
+            crops=list(clip.crop_regions),
+            group_colors=self._build_crop_group_colors(clip),
+        )
+
+    def _on_crop_selected_in_panel(self, crop_id: str):
+        self._preview.set_selected_crop(crop_id)
+
+    def _on_crop_selected_in_preview(self, crop_id: str):
+        self._clip_info.set_selected_crop(crop_id)
+
+    def _on_new_crop_drawn(self, x: int, y: int, w: int, h: int):
+        """Overlay finished a draw-new drag → add a CropRegion to the
+        clip that's currently in edit mode, with the playhead's source
+        frame as the default anchor."""
+        clip_id = self._crop_edit_clip_id
+        if not clip_id:
+            return
+        clip = self._timeline.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return
+        source = self._sources.get(clip.source_id)
+        if source is None or source.fps <= 0:
+            return
+        from core.crop_region import CropRegion, can_host_crop, clamp_anchor
+        if not can_host_crop(clip, source.fps):
+            return
+        anchor = clamp_anchor(
+            self._current_playhead_source_frame(clip), clip, source.fps)
+        cr = CropRegion(x=int(x), y=int(y), w=int(w), h=int(h),
+                        anchor_frame=anchor, aspect_ratio="free")
+        new_id = self._timeline.add_crop_region(clip_id, cr)
+        if new_id:
+            # Sync selection so the freshly-drawn rect shows its handles.
+            self._preview.set_selected_crop(new_id)
+            self._clip_info.set_selected_crop(new_id)
+
+    def _on_crop_geometry_changed(self, crop_id: str, x: int, y: int,
+                                  w: int, h: int):
+        """Overlay drag finished — apply the new geometry through
+        ``TimelineModel.update_crop_region`` so it lands in the undo
+        stack. The overlay has already reverted the live crop to its
+        pre-drag rect, so a single ``update_crop_region`` call snapshots
+        BEFORE and applies AFTER atomically."""
+        clip_id = self._crop_edit_clip_id
+        if not clip_id:
+            return
+        self._timeline.update_crop_region(
+            clip_id, crop_id, x=int(x), y=int(y), w=int(w), h=int(h))
+
+    def _on_crop_delete_requested(self, crop_id: str):
+        clip_id = self._crop_edit_clip_id
+        if not clip_id:
+            return
+        self._timeline.remove_crop_region(clip_id, crop_id)
+
+    def _refresh_crop_overlay(self):
+        """Push the current clip's crop list into the overlay. No-op when
+        edit mode is off."""
+        clip_id = self._crop_edit_clip_id
+        if not clip_id:
+            return
+        clip = self._timeline.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            self._preview.set_crop_edit_mode(False)
+            self._crop_edit_clip_id = None
+            return
+        self._preview.refresh_crops(
+            list(clip.crop_regions),
+            group_colors=self._build_crop_group_colors(clip))
+
+    def _build_crop_group_colors(self, clip) -> dict:
+        """Return ``{crop_id: hex_color}`` for every crop on the clip."""
+        groups = self._timeline.groups
+        colors = {}
+        for cr in clip.crop_regions:
+            if cr.group_id and cr.group_id in groups:
+                colors[cr.id] = groups[cr.group_id].color
+            else:
+                colors[cr.id] = "#888888"
+        return colors
+
+    def _sync_clip_panel_playhead(self, timeline_frame: int):
+        """Tell the Clip panel which source frame the playhead is on, so
+        its "From playhead" anchor buttons work without a round-trip."""
+        result = self._timeline.timeline_frame_to_source_frame(timeline_frame)
+        if result is None:
+            return
+        _clip, source_frame = result
+        self._clip_info.set_playhead_source_frame(source_frame)
+
+    def _current_playhead_source_frame(self, clip) -> int:
+        """Map the playhead to a source frame inside ``clip``. Clamps to
+        the clip's source range so the caller doesn't have to."""
+        playhead_tl = self._timeline_widget.strip.playhead_frame
+        start_tl = self._timeline.get_clip_timeline_start(clip.id)
+        if start_tl < 0:
+            return clip.source_in
+        source_frame = clip.source_in + (playhead_tl - start_tl)
+        return max(clip.source_in, min(clip.source_out, source_frame))
 
     def _run_otio_export(self, settings: dict, dialog):
         first_source = next(iter(self._sources.values()), None)

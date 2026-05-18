@@ -13,6 +13,7 @@ from PySide6.QtGui import (
 
 from core.timeline import TimelineModel
 from core.clip import Clip
+from core.crop_region import required_source_frames
 from core.ui_scale import ui_scale
 from ui.icon_loader import icon
 
@@ -123,6 +124,11 @@ class TimelineStrip(QWidget):
         # Sources dict reference — set by MainWindow once at startup so the
         # drop preview can render each dragged source's media-pool thumbnail.
         self._sources_ref: dict = {}
+
+        # Crop anchor drag — populated on press over an anchor pin and
+        # consumed by mouseMove/mouseRelease. Tuple: (clip_id, crop_id,
+        # original_source_anchor, clip_timeline_start, required_src_frames).
+        self._dragging_crop_anchor: Optional[tuple] = None
 
         # Materialise scaled chrome metrics BEFORE any size-dependent calls
         # below — setMinimumHeight reads self.HEADER_HEIGHT etc.
@@ -391,6 +397,9 @@ class TimelineStrip(QWidget):
         # Clips
         clip_y = self.HEADER_HEIGHT + ui_scale().px(2)
         self._paint_clips(painter, clip_y, w)
+
+        # Crop anchor pins + span bars (only for crops on selected clips)
+        self._paint_crop_markers(painter, clip_y, w)
 
         # In/Out overlay
         self._paint_in_out_overlay(painter, w)
@@ -724,6 +733,116 @@ class TimelineStrip(QWidget):
                 painter.setPen(QPen(marker_color, 2))
                 painter.drawLine(out_px, 0, out_px, total_h)
 
+    def _paint_crop_markers(self, painter: QPainter, clip_y: int,
+                            viewport_width: int):
+        """Per crop on each selected clip, paint a small anchor pin in the
+        ruler band and a thin span bar at the top of the clip body covering
+        the source-frame window that crop will export.
+
+        Markers only render for *selected* clips so the timeline doesn't get
+        noisy when many clips have crops."""
+        selected = self._model.selected_ids
+        if not selected:
+            return
+        groups = self._model.groups
+        pin_w = ui_scale().px(6)
+        pin_h = ui_scale().px(8)
+        bar_h = ui_scale().px(3)
+        cumulative = 0
+        for clip in self._model.clips:
+            clip_start_frame = cumulative
+            cumulative += clip.duration_frames
+            if clip.is_gap:
+                continue
+            if clip.id not in selected or not clip.crop_regions:
+                continue
+            source = self._sources_ref.get(clip.source_id) \
+                if self._sources_ref else None
+            if source is None or source.fps <= 0:
+                continue
+            req = required_source_frames(source.fps)
+            for cr in clip.crop_regions:
+                color_hex = "#888888"
+                if cr.group_id and cr.group_id in groups:
+                    color_hex = groups[cr.group_id].color
+                color = QColor(color_hex)
+                if not color.isValid():
+                    color = QColor("#888888")
+                # Inactive crops fade to 30% so they still tell the user
+                # where they are.
+                alpha = 255 if cr.active else 76
+                color.setAlpha(alpha)
+
+                anchor_tl = clip_start_frame + (cr.anchor_frame - clip.source_in)
+                span_end_tl = anchor_tl + req
+                anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
+                end_px = self._frame_to_pixel(span_end_tl) - self._scroll_offset
+                if end_px < 0 or anchor_px > viewport_width:
+                    continue
+
+                # Span bar at the top of the clip body.
+                bar_color = QColor(color)
+                bar_color.setAlpha(int(0.4 * alpha))
+                bar_x = max(0, anchor_px)
+                bar_w = min(viewport_width, end_px) - bar_x
+                if bar_w > 0:
+                    painter.fillRect(bar_x, clip_y, bar_w, bar_h, bar_color)
+
+                # Anchor pin — upward triangle in the ruler band, apex at
+                # the anchor frame, base at the top of the clip body.
+                painter.setBrush(QBrush(color))
+                outline = color.darker(150)
+                outline.setAlpha(alpha)
+                painter.setPen(QPen(outline, 1))
+                painter.drawPolygon([
+                    QPoint(int(anchor_px - pin_w), int(clip_y - pin_h)),
+                    QPoint(int(anchor_px + pin_w), int(clip_y - pin_h)),
+                    QPoint(int(anchor_px), int(clip_y)),
+                ])
+
+    def _hit_crop_pin(self, x: float, y: float):
+        """Return ``(clip_id, crop_id, original_source_anchor,
+        clip_timeline_start, req_src_frames)`` if the point hits an anchor
+        pin on a selected non-gap clip, else None.
+
+        Pin hit-box: roughly the triangle's bounding rect in the ruler band
+        just above the clip body. Slight padding for fat-finger tolerance.
+        """
+        selected = self._model.selected_ids
+        if not selected:
+            return None
+        clip_y = self.HEADER_HEIGHT + ui_scale().px(2)
+        pin_w = ui_scale().px(6) + 2
+        pin_h = ui_scale().px(8)
+        if y < clip_y - pin_h - 2 or y > clip_y + 2:
+            return None
+        cumulative = 0
+        # Iterate reverse so topmost (later in list) wins when pins overlap.
+        clips = list(self._model.clips)
+        for clip in clips:
+            cumulative += clip.duration_frames
+        cumulative = 0
+        hit = None
+        for clip in clips:
+            clip_start_frame = cumulative
+            cumulative += clip.duration_frames
+            if clip.is_gap or clip.id not in selected or not clip.crop_regions:
+                continue
+            source = self._sources_ref.get(clip.source_id) \
+                if self._sources_ref else None
+            if source is None or source.fps <= 0:
+                continue
+            req = required_source_frames(source.fps)
+            for cr in clip.crop_regions:
+                anchor_tl = clip_start_frame + (cr.anchor_frame - clip.source_in)
+                anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
+                if abs(x - anchor_px) <= pin_w:
+                    # Don't return immediately — later crops painted on top
+                    # should win the hit.
+                    hit = (clip.id, cr.id, cr.anchor_frame,
+                           clip_start_frame, req)
+        return hit
+
     def _paint_playhead(self, painter: QPainter, clip_y: int, total_height: int):
         px = self._frame_to_pixel(self._playhead_frame) - self._scroll_offset
         if 0 <= px <= self.width():
@@ -766,6 +885,15 @@ class TimelineStrip(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             x = event.position().x()
             y = event.position().y()
+
+            # Crop anchor pin hit-test runs BEFORE the ruler / clip / marquee
+            # branches so the user can drag a pin that sits just above the
+            # clip body without inadvertently moving the playhead.
+            pin_hit = self._hit_crop_pin(x, y)
+            if pin_hit is not None:
+                self._dragging_crop_anchor = pin_hit
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
 
             # Check if dragging the track bottom edge to resize
             bottom = self._track_bottom_y()
@@ -813,6 +941,10 @@ class TimelineStrip(QWidget):
                 self.set_playhead(frame)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self._dragging_crop_anchor is not None:
+            self._do_crop_anchor_drag(event.position().x())
+            return
+
         if self._marquee_active:
             self._marquee_end = QPoint(int(event.position().x()), int(event.position().y()))
             self.update()
@@ -882,7 +1014,67 @@ class TimelineStrip(QWidget):
             self.preview_frame_requested.emit(self._playhead_frame)
         super().leaveEvent(event)
 
+    def _do_crop_anchor_drag(self, x: float):
+        """Live mid-drag mutation. We bypass ``TimelineModel.update_crop_region``
+        (which pushes undo each call) and mutate the live ``CropRegion`` in
+        place — only the strip needs the visual refresh until release."""
+        info = self._dragging_crop_anchor
+        if info is None:
+            return
+        clip_id, crop_id, original_anchor, clip_start_tl, req = info
+        clip = self._model.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return
+        target = None
+        for cr in clip.crop_regions:
+            if cr.id == crop_id:
+                target = cr
+                break
+        if target is None:
+            return
+        # Mouse-x → timeline frame → source frame (offset within clip).
+        tl_frame = self._pixel_to_frame(x)
+        # Clamp anchor to [clip.source_in, clip.source_out - req + 1]
+        source_anchor = clip.source_in + (tl_frame - clip_start_tl)
+        lo = clip.source_in
+        hi = max(lo, clip.source_out - req + 1)
+        source_anchor = max(lo, min(hi, source_anchor))
+        if source_anchor != target.anchor_frame:
+            target.anchor_frame = source_anchor
+            self.update()
+
+    def _finish_crop_anchor_drag(self):
+        """Restore the pre-drag anchor on the live object and commit the
+        final value through ``update_crop_region`` so one drag = one undo."""
+        info = self._dragging_crop_anchor
+        self._dragging_crop_anchor = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        if info is None:
+            return
+        clip_id, crop_id, original_anchor, _start_tl, _req = info
+        clip = self._model.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return
+        target = None
+        for cr in clip.crop_regions:
+            if cr.id == crop_id:
+                target = cr
+                break
+        if target is None:
+            return
+        final_anchor = target.anchor_frame
+        if final_anchor == original_anchor:
+            # No-op drag — don't pollute the undo stack with a redundant entry.
+            return
+        target.anchor_frame = original_anchor
+        self._model.update_crop_region(
+            clip_id, crop_id, anchor_frame=final_anchor)
+
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._dragging_crop_anchor is not None and \
+                event.button() == Qt.MouseButton.LeftButton:
+            self._finish_crop_anchor_drag()
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             was_panning = self._panning
             self._panning = False

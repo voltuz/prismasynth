@@ -15,6 +15,7 @@ os.environ['PATH'] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + o
 import mpv
 
 from ui.icon_loader import icon
+from ui.crop_overlay import CropOverlay
 from core.ui_scale import ui_scale
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,11 @@ class PreviewWidget(QWidget):
         )
         self._volume_slider.valueChanged.connect(self._on_volume_changed)
         self._volume_slider.raise_()
+
+        # Cropping-regions overlay (transparent for mouse events when edit
+        # mode is off; intercepts LMB when on). Sits above the black
+        # overlay and below the bottom-left controls.
+        self._crop_overlay = CropOverlay(self, self)
 
         ui_scale().changed.connect(self._on_ui_scale_changed)
 
@@ -373,6 +379,11 @@ class PreviewWidget(QWidget):
         super().resizeEvent(event)
         if self._black_overlay.isVisible():
             self._black_overlay.setGeometry(self._container.geometry())
+        # Crop overlay covers the whole preview widget so its source↔widget
+        # math can use the container's geometry as offset.
+        if hasattr(self, "_crop_overlay"):
+            self._crop_overlay.setGeometry(self.rect())
+            self._crop_overlay.request_repaint()
         # Position bottom-left overlay row (zoom combo + mute + volume slider)
         self._reposition_overlays()
         # Fit-factor changes with widget size, so a fixed percentage needs to
@@ -392,6 +403,8 @@ class PreviewWidget(QWidget):
         x = geo.x() + inset
         y = geo.y() + geo.height() - combo_h - inset
         self._zoom_combo.setGeometry(x, y, combo_w, combo_h)
+        # Keep the bottom-left controls above the crop overlay so they stay
+        # clickable even when edit mode is on.
         self._zoom_combo.raise_()
 
         if not hasattr(self, "_mute_btn"):
@@ -464,6 +477,10 @@ class PreviewWidget(QWidget):
 
     def _apply_zoom(self):
         """Push current zoom_mode/percent/pan into mpv properties."""
+        # Whether or not mpv is ready, refresh the crop overlay so its
+        # widget-space rects track any pending zoom-state change.
+        if hasattr(self, "_crop_overlay"):
+            self._crop_overlay.request_repaint()
         if not self._ready or self._player is None:
             return
         # Opportunistically refresh source dims if we don't have them yet
@@ -686,6 +703,44 @@ class PreviewWidget(QWidget):
         self._pan_y = 0.0
         self._apply_zoom()
         event.accept()
+
+    # ------------------------------------------------------------------
+    # Crop overlay plumbing
+    # ------------------------------------------------------------------
+
+    @property
+    def crop_overlay(self) -> "CropOverlay":
+        return self._crop_overlay
+
+    def set_crop_edit_mode(self, on: bool, clip_id=None,
+                           source_w: int = 0, source_h: int = 0,
+                           crops=None, group_colors=None):
+        """Toggle the crop-editing overlay. When ``on`` is True the overlay
+        intercepts left-mouse for draw/move/resize; middle-mouse pan and
+        scroll-wheel zoom continue to work because the overlay ignores them."""
+        # Ensure geometry covers the widget before the first paint —
+        # resizeEvent may not have fired yet on first activation.
+        self._crop_overlay.setGeometry(self.rect())
+        # Keep the bottom controls above the overlay.
+        self._zoom_combo.raise_()
+        self._mute_btn.raise_()
+        self._volume_slider.raise_()
+        self._crop_overlay.set_edit_mode(
+            on,
+            clip_id=clip_id,
+            source_w=source_w,
+            source_h=source_h,
+            crops=crops,
+            group_colors=group_colors,
+        )
+
+    def refresh_crops(self, crops, group_colors=None):
+        """Push a fresh crop list into the overlay (e.g. on clips_changed)."""
+        self._crop_overlay.set_crops(crops, group_colors=group_colors)
+
+    def set_selected_crop(self, crop_id: str):
+        """External selection sync (panel ⇄ preview)."""
+        self._crop_overlay.set_selected_crop(crop_id)
 
     def cleanup(self):
         """Clean up mpv player."""

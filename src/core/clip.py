@@ -2,6 +2,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+from core.crop_region import CropRegion
+
 
 @dataclass
 class Clip:
@@ -14,6 +16,9 @@ class Clip:
     # Group (People) memberships. Stored in toggle order; the timeline
     # label strip sorts by digit at paint time for stable chip ordering.
     group_ids: list = field(default_factory=list)
+    # Per-clip rectangular crop regions for the cropping-export feature.
+    # Each entry is a CropRegion in source-pixel coords; see core.crop_region.
+    crop_regions: list = field(default_factory=list)
 
     @property
     def is_gap(self) -> bool:
@@ -40,6 +45,7 @@ class Clip:
             "label": self.label,
             "color_index": self.color_index,
             "group_ids": list(self.group_ids),
+            "crop_regions": [cr.to_dict() for cr in self.crop_regions],
         }
 
     @classmethod
@@ -52,4 +58,6 @@ class Clip:
             label=d.get("label", ""),
             color_index=d.get("color_index", 0),
             group_ids=list(d.get("group_ids", [])),
+            crop_regions=[CropRegion.from_dict(cd)
+                          for cd in d.get("crop_regions", [])],
         )

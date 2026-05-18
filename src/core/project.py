@@ -167,6 +167,10 @@ def load_project(filepath: str):
         # group was deleted from the registry, skip dangling references.
         if c.group_ids:
             c.group_ids = [gid for gid in c.group_ids if gid in valid_group_ids]
+        # Same self-heal for per-crop group tags.
+        for cr in c.crop_regions:
+            if cr.group_id and cr.group_id not in valid_group_ids:
+                cr.group_id = None
         clips.append(c)
 
     return {
