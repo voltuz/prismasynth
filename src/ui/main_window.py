@@ -1192,7 +1192,7 @@ class MainWindow(QMainWindow):
     def _on_source_thumb_extracted(self, source_id: str):
         src = self._sources.get(source_id)
         if src is not None:
-            self._media_panel.refresh_thumbnail(src)
+            self._media_panel.refresh_source(src)
 
     def _on_source_double_clicked(self, source_id: str):
         src = self._sources.get(source_id)
@@ -1330,7 +1330,7 @@ class MainWindow(QMainWindow):
             self._reader_pool.register_source(src)
             self._proxy_manager.load_or_open(src, force_reopen=True)
             extract_thumbnail(src, force=True)
-            self._media_panel.refresh_thumbnail(src)
+            self._media_panel.refresh_source(src)
             touched_sources.append(src)
         if clamp_total:
             QMessageBox.warning(

@@ -378,12 +378,22 @@ class MediaPanel(QWidget):
             self._model.appendRow(item)
         self._refresh_empty_state()
 
-    def refresh_thumbnail(self, source: VideoSource):
-        """Force-reload the icon for one source (e.g. after async thumb extract)."""
+    def refresh_source(self, source: VideoSource):
+        """Re-sync icon, display name, tooltip, and duration for one source
+        on its model item. Call after any VideoSource attribute change
+        (relink, timebase auto-fix, async source-thumbnail extraction).
+
+        Updating text/tooltip is load-bearing for the relink path: when
+        VideoSource.file_path is mutated in place, the item's baked-in
+        text (set once in set_sources) would otherwise stay frozen at
+        the pre-relink filename in both grid and list views."""
         for row in range(self._model.rowCount()):
             item = self._model.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == source.id:
                 item.setIcon(self._load_icon(source))
+                item.setText(self._display_name(source))
+                item.setToolTip(self._tooltip(source))
+                item.setData(int(source.total_frames), _DURATION_ROLE)
                 return
 
     # --- View mode ---
