@@ -44,6 +44,7 @@ SHORTCUTS: List[ShortcutDef] = [
     ShortcutDef("manual_project_snapshot",  "File", "Snapshot Project Now",     ""),
     # Tools
     ShortcutDef("snapshot_frame",     "Tools",    "Snapshot Frame",             "F12"),
+    ShortcutDef("performance_check",  "Tools",    "System Performance Check",   ""),
     # Edit
     ShortcutDef("split",              "Edit",     "Split at Playhead",          "S"),
     ShortcutDef("delete",             "Edit",     "Delete Selected",            "W"),

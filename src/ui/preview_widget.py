@@ -342,6 +342,16 @@ class PreviewWidget(QWidget):
     def is_playing(self) -> bool:
         return self._is_playing
 
+    def get_hwdec_current(self) -> Optional[str]:
+        """mpv's currently-active hardware decoder name (e.g. 'nvdec',
+        'd3d11va', 'no'), or None if mpv isn't ready / no clip is loaded."""
+        if not self._ready or self._player is None:
+            return None
+        try:
+            return self._player.hwdec_current
+        except Exception:
+            return None
+
     def show_frame(self, frame: np.ndarray, fast: bool = True):
         """Legacy compatibility: display a numpy frame.
         Only used for gaps or when mpv isn't available."""

@@ -982,6 +982,12 @@ class MainWindow(QMainWindow):
         cut_inspect_action.triggered.connect(self._on_tools_cut_inspect)
         tools_menu.addAction(cut_inspect_action)
 
+        perf_check_action = QAction(icon("diagnostics"),
+                                    "System Performance Check…", self)
+        self._shortcut_mgr.attach_action("performance_check", perf_check_action)
+        perf_check_action.triggered.connect(self._on_tools_performance_check)
+        tools_menu.addAction(perf_check_action)
+
         tools_menu.addSeparator()
 
         self._snapshot_frame_action = QAction(icon("camera"), "Snapshot Frame", self)
@@ -1272,6 +1278,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "Cut Inspect",
                 f"Could not launch Cut Inspect:\n{e}")
+
+    def _on_tools_performance_check(self):
+        """Tools → System Performance Check… opens a static-checks report
+        of every GPU / codec / filter dependency, with suggested fixes for
+        any that aren't working."""
+        from ui.diagnostics_dialog import DiagnosticsDialog
+        dlg = DiagnosticsDialog(parent=self, preview_widget=self._preview)
+        dlg.exec()
 
     def _apply_relink_results(self, resolved: dict, probe_cache: dict):
         """Apply the user's relink choices from RelinkDialog to one or more
