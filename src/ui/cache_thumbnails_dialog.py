@@ -2,7 +2,7 @@ import logging
 import time
 from typing import Optional, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
     QPushButton, QVBoxLayout,
@@ -33,6 +33,11 @@ class CacheThumbnailsDialog(QDialog):
     so the user can run another bake (e.g. with Overwrite ticked) without
     closing and reopening.
     """
+
+    # Emitted from the success path of _on_finished (total > 0). Cancel
+    # and the empty-job early-return do NOT emit, so listeners that play
+    # a completion sound only fire on real work-done.
+    completed = Signal()
 
     def __init__(self, thumbnail_cache: ThumbnailCache,
                  render_range: Tuple[int, int],
@@ -219,6 +224,7 @@ class CacheThumbnailsDialog(QDialog):
             self._detail_label.setText(
                 f"Done — {total:,} thumbnails cached in {int(elapsed)}s"
             )
+            self.completed.emit()
         self._reset_to_idle()
 
     def _on_cancelled(self):

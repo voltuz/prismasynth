@@ -45,6 +45,8 @@ SHORTCUTS: List[ShortcutDef] = [
     # Tools
     ShortcutDef("snapshot_frame",     "Tools",    "Snapshot Frame",             "F12"),
     ShortcutDef("performance_check",  "Tools",    "System Performance Check",   ""),
+    # View — menu-driven toggles. Empty default = menu-only.
+    ShortcutDef("toggle_completion_sound", "View", "Completion Sound",          ""),
     # Edit
     ShortcutDef("split",              "Edit",     "Split at Playhead",          "S"),
     ShortcutDef("delete",             "Edit",     "Delete Selected",            "W"),

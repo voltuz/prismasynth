@@ -486,6 +486,11 @@ class MainWindow(QMainWindow):
         self._setup_menus()
         self._update_title()
 
+        # Completion-sound effect must be constructed on the UI thread
+        # after QApplication is running; parented to self for lifetime.
+        from ui import sound_loader
+        sound_loader.init(self)
+
         # Timeline-specific keys (arrows / Home / End / Up / Down) are
         # QShortcuts scoped to the timeline widget so they only fire when
         # it has focus. Customizable via the Keyboard Shortcuts dialog.
@@ -921,6 +926,20 @@ class MainWindow(QMainWindow):
             for a in self._scale_action_group.actions()
         }
 
+        view_menu.addSeparator()
+        from ui import sound_loader
+        completion_sound_action = QAction("Completion Sound", self)
+        completion_sound_action.setCheckable(True)
+        completion_sound_action.setChecked(sound_loader.is_enabled())
+        completion_sound_action.setToolTip(
+            "Play a short ding when Detect Cuts, Thumbnail Bake, Export, "
+            "or Timebase Auto-Fix finishes (only while you're focused on "
+            "another window).")
+        completion_sound_action.toggled.connect(sound_loader.set_enabled)
+        self._shortcut_mgr.attach_action(
+            "toggle_completion_sound", completion_sound_action)
+        view_menu.addAction(completion_sound_action)
+
         # --- Timeline menu ---
         timeline_menu = menu.addMenu("Timeline")
 
@@ -1163,6 +1182,7 @@ class MainWindow(QMainWindow):
         from ui.remux_progress_dialog import RemuxProgressDialog
         progress = RemuxProgressDialog(jobs, audio_mode=audio_mode, parent=self)
         progress.source_succeeded.connect(self._apply_single_remux_relink)
+        progress.batch_completed.connect(self._on_remux_batch_completed)
         progress.exec()
 
     def _apply_single_remux_relink(self, source_id: str, fixed_path: str):
@@ -1183,6 +1203,21 @@ class MainWindow(QMainWindow):
             return
         self._apply_relink_results({source_id: fixed_path},
                                    {source_id: info})
+
+    def _on_remux_batch_completed(self, succeeded: int, total: int):
+        # Only fire the completion sound when at least one source was
+        # actually fixed; an all-failed / all-cancelled batch stays silent.
+        if succeeded > 0:
+            self._play_completion_sound()
+
+    def _play_completion_sound(self):
+        from ui import sound_loader
+        sound_loader.play_completion(self)
+
+    def _play_export_completion_sound(self):
+        # Exporter.finished is success-only — cancelled/error are separate
+        # signals that route to dialog slots, not this one.
+        self._play_completion_sound()
 
     # --- Media Panel handlers ---
 
@@ -1619,6 +1654,10 @@ class MainWindow(QMainWindow):
         logger.info("Detection complete: %d clips from %d segments",
                      total_clips, len(results))
 
+        if results:
+            from ui import sound_loader
+            sound_loader.play_completion(self)
+
     def _start_thumbnail_cache(self):
         # Respect the user's toggle — master off means nothing runs.
         if not self._timeline_widget.thumbnails_enabled:
@@ -1670,6 +1709,7 @@ class MainWindow(QMainWindow):
                       or self._timeline.out_point is not None)
         dialog = CacheThumbnailsDialog(
             self._thumbnail_cache, render_range, has_in_out, self)
+        dialog.completed.connect(lambda: self._play_completion_sound())
         dialog.exec()
 
     def _on_thumbnail_ready(self, clip_id: str, position: str, qimage):
@@ -2179,6 +2219,9 @@ class MainWindow(QMainWindow):
         self._exporter.finished.connect(dialog.export_finished, Qt.ConnectionType.QueuedConnection)
         self._exporter.cancelled.connect(dialog.export_cancelled, Qt.ConnectionType.QueuedConnection)
         self._exporter.error.connect(dialog.export_failed, Qt.ConnectionType.QueuedConnection)
+        self._exporter.finished.connect(
+            self._play_export_completion_sound,
+            Qt.ConnectionType.QueuedConnection)
         # Cancel button during an active export, and the X-close fallback.
         dialog.cancel_requested.connect(self._exporter.cancel)
         dialog.rejected.connect(self._exporter.cancel)

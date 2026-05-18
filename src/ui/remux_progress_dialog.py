@@ -32,6 +32,10 @@ class RemuxProgressDialog(QDialog):
     just like ``cache_thumbnails_dialog.CacheThumbnailsDialog``."""
 
     source_succeeded = Signal(str, str)  # (source_id, fixed_path)
+    # Emitted from _on_finished_all once the batch settles. Carries
+    # (succeeded, total) so listeners can decide what counts as success
+    # — e.g. play a completion sound only when succeeded > 0.
+    batch_completed = Signal(int, int)
 
     def __init__(self, jobs: List[RemuxJobSpec],
                  audio_mode: str = RemuxJob.AUDIO_KEEP, parent=None):
@@ -138,6 +142,7 @@ class RemuxProgressDialog(QDialog):
             self._detail.setText("Errors:\n" + lines)
         self._right_btn.setText("Close")
         self._right_btn.setEnabled(True)
+        self.batch_completed.emit(succeeded, total)
 
     # --- buttons ------------------------------------------------------
 
