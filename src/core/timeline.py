@@ -822,13 +822,22 @@ class TimelineModel(QObject):
         return set(self._selected_ids)
 
     def select_clip(self, clip_id: str, exclusive: bool = True):
-        if exclusive:
-            self._selected_ids = {clip_id}
-        else:
-            self._selected_ids.add(clip_id)
+        # Same-state early-out: when the requested selection equals the
+        # current one, skip the emit. The playback loop calls this on
+        # every tick (60Hz) with the currently-playing clip's id when
+        # ``_selection_follows_playhead`` is on; without this guard the
+        # spurious ``selection_changed`` cascades down to
+        # ``ClipInfoPanel.update_clip → _refresh_crops`` which destroys
+        # and rebuilds every row, visibly collapsing the crops list.
+        new = {clip_id} if exclusive else (self._selected_ids | {clip_id})
+        if new == self._selected_ids:
+            return
+        self._selected_ids = new
         self.selection_changed.emit()
 
     def deselect_clip(self, clip_id: str):
+        if clip_id not in self._selected_ids:
+            return
         self._selected_ids.discard(clip_id)
         self.selection_changed.emit()
 

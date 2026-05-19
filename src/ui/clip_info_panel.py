@@ -180,7 +180,12 @@ class _CropRow(QFrame):
         layout.addLayout(kf_row, 2, 0, 1, 6)
 
         # KF visual state. Stays as the "empty" state until ClipInfoPanel
-        # pushes a refresh.
+        # pushes a refresh. ``_kf_visuals_cache`` is the last tuple
+        # actually applied to the widgets — used by ``_refresh_kf_visuals``
+        # to early-out when nothing changed (avoids per-playhead-frame
+        # setStyleSheet churn during playback, which re-polishes the
+        # widget subtree even for an identical string).
+        self._kf_visuals_cache: Optional[tuple] = None
         self._refresh_kf_visuals("empty", "empty",
                                 False, False, False, False)
 
@@ -260,12 +265,17 @@ class _CropRow(QFrame):
     def _refresh_kf_visuals(self, pos_state: str, sz_state: str,
                             pos_prev: bool, pos_next: bool,
                             sz_prev: bool, sz_next: bool):
+        incoming = (pos_state, sz_state, pos_prev, pos_next,
+                    sz_prev, sz_next)
+        if incoming == self._kf_visuals_cache:
+            return
         self._pos_diamond.setStyleSheet(self._diamond_style(pos_state))
         self._sz_diamond.setStyleSheet(self._diamond_style(sz_state))
         self._pos_prev.setEnabled(pos_prev)
         self._pos_next.setEnabled(pos_next)
         self._sz_prev.setEnabled(sz_prev)
         self._sz_next.setEnabled(sz_next)
+        self._kf_visuals_cache = incoming
 
     # ------------------------------------------------------------------
 
@@ -390,6 +400,12 @@ class ClipInfoPanel(QWidget):
         # Playhead source frame is set by MainWindow on every playhead change
         # so "From playhead" can fill the anchor without a round-trip.
         self._playhead_source_frame: int = 0
+        # KF-refresh fast path state — see ``_refresh_keyframe_states``.
+        # ``_kf_states_seeded`` flips True after the first pass per clip
+        # load so we can skip subsequent zero-key passes; cleared in
+        # ``_refresh_crops`` when rows are rebuilt.
+        self._kf_states_seeded: bool = False
+        self._had_animated_last_pass: bool = False
 
         s = ui_scale()
         self.setMinimumWidth(s.px(220))
@@ -488,8 +504,15 @@ class ClipInfoPanel(QWidget):
     # ------------------------------------------------------------------
 
     def set_playhead_source_frame(self, frame: int):
-        """MainWindow calls this on every playhead change."""
-        self._playhead_source_frame = int(frame)
+        """MainWindow calls this on every playhead change. Same-frame
+        ticks early-out — the playback timer fires at 60Hz but source
+        frames advance at the source FPS (24/25/30), so most ticks
+        carry the same frame value and would re-walk the KF state for
+        nothing."""
+        f = int(frame)
+        if f == self._playhead_source_frame:
+            return
+        self._playhead_source_frame = f
         self._refresh_keyframe_states()
 
     def update_clip(self, clip: Optional[Clip],
@@ -614,7 +637,12 @@ class ClipInfoPanel(QWidget):
         """Rebuild the row widgets from the current clip's crop_regions.
         Cheap and bulletproof — rebuilds on every clips_changed."""
         clip = self._current_clip
-        # Drop all existing rows; we rebuild fresh each time.
+        # Drop all existing rows; we rebuild fresh each time. Fresh
+        # rows have empty visual caches, so the seed pass needs to
+        # happen — clear the panel-level fast-path flag so the next
+        # ``_refresh_keyframe_states`` walks all rows once.
+        self._kf_states_seeded = False
+        self._had_animated_last_pass = False
         for row in list(self._crop_rows.values()):
             self._rows_layout.removeWidget(row)
             row.deleteLater()
@@ -695,14 +723,34 @@ class ClipInfoPanel(QWidget):
         return min(a, b)  # closest following key
 
     def _refresh_keyframe_states(self):
-        """Recompute every row's KF visual + nav-enable state. Cheap —
-        runs on playhead moves and on clips_changed."""
+        """Recompute every row's KF visual + nav-enable state.
+
+        Runs on every playhead source-frame change (up to 60Hz during
+        playback) plus on clips_changed. Two layers of early-out keep
+        the per-frame cost near zero:
+
+        * Panel-level: when no crop on the current clip is animated
+          AND none was animated last pass AND every row has already
+          been seeded with its empty state, skip the per-row loop
+          entirely — playhead motion can't move an empty-track diamond.
+        * Row-level (in ``_CropRow._refresh_kf_visuals``): tuple cache
+          of the last applied state, early-outs identical pushes so
+          ``setStyleSheet`` isn't called on every tick (previously the
+          stutter source — Qt re-polishes the widget subtree even when
+          the stylesheet string is unchanged).
+        """
         clip = self._current_clip
         if clip is None or clip.is_gap:
             return
         live = self._timeline.get_clip_by_id(clip.id)
         if live is None:
             return
+        any_animated = any(cr.is_animated() for cr in live.crop_regions)
+        if (not any_animated and not self._had_animated_last_pass
+                and self._kf_states_seeded):
+            return
+        self._had_animated_last_pass = any_animated
+        self._kf_states_seeded = True
         frame = int(self._playhead_source_frame)
         for cr in live.crop_regions:
             row = self._crop_rows.get(cr.id)
