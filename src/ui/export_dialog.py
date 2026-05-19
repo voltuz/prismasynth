@@ -508,9 +508,20 @@ class ExportDialog(QDialog):
 
     def _on_codec_changed(self):
         key = self._selected_codec_key()
-        has_quality = "{quality}" in " ".join(VIDEO_PRESETS[key]["args"])
+        preset = VIDEO_PRESETS[key]
+        has_quality = "{quality}" in " ".join(preset["args"])
         self._quality_spin.setVisible(has_quality)
         self._quality_label.setVisible(has_quality)
+        # Rewrite the output path's extension to match the new format so
+        # the user doesn't ship a ProRes stream inside a `.mp4` container
+        # by accident. "Always swap" semantics — even custom stems get
+        # their extension replaced.
+        current = self._vid_output.text().strip()
+        if current:
+            stem, _old_ext = os.path.splitext(current)
+            new_path = stem + preset["ext"]
+            if new_path != current:
+                self._vid_output.setText(new_path)
 
     def _browse_video_output(self):
         codec_key = self._selected_codec_key()

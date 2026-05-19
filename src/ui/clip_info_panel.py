@@ -5,8 +5,10 @@ audio).
 
 Bottom half: per-clip **Cropping Regions** — checkable "Edit crops in
 preview" toggle, "+ Add crop" button, and a scrollable list of rows
-(eye-active / label / aspect / group / anchor / pick-from-playhead /
-trash) backed by ``Clip.crop_regions``.
+(eye-active / label / aspect / group / trash) backed by
+``Clip.crop_regions``. The window position itself is dragged on the
+timeline strip; this panel no longer surfaces an "anchor frame"
+control.
 """
 
 from typing import Dict, Optional
@@ -74,20 +76,19 @@ class _CustomAspectDialog(QDialog):
 
 
 class _CropRow(QFrame):
-    """One row in the cropping list: eye / label / aspect / group / anchor /
-    pick-anchor / trash."""
+    """One row in the cropping list: eye / label / aspect / group /
+    trash. Window position (formerly an 'anchor frame' spinbox) is now
+    edited via the timeline strip's drag interaction."""
 
     active_toggled = Signal(str)
     label_changed = Signal(str, str)
     aspect_changed = Signal(str, str, int, int)       # crop_id, preset, cw, ch
     group_changed = Signal(str, object)               # crop_id, group_id or None
-    anchor_changed = Signal(str, int)
-    pick_anchor_requested = Signal(str)
     delete_requested = Signal(str)
     selected = Signal(str)
 
     def __init__(self, crop: CropRegion, groups: Dict[str, "Group"],
-                 anchor_min: int, anchor_max: int, parent=None):
+                 parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(
@@ -150,23 +151,7 @@ class _CropRow(QFrame):
         self._group_combo.currentIndexChanged.connect(self._on_group_changed)
         layout.addWidget(self._group_combo, 1, 4, 1, 2)
 
-        # Row 2: anchor spinbox + pick-from-playhead
-        layout.addWidget(QLabel("Anchor:"), 2, 0, 1, 1,
-                         Qt.AlignmentFlag.AlignRight)
-        self._anchor_spin = QSpinBox()
-        self._anchor_spin.setRange(anchor_min, anchor_max)
-        self._anchor_spin.setSuffix(" (source frame)")
-        self._anchor_spin.valueChanged.connect(self._on_anchor_changed)
-        layout.addWidget(self._anchor_spin, 2, 1, 1, 3)
-
-        self._pick_btn = QPushButton("From playhead")
-        self._pick_btn.setToolTip(
-            "Set the anchor to the playhead's current source frame")
-        self._pick_btn.clicked.connect(
-            lambda: self.pick_anchor_requested.emit(self._crop_id))
-        layout.addWidget(self._pick_btn, 2, 4, 1, 2)
-
-        self.update_from(crop, groups, anchor_min, anchor_max)
+        self.update_from(crop, groups)
 
     # ------------------------------------------------------------------
 
@@ -187,8 +172,7 @@ class _CropRow(QFrame):
 
     # ------------------------------------------------------------------
 
-    def update_from(self, crop: CropRegion, groups: Dict[str, "Group"],
-                    anchor_min: int, anchor_max: int):
+    def update_from(self, crop: CropRegion, groups: Dict[str, "Group"]):
         self._suppress = True
         try:
             self._eye_btn.setChecked(crop.active)
@@ -220,11 +204,6 @@ class _CropRow(QFrame):
             if target < 0:
                 target = 0
             self._group_combo.setCurrentIndex(target)
-
-            # Anchor range may have shifted (e.g. clip edges moved).
-            self._anchor_spin.setRange(anchor_min, anchor_max)
-            self._anchor_spin.setValue(
-                max(anchor_min, min(anchor_max, crop.anchor_frame)))
         finally:
             self._suppress = False
 
@@ -267,11 +246,6 @@ class _CropRow(QFrame):
             return
         data = self._group_combo.itemData(idx)
         self.group_changed.emit(self._crop_id, data)
-
-    def _on_anchor_changed(self, value: int):
-        if self._suppress:
-            return
-        self.anchor_changed.emit(self._crop_id, value)
 
 
 class ClipInfoPanel(QWidget):
@@ -537,27 +511,14 @@ class ClipInfoPanel(QWidget):
         self._current_clip = live
         clip = live
 
-        fps = self._current_source.fps if self._current_source else 0.0
         groups = self._timeline.groups
-        if fps > 0:
-            req = required_source_frames(fps)
-            anchor_min = clip.source_in
-            anchor_max = clip.source_out - req + 1
-            if anchor_max < anchor_min:
-                anchor_max = anchor_min
-        else:
-            anchor_min = clip.source_in
-            anchor_max = clip.source_out
 
         for cr in clip.crop_regions:
-            row = _CropRow(cr, groups, anchor_min, anchor_max,
-                           parent=self._rows_host)
+            row = _CropRow(cr, groups, parent=self._rows_host)
             row.active_toggled.connect(self._on_row_active_toggled)
             row.label_changed.connect(self._on_row_label_changed)
             row.aspect_changed.connect(self._on_row_aspect_changed)
             row.group_changed.connect(self._on_row_group_changed)
-            row.anchor_changed.connect(self._on_row_anchor_changed)
-            row.pick_anchor_requested.connect(self._on_row_pick_anchor)
             row.delete_requested.connect(self._on_row_delete)
             row.selected.connect(self._on_row_selected)
             idx = self._rows_layout.count() - 1
@@ -599,27 +560,6 @@ class ClipInfoPanel(QWidget):
             return
         self._timeline.update_crop_region(
             self._current_clip.id, crop_id, group_id=group_id)
-
-    def _on_row_anchor_changed(self, crop_id: str, anchor: int):
-        if self._current_clip is None:
-            return
-        clamped = anchor
-        src = self._current_source
-        if src and src.fps > 0:
-            clamped = clamp_anchor(anchor, self._current_clip, src.fps)
-        self._timeline.update_crop_region(
-            self._current_clip.id, crop_id, anchor_frame=clamped)
-
-    def _on_row_pick_anchor(self, crop_id: str):
-        if self._current_clip is None:
-            return
-        src = self._current_source
-        if src is None or src.fps <= 0:
-            return
-        anchor = clamp_anchor(
-            self._playhead_source_frame, self._current_clip, src.fps)
-        self._timeline.update_crop_region(
-            self._current_clip.id, crop_id, anchor_frame=anchor)
 
     def _on_row_delete(self, crop_id: str):
         if self._current_clip is None:

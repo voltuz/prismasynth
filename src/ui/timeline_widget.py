@@ -13,7 +13,7 @@ from PySide6.QtGui import (
 
 from core.timeline import TimelineModel
 from core.clip import Clip
-from core.crop_region import required_source_frames
+from core.crop_region import clamp_anchor, required_source_frames
 from core.ui_scale import ui_scale
 from ui.icon_loader import icon
 
@@ -62,6 +62,14 @@ _DH_PAD = 4
 _DH_RESIZE_HANDLE = 5
 _DH_THUMB_HIDE = 15  # below this clip width, skip thumbnail paint
 _DH_GROUP_LABEL = 14
+# Crop-strip layout. Strips live below the group-chip band; each crop
+# gets its own row. Strip width = the 81-frame export window's source-
+# frame width at the current zoom; drag the strip to translate the
+# window across the clip.
+_DH_CROP_STRIP = 8
+_DH_CROP_GAP = 1
+MIN_CROP_STRIP_PX = 6
+CROP_WARNING_COLOR = QColor("#cc5500")  # clip too short to host the window
 _DH_LABEL_FONT_PT = 8
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
@@ -85,6 +93,7 @@ class TimelineStrip(QWidget):
     cut_requested = Signal(int)    # cut-mode click at timeline frame
     sources_dropped = Signal(list, int)   # source_ids (list[str]), insert frame
     files_dropped = Signal(list, int)     # file paths (list[str]), insert frame
+    crop_clicked = Signal(str, str)       # clip_id, crop_id (strip hit)
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -125,10 +134,16 @@ class TimelineStrip(QWidget):
         # drop preview can render each dragged source's media-pool thumbnail.
         self._sources_ref: dict = {}
 
-        # Crop anchor drag — populated on press over an anchor pin and
+        # Crop-strip drag — populated on press over a crop strip and
         # consumed by mouseMove/mouseRelease. Tuple: (clip_id, crop_id,
         # original_source_anchor, clip_timeline_start, required_src_frames).
-        self._dragging_crop_anchor: Optional[tuple] = None
+        self._dragging_crop_strip: Optional[tuple] = None
+        # Track press-x so we can distinguish "click only" from "drag" and
+        # apply a small dead-zone before mutating the anchor.
+        self._crop_strip_press_x: float = 0.0
+        # Selected crop id mirrored from main_window via set_selected_crop_id;
+        # used purely for the white selection halo on the matching strip.
+        self._selected_crop_id: str = ""
 
         # Materialise scaled chrome metrics BEFORE any size-dependent calls
         # below — setMinimumHeight reads self.HEADER_HEIGHT etc.
@@ -143,6 +158,7 @@ class TimelineStrip(QWidget):
         self.setAcceptDrops(True)
 
         self._model.clips_changed.connect(self.update)
+        self._model.clips_changed.connect(self._refresh_min_height)
         self._model.selection_changed.connect(self.update)
         self._model.in_out_changed.connect(self.update)
         self._model.groups_changed.connect(self.update)
@@ -159,14 +175,45 @@ class TimelineStrip(QWidget):
         self.THUMB_HIDE_THRESHOLD = s.px(_DH_THUMB_HIDE)
         self.GROUP_LABEL_HEIGHT = s.px(_DH_GROUP_LABEL)
         self.GROUP_STRIP_RESERVE = self.GROUP_LABEL_HEIGHT * GROUP_LABEL_MAX_VISIBLE
+        self.CROP_STRIP_HEIGHT = s.px(_DH_CROP_STRIP)
+        self.CROP_STRIP_GAP = s.px(_DH_CROP_GAP)
         self._label_font_pt = s.font_pt(_DH_LABEL_FONT_PT)
 
     def _on_ui_scale_changed(self):
         self._refresh_scale_metrics()
+        self._refresh_min_height()
+        self.update()
+
+    def _crop_band_height(self) -> int:
+        """Pixel height of the crop-strip band below the group-chip band.
+        Sized to the clip with the most crops so all strips remain visible
+        without per-clip height variance."""
+        max_crops = 0
+        for clip in self._model.clips:
+            if clip.is_gap or not clip.crop_regions:
+                continue
+            n = len(clip.crop_regions)
+            if n > max_crops:
+                max_crops = n
+        if max_crops == 0:
+            return 0
+        return max_crops * (self.CROP_STRIP_HEIGHT + self.CROP_STRIP_GAP)
+
+    def _refresh_min_height(self):
+        """Recompute the widget's minimum height when the chrome or the
+        max-crops-per-clip count changes."""
         self.setMinimumHeight(
             CLIP_HEIGHT_MIN + self.HEADER_HEIGHT
-            + ui_scale().px(4) + self.GROUP_STRIP_RESERVE)
+            + ui_scale().px(4) + self.GROUP_STRIP_RESERVE
+            + self._crop_band_height())
         self.updateGeometry()
+
+    def set_selected_crop_id(self, crop_id: str):
+        """External crop-selection sync (panel ⇄ preview ⇄ timeline)."""
+        new = crop_id or ""
+        if new == self._selected_crop_id:
+            return
+        self._selected_crop_id = new
         self.update()
 
     @property
@@ -398,8 +445,9 @@ class TimelineStrip(QWidget):
         clip_y = self.HEADER_HEIGHT + ui_scale().px(2)
         self._paint_clips(painter, clip_y, w)
 
-        # Crop anchor pins + span bars (only for crops on selected clips)
-        self._paint_crop_markers(painter, clip_y, w)
+        # Crop strips — one per crop, in a band below the group chips.
+        # Always visible (not gated on clip selection).
+        self._paint_crop_strips(painter, clip_y, w)
 
         # In/Out overlay
         self._paint_in_out_overlay(painter, w)
@@ -733,115 +781,109 @@ class TimelineStrip(QWidget):
                 painter.setPen(QPen(marker_color, 2))
                 painter.drawLine(out_px, 0, out_px, total_h)
 
-    def _paint_crop_markers(self, painter: QPainter, clip_y: int,
-                            viewport_width: int):
-        """Per crop on each selected clip, paint a small anchor pin in the
-        ruler band and a thin span bar at the top of the clip body covering
-        the source-frame window that crop will export.
-
-        Markers only render for *selected* clips so the timeline doesn't get
-        noisy when many clips have crops."""
-        selected = self._model.selected_ids
-        if not selected:
-            return
+    def _paint_crop_strips(self, painter: QPainter, clip_y: int,
+                           viewport_width: int):
+        """Paint one strip per crop on every clip that has crops, in a
+        band below the group-chip strip. Strip width = the 81-frame
+        export window's source-frame width at the current zoom; strip
+        left edge = window start. Color = the crop's group color (grey
+        if untagged); orange if the clip is too short to host the
+        window. Selected crop gets a 1-px white halo."""
         groups = self._model.groups
-        pin_w = ui_scale().px(6)
-        pin_h = ui_scale().px(8)
-        bar_h = ui_scale().px(3)
+        crop_band_y = (clip_y + self._clip_height
+                       + self.GROUP_STRIP_RESERVE)
+        row_h = self.CROP_STRIP_HEIGHT + self.CROP_STRIP_GAP
         cumulative = 0
         for clip in self._model.clips:
             clip_start_frame = cumulative
             cumulative += clip.duration_frames
-            if clip.is_gap:
-                continue
-            if clip.id not in selected or not clip.crop_regions:
+            if clip.is_gap or not clip.crop_regions:
                 continue
             source = self._sources_ref.get(clip.source_id) \
                 if self._sources_ref else None
             if source is None or source.fps <= 0:
                 continue
             req = required_source_frames(source.fps)
-            for cr in clip.crop_regions:
-                color_hex = "#888888"
-                if cr.group_id and cr.group_id in groups:
-                    color_hex = groups[cr.group_id].color
-                color = QColor(color_hex)
-                if not color.isValid():
+            clip_src_frames = clip.source_out - clip.source_in + 1
+            too_short = req > clip_src_frames
+            for i, cr in enumerate(clip.crop_regions):
+                strip_y = crop_band_y + i * row_h
+                # Use clamp_anchor so an out-of-range anchor (e.g. after a
+                # destructive split) pins to the clip's rightmost legal
+                # frame and the strip never overflows the clip's body.
+                anchor_clamped = clamp_anchor(cr.anchor_frame, clip, source.fps)
+                anchor_tl = clip_start_frame + (anchor_clamped - clip.source_in)
+                end_tl = anchor_tl + req
+                anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
+                end_px = self._frame_to_pixel(end_tl) - self._scroll_offset
+                width = max(MIN_CROP_STRIP_PX, end_px - anchor_px)
+                # Off-screen culling.
+                if anchor_px + width < 0 or anchor_px > viewport_width:
+                    continue
+                if too_short:
+                    color = QColor(CROP_WARNING_COLOR)
+                elif cr.group_id and cr.group_id in groups:
+                    color = QColor(groups[cr.group_id].color)
+                    if not color.isValid():
+                        color = QColor("#888888")
+                else:
                     color = QColor("#888888")
-                # Inactive crops fade to 30% so they still tell the user
-                # where they are.
                 alpha = 255 if cr.active else 76
                 color.setAlpha(alpha)
-
-                anchor_tl = clip_start_frame + (cr.anchor_frame - clip.source_in)
-                span_end_tl = anchor_tl + req
-                anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
-                end_px = self._frame_to_pixel(span_end_tl) - self._scroll_offset
-                if end_px < 0 or anchor_px > viewport_width:
+                # Clip to viewport.
+                draw_x = max(0, anchor_px)
+                draw_w = min(viewport_width, anchor_px + width) - draw_x
+                if draw_w <= 0:
                     continue
+                if cr.id == self._selected_crop_id:
+                    halo = QColor(255, 255, 255, 220)
+                    painter.fillRect(int(draw_x) - 1, int(strip_y) - 1,
+                                     int(draw_w) + 2,
+                                     int(self.CROP_STRIP_HEIGHT) + 2, halo)
+                painter.fillRect(int(draw_x), int(strip_y),
+                                 int(draw_w),
+                                 int(self.CROP_STRIP_HEIGHT), color)
 
-                # Span bar at the top of the clip body.
-                bar_color = QColor(color)
-                bar_color.setAlpha(int(0.4 * alpha))
-                bar_x = max(0, anchor_px)
-                bar_w = min(viewport_width, end_px) - bar_x
-                if bar_w > 0:
-                    painter.fillRect(bar_x, clip_y, bar_w, bar_h, bar_color)
-
-                # Anchor pin — upward triangle in the ruler band, apex at
-                # the anchor frame, base at the top of the clip body.
-                painter.setBrush(QBrush(color))
-                outline = color.darker(150)
-                outline.setAlpha(alpha)
-                painter.setPen(QPen(outline, 1))
-                painter.drawPolygon([
-                    QPoint(int(anchor_px - pin_w), int(clip_y - pin_h)),
-                    QPoint(int(anchor_px + pin_w), int(clip_y - pin_h)),
-                    QPoint(int(anchor_px), int(clip_y)),
-                ])
-
-    def _hit_crop_pin(self, x: float, y: float):
+    def _hit_crop_strip(self, x: float, y: float):
         """Return ``(clip_id, crop_id, original_source_anchor,
-        clip_timeline_start, req_src_frames)`` if the point hits an anchor
-        pin on a selected non-gap clip, else None.
-
-        Pin hit-box: roughly the triangle's bounding rect in the ruler band
-        just above the clip body. Slight padding for fat-finger tolerance.
-        """
-        selected = self._model.selected_ids
-        if not selected:
-            return None
+        clip_timeline_start, req_src_frames)`` if the point hits a crop
+        strip, else None. Iterates clips and per-clip crops in reverse
+        so the topmost overlapping strip wins."""
         clip_y = self.HEADER_HEIGHT + ui_scale().px(2)
-        pin_w = ui_scale().px(6) + 2
-        pin_h = ui_scale().px(8)
-        if y < clip_y - pin_h - 2 or y > clip_y + 2:
+        crop_band_y = clip_y + self._clip_height + self.GROUP_STRIP_RESERVE
+        band_h = self._crop_band_height()
+        if band_h <= 0 or y < crop_band_y or y >= crop_band_y + band_h:
             return None
+        row_h = self.CROP_STRIP_HEIGHT + self.CROP_STRIP_GAP
+        # Build (clip, start_frame) pairs once, then iterate reversed.
+        starts = []
         cumulative = 0
-        # Iterate reverse so topmost (later in list) wins when pins overlap.
-        clips = list(self._model.clips)
-        for clip in clips:
+        for clip in self._model.clips:
+            starts.append((clip, cumulative))
             cumulative += clip.duration_frames
-        cumulative = 0
-        hit = None
-        for clip in clips:
-            clip_start_frame = cumulative
-            cumulative += clip.duration_frames
-            if clip.is_gap or clip.id not in selected or not clip.crop_regions:
+        for clip, clip_start_frame in reversed(starts):
+            if clip.is_gap or not clip.crop_regions:
                 continue
             source = self._sources_ref.get(clip.source_id) \
                 if self._sources_ref else None
             if source is None or source.fps <= 0:
                 continue
             req = required_source_frames(source.fps)
-            for cr in clip.crop_regions:
-                anchor_tl = clip_start_frame + (cr.anchor_frame - clip.source_in)
+            for i in range(len(clip.crop_regions) - 1, -1, -1):
+                cr = clip.crop_regions[i]
+                anchor_clamped = clamp_anchor(cr.anchor_frame, clip, source.fps)
+                anchor_tl = clip_start_frame + (anchor_clamped - clip.source_in)
+                end_tl = anchor_tl + req
                 anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
-                if abs(x - anchor_px) <= pin_w:
-                    # Don't return immediately — later crops painted on top
-                    # should win the hit.
-                    hit = (clip.id, cr.id, cr.anchor_frame,
-                           clip_start_frame, req)
-        return hit
+                end_px = self._frame_to_pixel(end_tl) - self._scroll_offset
+                width = max(MIN_CROP_STRIP_PX, end_px - anchor_px)
+                strip_y = crop_band_y + i * row_h
+                if (anchor_px <= x < anchor_px + width
+                        and strip_y <= y < strip_y + self.CROP_STRIP_HEIGHT):
+                    # Reverse iteration means first hit is the topmost.
+                    return (clip.id, cr.id, cr.anchor_frame,
+                            clip_start_frame, req)
+        return None
 
     def _paint_playhead(self, painter: QPainter, clip_y: int, total_height: int):
         px = self._frame_to_pixel(self._playhead_frame) - self._scroll_offset
@@ -861,10 +903,12 @@ class TimelineStrip(QWidget):
     # --- Mouse interaction ---
 
     def _track_bottom_y(self) -> int:
-        # Bottom of the clip body + the reserved group-label strip — this is
-        # where the resize handle sits and where the marquee area starts.
+        # Bottom of the clip body + group-label strip + crop-strip band.
+        # This is where the resize handle sits and where the marquee area
+        # starts.
         return (self.HEADER_HEIGHT + ui_scale().px(2)
-                + self._clip_height + self.GROUP_STRIP_RESERVE)
+                + self._clip_height + self.GROUP_STRIP_RESERVE
+                + self._crop_band_height())
 
     def mousePressEvent(self, event: QMouseEvent):
         # Quick-cut: right-click while scrubbing (drag or scrub-follow mode)
@@ -886,12 +930,16 @@ class TimelineStrip(QWidget):
             x = event.position().x()
             y = event.position().y()
 
-            # Crop anchor pin hit-test runs BEFORE the ruler / clip / marquee
-            # branches so the user can drag a pin that sits just above the
-            # clip body without inadvertently moving the playhead.
-            pin_hit = self._hit_crop_pin(x, y)
-            if pin_hit is not None:
-                self._dragging_crop_anchor = pin_hit
+            # Crop-strip hit-test runs BEFORE the ruler / clip / marquee
+            # branches so dragging a strip doesn't move the playhead or
+            # start a marquee. Selecting on press means a no-drag click
+            # still routes selection to the panel + preview overlay.
+            strip_hit = self._hit_crop_strip(x, y)
+            if strip_hit is not None:
+                self._dragging_crop_strip = strip_hit
+                self._crop_strip_press_x = float(x)
+                clip_id, crop_id, _orig, _start_tl, _req = strip_hit
+                self.crop_clicked.emit(clip_id, crop_id)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 return
 
@@ -941,8 +989,8 @@ class TimelineStrip(QWidget):
                 self.set_playhead(frame)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        if self._dragging_crop_anchor is not None:
-            self._do_crop_anchor_drag(event.position().x())
+        if self._dragging_crop_strip is not None:
+            self._do_crop_strip_drag(event.position().x())
             return
 
         if self._marquee_active:
@@ -1014,12 +1062,18 @@ class TimelineStrip(QWidget):
             self.preview_frame_requested.emit(self._playhead_frame)
         super().leaveEvent(event)
 
-    def _do_crop_anchor_drag(self, x: float):
+    def _do_crop_strip_drag(self, x: float):
         """Live mid-drag mutation. We bypass ``TimelineModel.update_crop_region``
         (which pushes undo each call) and mutate the live ``CropRegion`` in
-        place — only the strip needs the visual refresh until release."""
-        info = self._dragging_crop_anchor
+        place — only the strip needs the visual refresh until release.
+
+        A small dead-zone (3 px) around the press position lets a pure
+        click pass through without nudging the anchor by ±1 source frame
+        on subpixel mouse jitter."""
+        info = self._dragging_crop_strip
         if info is None:
+            return
+        if abs(x - self._crop_strip_press_x) < 3.0:
             return
         clip_id, crop_id, original_anchor, clip_start_tl, req = info
         clip = self._model.get_clip_by_id(clip_id)
@@ -1032,10 +1086,15 @@ class TimelineStrip(QWidget):
                 break
         if target is None:
             return
-        # Mouse-x → timeline frame → source frame (offset within clip).
-        tl_frame = self._pixel_to_frame(x)
-        # Clamp anchor to [clip.source_in, clip.source_out - req + 1]
-        source_anchor = clip.source_in + (tl_frame - clip_start_tl)
+        # Mouse delta in pixels → source-frame delta, applied to the
+        # PRE-DRAG anchor so the strip translates by exactly the drag
+        # distance regardless of subpixel rounding history.
+        dx_px = x - self._crop_strip_press_x
+        if self._pixels_per_frame <= 0:
+            return
+        delta_frames = int(round(dx_px / self._pixels_per_frame))
+        source_anchor = original_anchor + delta_frames
+        # Clamp to [clip.source_in, clip.source_out - req + 1].
         lo = clip.source_in
         hi = max(lo, clip.source_out - req + 1)
         source_anchor = max(lo, min(hi, source_anchor))
@@ -1043,11 +1102,11 @@ class TimelineStrip(QWidget):
             target.anchor_frame = source_anchor
             self.update()
 
-    def _finish_crop_anchor_drag(self):
+    def _finish_crop_strip_drag(self):
         """Restore the pre-drag anchor on the live object and commit the
         final value through ``update_crop_region`` so one drag = one undo."""
-        info = self._dragging_crop_anchor
-        self._dragging_crop_anchor = None
+        info = self._dragging_crop_strip
+        self._dragging_crop_strip = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
         if info is None:
             return
@@ -1064,16 +1123,16 @@ class TimelineStrip(QWidget):
             return
         final_anchor = target.anchor_frame
         if final_anchor == original_anchor:
-            # No-op drag — don't pollute the undo stack with a redundant entry.
+            # No-op drag (pure click) — don't pollute the undo stack.
             return
         target.anchor_frame = original_anchor
         self._model.update_crop_region(
             clip_id, crop_id, anchor_frame=final_anchor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        if self._dragging_crop_anchor is not None and \
+        if self._dragging_crop_strip is not None and \
                 event.button() == Qt.MouseButton.LeftButton:
-            self._finish_crop_anchor_drag()
+            self._finish_crop_strip_drag()
             return
         if event.button() == Qt.MouseButton.MiddleButton:
             was_panning = self._panning
@@ -1217,6 +1276,7 @@ class TimelineWidget(QWidget):
     cache_thumbnails_clicked = Signal()  # button hit; main_window decides start vs cancel
     sources_dropped = Signal(list, int)  # source_ids, insert_frame
     files_dropped = Signal(list, int)    # file paths, insert_frame
+    crop_clicked = Signal(str, str)      # clip_id, crop_id (strip hit)
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -1299,6 +1359,7 @@ class TimelineWidget(QWidget):
         self._strip.cut_requested.connect(self.cut_requested.emit)
         self._strip.sources_dropped.connect(self.sources_dropped.emit)
         self._strip.files_dropped.connect(self.files_dropped.emit)
+        self._strip.crop_clicked.connect(self.crop_clicked.emit)
         self._scrollbar.valueChanged.connect(self._strip.set_scroll_offset)
         self._model.clips_changed.connect(self._update_scrollbar)
 
@@ -1310,6 +1371,10 @@ class TimelineWidget(QWidget):
         """Forward MainWindow's source dict to the strip so drag previews
         can render per-source thumbnails."""
         self._strip.set_sources_ref(sources)
+
+    def set_selected_crop_id(self, crop_id: str):
+        """External crop-selection sync (panel ⇄ preview ⇄ timeline)."""
+        self._strip.set_selected_crop_id(crop_id)
 
     @property
     def thumbnails_enabled(self) -> bool:

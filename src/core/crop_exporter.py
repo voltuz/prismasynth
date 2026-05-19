@@ -30,14 +30,27 @@ from core.crop_region import (
     CropRegion, OUTPUT_FPS, OUTPUT_FRAMES, crop_matches_filter,
     exact_audio_samples_81_at_16,
 )
-from core.exporter import Exporter, _AUDIO_CODEC_FOR_EXT
+from core.exporter import (
+    Exporter, _AUDIO_CODEC_FOR_EXT, _AUDIO_FORMAT_PRESETS,
+    _probe_gpu_tonemap,
+)
 from core.timeline import TimelineModel
 from core.video_source import VideoSource
+from utils.ffprobe import probe_hdr
 
 logger = logging.getLogger(__name__)
 
 
-# Synthetic codec id for the image-sequence path (no entry in VIDEO_PRESETS).
+# Synthetic codec ids for the image-sequence paths. Each maps to the
+# extension ffmpeg will use for the per-frame filename pattern. Keys
+# must match the dialog's image-format combo (`png`, `jpg`, `exr`)
+# suffixed with `_sequence`.
+IMAGE_SEQUENCE_CODECS: Dict[str, str] = {
+    "png_sequence": ".png",
+    "jpg_sequence": ".jpg",
+    "exr_sequence": ".exr",
+}
+# Back-compat alias for the originally-shipped PNG codec key.
 PNG_SEQUENCE_CODEC = "png_sequence"
 
 
@@ -76,6 +89,18 @@ class CropExporter(QObject):
         self._cancelled = False
         self._active_procs: List[subprocess.Popen] = []
         self._procs_lock = threading.Lock()
+        # HDR-probe results, cached per source path for the lifetime of a
+        # single export job. Reset at the top of _run so re-exports pick
+        # up source remuxes / metadata fixes.
+        self._hdr_cache: Dict[str, bool] = {}
+        self._hdr_cache_lock = threading.Lock()
+        # GPU tonemap state — probed once at the top of _run. When True,
+        # HDR sources go through `tonemap_opencl=hable` matching the
+        # normal exporter. When False, fall back to the CPU zscale chain.
+        # Without this, normal export uses GPU + crop uses CPU and the
+        # two algorithms produce visibly different tonemapped output.
+        self._gpu_tonemap: bool = False
+        self._opencl_device: Optional[str] = None
 
     # --- Subprocess tracking (mirror Exporter) ------------------------
 
@@ -125,6 +150,8 @@ class CropExporter(QObject):
     def _run(self, settings: dict):
         try:
             self._cancelled = False
+            self._hdr_cache = {}
+            self._gpu_tonemap, self._opencl_device = _probe_gpu_tonemap()
             jobs = self._build_jobs(settings)
             if not jobs:
                 self.status.emit("No crops to export")
@@ -158,15 +185,15 @@ class CropExporter(QObject):
         codec = settings.get("codec", "h264")
 
         from ui.export_dialog import VIDEO_PRESETS
-        is_png_sequence = (codec == PNG_SEQUENCE_CODEC)
-        if not is_png_sequence:
+        is_image_sequence = (codec in IMAGE_SEQUENCE_CODECS)
+        if is_image_sequence:
+            preset = None
+            out_ext = ""  # not a single file — output is a folder
+        else:
             preset = VIDEO_PRESETS.get(codec)
             if preset is None:
                 raise ValueError(f"Unknown codec: {codec}")
             out_ext = preset["ext"]
-        else:
-            preset = None
-            out_ext = ""  # not a single file
 
         groups = self._timeline.groups
         jobs: List[dict] = []
@@ -191,8 +218,8 @@ class CropExporter(QObject):
             stem = _stem_of(source.file_path)
             base_name = (
                 f"{stem}_f{cr.anchor_frame}_{cr.w}x{cr.h}_{cr.id[:6]}")
-            if is_png_sequence:
-                # Output is a folder per crop containing frame_001.png ...
+            if is_image_sequence:
+                # Output is a folder per crop containing frame_001.<ext> ...
                 out_path = os.path.join(target_dir, base_name)
             else:
                 out_path = os.path.join(target_dir, base_name + out_ext)
@@ -205,7 +232,8 @@ class CropExporter(QObject):
                 "has_audio": bool(source.audio_channels > 0),
                 "out_path": out_path,
                 "out_ext": out_ext,
-                "is_png_sequence": is_png_sequence,
+                "is_image_sequence": is_image_sequence,
+                "image_ext": IMAGE_SEQUENCE_CODECS.get(codec, ".png"),
                 "preset": preset,
             })
         return jobs
@@ -276,31 +304,49 @@ class CropExporter(QObject):
         src_fps: float = job["source_fps"]
         has_audio: bool = job["has_audio"]
         out_path: str = job["out_path"]
-        is_png: bool = job["is_png_sequence"]
+        is_image_sequence: bool = job["is_image_sequence"]
 
-        if is_png:
-            self._run_png_sequence_job(cr, src_path, src_fps, out_path)
+        if is_image_sequence:
+            ext = job.get("image_ext", ".png")
+            self._run_image_sequence_job(cr, src_path, src_fps, out_path, ext)
             return
 
         preset: dict = job["preset"]
         quality = int(settings.get("quality", 18))
         codec_args = self._apply_quality(preset["args"], quality)
-        out_ext = job["out_ext"]
+        audio_mode = settings.get("audio_mode", "embedded")
+        is_hdr = self._is_hdr_source(src_path)
 
-        # Video + audio + mux pipeline (audio always included per spec).
         os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
                     exist_ok=True)
         base, ext = os.path.splitext(out_path)
+
+        if audio_mode == "none":
+            # Single-pass video write — no audio track, no mux.
+            cmd = self._build_video_cmd(
+                cr, src_path, src_fps, codec_args, out_path, is_hdr)
+            self._run_pipeline([cmd])
+            return
+
+        # embedded (default) or both — three-pass video + audio + mux.
         temp_v = base + ".v" + ext
         temp_a = base + ".a.wav"
-
         cmds = [
-            self._build_video_cmd(cr, src_path, src_fps, codec_args, temp_v),
-            self._build_audio_cmd(cr, src_path, src_fps, has_audio, temp_a),
+            self._build_video_cmd(
+                cr, src_path, src_fps, codec_args, temp_v, is_hdr),
+            self._build_audio_cmd(
+                cr, src_path, src_fps, has_audio, temp_a),
             self._build_mux_cmd(temp_v, temp_a, out_path),
         ]
         try:
             self._run_pipeline(cmds)
+            if audio_mode == "both":
+                # Sidecar in the user-chosen format, transcoded from the
+                # same sample-precise 243000-sample WAV used for embedding.
+                sidecar_cmd = self._build_sidecar_audio_cmd(
+                    temp_a, base, settings)
+                if sidecar_cmd is not None:
+                    self._run_pipeline([sidecar_cmd])
         finally:
             for f in (temp_v, temp_a):
                 try:
@@ -308,58 +354,180 @@ class CropExporter(QObject):
                 except OSError:
                     pass
 
-    def _run_png_sequence_job(self, cr: CropRegion, src_path: str,
-                              src_fps: float, out_dir: str):
+    def _run_image_sequence_job(self, cr: CropRegion, src_path: str,
+                                src_fps: float, out_dir: str,
+                                ext: str = ".png"):
+        """Write 81 numbered image files (PNG/JPG/EXR) to ``out_dir``.
+
+        Uses the same HDR/color filter chain + two-stage seek as the
+        video path so brightness and color match the video output. JPEG
+        gets a fixed high-quality ``-q:v 2`` (1=best, 31=worst in ffmpeg).
+        PNG and OpenEXR are lossless; no quality knob applies."""
         os.makedirs(out_dir, exist_ok=True)
-        ss = Exporter._frame_to_seek_ts(cr.anchor_frame, src_fps)
-        cmd = [
-            "ffmpeg", "-y", "-nostdin", "-v", "error",
-        ]
-        if ss > 0:
-            cmd += ["-ss", f"{ss:.6f}"]
+        is_hdr = self._is_hdr_source(src_path)
+        pre_ss, post_ss = self._two_stage_seek(cr.anchor_frame, src_fps)
+        cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+        if is_hdr:
+            cmd += self._gpu_hw_args()
+        if pre_ss > 0:
+            cmd += ["-ss", f"{pre_ss:.6f}"]
+        cmd += ["-i", src_path]
+        if post_ss > 0:
+            cmd += ["-ss", f"{post_ss:.6f}"]
         cmd += [
-            "-i", src_path,
             "-an",
-            "-vf", self._video_filter(cr, include_setpts=False),
+            "-vf", self._video_filter(
+                cr, is_hdr=is_hdr, include_setpts=False),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
-            os.path.join(out_dir, "frame_%03d.png"),
+            "-map_chapters", "-1", "-dn", "-sn",
         ]
+        # Per-format quality args. PNG / EXR are lossless; JPEG needs a
+        # quality value to avoid the default of 31 (worst).
+        if ext.lower() in (".jpg", ".jpeg"):
+            cmd += ["-q:v", "2"]
+        cmd += [os.path.join(out_dir, f"frame_%03d{ext}")]
         self._run_pipeline([cmd])
 
     # --- Command builders --------------------------------------------
 
-    def _video_filter(self, cr: CropRegion,
+    def _video_filter(self, cr: CropRegion, is_hdr: bool = False,
                       include_setpts: bool = True) -> str:
-        """``crop=W:H:X:Y`` → ``fps=16`` → (``setpts=PTS-STARTPTS``).
+        """Filter chain for the cropped 81-frame@16fps window.
+
+        SDR path: ``crop=W:H:X:Y → fps=16 → setpts=PTS-STARTPTS``.
+
+        HDR path: prepended with the same tonemap chain the normal
+        exporter uses — GPU `tonemap_opencl=hable` when OpenCL is
+        available, CPU `zscale + tonemap=hable + zscale` fallback. The
+        leading ``setparams=bt2020/PQ`` forces consistent HDR signalling
+        so a mid-GOP seek can't desync the tonemap filter, and the
+        trailing ``setparams=bt709`` stamps the output as Rec.709 so
+        encoders don't carry forward bt2020 primaries metadata into the
+        muxed stream (was visible in pre-fix normal exports as
+        `color_primaries=bt2020` despite Rec.709 pixels).
 
         ``setpts`` rebases to PTS=0 so the muxer writes a clean stream
         starting at t=0; the PNG-sequence path skips it because there's
         no muxer to confuse.
         """
-        parts = [f"crop={cr.w}:{cr.h}:{cr.x}:{cr.y}",
-                 f"fps={OUTPUT_FPS}"]
+        parts: List[str] = []
+        if is_hdr:
+            parts.append(
+                "setparams=color_primaries=bt2020:"
+                "color_trc=smpte2084:colorspace=bt2020nc")
+            if self._gpu_tonemap:
+                parts.extend([
+                    "format=p010le", "hwupload",
+                    "tonemap_opencl=tonemap=hable:desat=0:peak=1000:"
+                    "format=nv12",
+                    "hwdownload", "format=nv12",
+                ])
+            else:
+                parts.extend([
+                    "zscale=t=linear:npl=100",
+                    "format=gbrpf32le",
+                    "zscale=p=bt709",
+                    "tonemap=hable:desat=0:peak=10",
+                    "zscale=t=bt709:m=bt709:r=tv",
+                    "format=yuv420p",
+                ])
+            parts.append(
+                "setparams=color_primaries=bt709:"
+                "color_trc=bt709:colorspace=bt709")
+        parts.append(f"crop={cr.w}:{cr.h}:{cr.x}:{cr.y}")
+        parts.append(f"fps={OUTPUT_FPS}")
         if include_setpts:
             parts.append("setpts=PTS-STARTPTS")
         return ",".join(parts)
 
+    def _gpu_hw_args(self) -> List[str]:
+        """OpenCL init flags for the GPU tonemap path. Empty list when
+        GPU tonemap isn't in use; the caller prepends these BEFORE -i."""
+        if not (self._gpu_tonemap and self._opencl_device):
+            return []
+        return ["-init_hw_device", f"opencl=ocl:{self._opencl_device}",
+                "-filter_hw_device", "ocl"]
+
+    @staticmethod
+    def _two_stage_seek(anchor_frame: int, src_fps: float) -> Tuple[float, float]:
+        """Split the seek timestamp into a fast keyframe-accurate pre-input
+        seek (~1s before target) + an accurate post-input seek. The
+        post-input stage also warms up the filter chain so HDR clips
+        don't write their first frame untonemapped (the same fix used in
+        the normal exporter)."""
+        ss = Exporter._frame_to_seek_ts(anchor_frame, src_fps)
+        pre_ss = max(0.0, ss - 1.0)
+        post_ss = max(0.0, ss - pre_ss)
+        return pre_ss, post_ss
+
     def _build_video_cmd(self, cr: CropRegion, src_path: str,
                          src_fps: float, codec_args: list,
-                         out_file: str) -> list:
-        ss = Exporter._frame_to_seek_ts(cr.anchor_frame, src_fps)
+                         out_file: str, is_hdr: bool = False) -> list:
+        pre_ss, post_ss = self._two_stage_seek(cr.anchor_frame, src_fps)
         cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
-        if ss > 0:
-            cmd += ["-ss", f"{ss:.6f}"]
+        if is_hdr:
+            cmd += self._gpu_hw_args()
+        if pre_ss > 0:
+            cmd += ["-ss", f"{pre_ss:.6f}"]
+        cmd += ["-i", src_path]
+        if post_ss > 0:
+            cmd += ["-ss", f"{post_ss:.6f}"]
         cmd += [
-            "-i", src_path,
             "-an",
-            "-vf", self._video_filter(cr),
+            "-vf", self._video_filter(cr, is_hdr=is_hdr),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
             "-video_track_timescale", "24000000",
+            # Drop chapter / data / subtitle streams so Blu-ray rips
+            # don't bleed their full-runtime chapter tracks into the
+            # 5-second crop output.
+            "-map_chapters", "-1", "-dn", "-sn",
+            # Output color tags — no-op for already-correctly-tagged SDR
+            # inputs, load-bearing for HDR inputs after the tonemap chain
+            # so players don't reinterpret the bt709 pixels as anything
+            # else.
+            "-colorspace", "bt709",
+            "-color_trc", "bt709",
+            "-color_primaries", "bt709",
         ]
         cmd += codec_args + [out_file]
         return cmd
+
+    def _build_sidecar_audio_cmd(self, src_wav: str, out_base: str,
+                                 settings: dict) -> Optional[list]:
+        """Transcode the embedded WAV to a sidecar file next to the
+        video. Returns None if the requested format is unknown — caller
+        skips silently rather than failing the whole job."""
+        fmt_key = str(settings.get("audio_format", "wav"))
+        fmt = _AUDIO_FORMAT_PRESETS.get(fmt_key)
+        if not fmt:
+            logger.warning("Unknown audio_format %r; skipping sidecar",
+                           fmt_key)
+            return None
+        out_file = out_base + fmt["ext"]
+        return [
+            "ffmpeg", "-y", "-nostdin", "-v", "error",
+            "-i", src_wav,
+            "-vn",
+            "-c:a", fmt["codec"], *fmt["extra"],
+            "-ar", "48000", "-ac", "2",
+            out_file,
+        ]
+
+    def _is_hdr_source(self, src_path: str) -> bool:
+        with self._hdr_cache_lock:
+            cached = self._hdr_cache.get(src_path)
+        if cached is not None:
+            return cached
+        try:
+            result = bool(probe_hdr(src_path))
+        except Exception:
+            logger.exception("HDR probe failed for %s", src_path)
+            result = False
+        with self._hdr_cache_lock:
+            self._hdr_cache[src_path] = result
+        return result
 
     def _build_audio_cmd(self, cr: CropRegion, src_path: str,
                          src_fps: float, has_audio: bool,
@@ -408,6 +576,7 @@ class CropExporter(QObject):
             "ffmpeg", "-y", "-nostdin", "-v", "error",
             "-i", video_in, "-i", audio_in,
             "-map", "0:v:0", "-map", "1:a:0",
+            "-map_chapters", "-1", "-dn", "-sn",
             "-c:v", "copy",
             "-c:a", audio_codec, *audio_extra,
             "-ar", "48000", "-ac", "2",

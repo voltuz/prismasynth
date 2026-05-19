@@ -470,6 +470,10 @@ class MainWindow(QMainWindow):
         overlay.crop_geometry_changed.connect(
             self._on_crop_geometry_changed)
         overlay.delete_requested.connect(self._on_crop_delete_requested)
+        # Timeline-strip crop-strip click → select the crop (sync panel +
+        # preview overlay highlight).
+        self._timeline_widget.crop_clicked.connect(
+            self._on_crop_selected_in_timeline)
         # Push fresh crop data into the overlay whenever the model changes
         # while edit mode is on (e.g. undo/redo, panel-driven edits).
         self._timeline.clips_changed.connect(self._refresh_crop_overlay)
@@ -2264,9 +2268,21 @@ class MainWindow(QMainWindow):
 
     def _on_crop_selected_in_panel(self, crop_id: str):
         self._preview.set_selected_crop(crop_id)
+        self._timeline_widget.set_selected_crop_id(crop_id)
 
     def _on_crop_selected_in_preview(self, crop_id: str):
         self._clip_info.set_selected_crop(crop_id)
+        self._timeline_widget.set_selected_crop_id(crop_id)
+
+    def _on_crop_selected_in_timeline(self, clip_id: str, crop_id: str):
+        """User clicked a crop strip on the timeline. Select the parent
+        clip if it isn't already, then route the crop selection to the
+        panel + preview overlay."""
+        if clip_id not in self._timeline.selected_ids:
+            self._timeline.set_selection([clip_id])
+        self._clip_info.set_selected_crop(crop_id)
+        self._preview.set_selected_crop(crop_id)
+        self._timeline_widget.set_selected_crop_id(crop_id)
 
     def _on_new_crop_drawn(self, x: int, y: int, w: int, h: int):
         """Overlay finished a draw-new drag → add a CropRegion to the
@@ -2290,9 +2306,11 @@ class MainWindow(QMainWindow):
                         anchor_frame=anchor, aspect_ratio="free")
         new_id = self._timeline.add_crop_region(clip_id, cr)
         if new_id:
-            # Sync selection so the freshly-drawn rect shows its handles.
+            # Sync selection so the freshly-drawn rect shows its handles
+            # in the preview and the new strip gets the halo on the timeline.
             self._preview.set_selected_crop(new_id)
             self._clip_info.set_selected_crop(new_id)
+            self._timeline_widget.set_selected_crop_id(new_id)
 
     def _on_crop_geometry_changed(self, crop_id: str, x: int, y: int,
                                   w: int, h: int):

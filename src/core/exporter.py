@@ -299,6 +299,15 @@ class Exporter(QObject):
                     "zscale=p=bt709", "tonemap=hable:desat=0:peak=10",
                     "zscale=t=bt709:m=bt709:r=tv", "format=yuv420p",
                 ])
+            # Stamp consistent SDR / Rec.709 tags so the encoded stream
+            # doesn't end up with primaries=bt2020 (which is what
+            # tonemap_opencl leaves behind, even though pixels are now
+            # Rec.709). Players that respect primaries would otherwise
+            # apply a bt2020 chroma matrix on top of already-Rec.709
+            # pixels — visible color drift vs the unfixed crop pipeline.
+            parts.append(
+                "setparams=color_primaries=bt709:"
+                "color_trc=bt709:colorspace=bt709")
             if need_scale:
                 parts.append(f"scale={width}:{height}:flags=lanczos")
         else:
@@ -560,6 +569,11 @@ class Exporter(QObject):
             # truncated by the video pipeline's two-stage seek + -frames:v
             # interaction. The mux stage joins them with -c copy.
             cmd += ["-an"]
+            # Drop chapters / data / subtitle streams. The source MOV may
+            # carry a `bin_data` chapter track whose duration spans the
+            # whole movie; without -map_chapters -1 the output inherits
+            # it via the eventual concat -c copy step.
+            cmd += ["-map_chapters", "-1", "-dn", "-sn"]
             cmd += ["-fps_mode", "passthrough",
                     "-video_track_timescale", "24000000"]
             cmd += ffmpeg_args + [out_file]
@@ -614,6 +628,7 @@ class Exporter(QObject):
                 "ffmpeg", "-y", "-nostdin", "-v", "error",
                 "-i", video_in, "-i", audio_in,
                 "-map", "0:v:0", "-map", "1:a:0",
+                "-map_chapters", "-1", "-dn", "-sn",
                 "-c:v", "copy",
                 "-c:a", audio_codec, *audio_extra,
                 "-ar", "48000", "-ac", "2",
@@ -774,6 +789,14 @@ class Exporter(QObject):
             concat_cmd = [
                 "ffmpeg", "-y", "-nostdin", "-v", "error",
                 "-f", "concat", "-safe", "0", "-i", concat_list,
+                # Explicit maps: -c copy without -map is "copy everything",
+                # which lets stray data streams (chapter tracks, RPU
+                # metadata) propagate from the temp segments into the
+                # final output. The chapter track's duration spans the
+                # source movie's full runtime, which players then report
+                # as the export's duration (the ~1:25h bug).
+                "-map", "0:v", "-map", "0:a?",
+                "-map_chapters", "-1", "-dn", "-sn",
                 "-c", "copy",
                 "-video_track_timescale", "24000000",
                 output_path,
@@ -1011,6 +1034,8 @@ class Exporter(QObject):
         concat_cmd = [
             "ffmpeg", "-y", "-nostdin", "-v", "error",
             "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-map", "0:v", "-map", "0:a?",
+            "-map_chapters", "-1", "-dn", "-sn",
             "-c", "copy",
             "-video_track_timescale", "24000000",
             output_path,

@@ -103,6 +103,12 @@ class RemuxJob(QThread):
             "-i", in_path,
             "-map", "0:v:0",
             "-map", "0:a:0?",
+            # Drop everything we don't want propagating downstream — Blu-ray
+            # rips ship chapter tracks (`bin_data`) whose duration spans the
+            # whole movie. Players take max(stream durations), so a 5-second
+            # crop export inherits the ~1:25h chapter-track duration and
+            # appears to be that long in playback.
+            "-map_chapters", "-1", "-dn", "-sn",
             "-c:v", "copy",
             "-video_track_timescale", str(target_ts),
         ]

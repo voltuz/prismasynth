@@ -17,15 +17,41 @@ from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
-    QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from core.crop_region import required_source_frames
-from core.crop_exporter import PNG_SEQUENCE_CODEC
+from core.crop_exporter import IMAGE_SEQUENCE_CODECS, PNG_SEQUENCE_CODEC
 from core.timeline import TimelineModel
 from core.ui_scale import ui_scale
-from ui.export_dialog import VIDEO_PRESETS
+from ui.export_dialog import AUDIO_FORMAT_PRESETS, IMAGE_FORMATS, VIDEO_PRESETS
 from ui.group_filter_widget import GroupFilterWidget
+
+
+# Codec radio-button grouping for the Video tab — mirrors export_dialog
+# so the same labels and ordering are presented to the user across both
+# export paths.
+_CODEC_GROUPS = [
+    ("H.264", [
+        ("h264_nvenc", "NVENC (GPU)"),
+        ("h264", "Software"),
+    ]),
+    ("H.265 / HEVC", [
+        ("h265_nvenc", "NVENC (GPU)"),
+        ("h265", "Software"),
+    ]),
+    ("ProRes", [
+        ("prores_proxy", "422 Proxy"),
+        ("prores_lt", "422 LT"),
+        ("prores_standard", "422"),
+        ("prores_hq", "422 HQ"),
+        ("prores_4444", "4444"),
+        ("prores_4444xq", "4444 XQ"),
+    ]),
+    ("Lossless", [
+        ("ffv1", "FFV1"),
+    ]),
+]
 
 
 _UNTAGGED_KEY = "__untagged__"
@@ -183,26 +209,89 @@ class ExportCropsDialog(QDialog):
         self._timeline.groups_changed.connect(self._rebuild_per_group_rows)
         self._rebuild_per_group_rows()
 
-        # Codec / quality.
-        codec_box = QGroupBox("Encoding")
-        codec_form = QFormLayout(codec_box)
-        self._codec_combo = QComboBox()
-        for codec_id, preset in VIDEO_PRESETS.items():
-            self._codec_combo.addItem(preset["name"], codec_id)
-        self._codec_combo.addItem("PNG image sequence", PNG_SEQUENCE_CODEC)
-        # Default = H.264 NVENC if available, else CPU H.264.
+        # Tabs: Video / Image Sequence. Resolution and FPS are fixed at
+        # the crop rectangle's native pixels @ 16fps, so neither tab
+        # exposes those controls (unlike the normal export dialog).
+        self._tabs = QTabWidget()
+
+        # --- Video tab ----------------------------------------------------
+        video_tab = QWidget()
+        vl = QVBoxLayout(video_tab)
+        vl.setContentsMargins(s.px(6), s.px(6), s.px(6), s.px(6))
+
+        # Codec radio buttons — same layout as the normal Video tab.
+        self._codec_group = QButtonGroup(self)
+        self._codec_buttons: Dict[str, QRadioButton] = {}
+        codec_row = QHBoxLayout()
+        codec_row.setSpacing(s.px(12))
+        for group_name, codecs in _CODEC_GROUPS:
+            box = QGroupBox(group_name)
+            box_l = QVBoxLayout(box)
+            box_l.setSpacing(2)
+            box_l.setContentsMargins(8, 8, 8, 6)
+            for key, label in codecs:
+                rb = QRadioButton(label)
+                rb.setProperty("codec_key", key)
+                self._codec_group.addButton(rb)
+                self._codec_buttons[key] = rb
+                box_l.addWidget(rb)
+            codec_row.addWidget(box)
         default_codec = "h264_nvenc" if _has_nvenc() else "h264"
-        idx = self._codec_combo.findData(default_codec)
-        if idx >= 0:
-            self._codec_combo.setCurrentIndex(idx)
-        self._codec_combo.currentIndexChanged.connect(self._on_codec_changed)
-        codec_form.addRow("Codec:", self._codec_combo)
+        self._codec_buttons[default_codec].setChecked(True)
+        self._codec_group.buttonClicked.connect(self._on_codec_changed)
+        vl.addLayout(codec_row)
+
+        # Quality + audio mode for video.
+        vform = QFormLayout()
         self._quality_spin = QSpinBox()
         self._quality_spin.setRange(0, 51)
         self._quality_spin.setValue(17)
-        codec_form.addRow("Quality (CRF/CQ):", self._quality_spin)
-        outer.addWidget(codec_box)
+        self._quality_spin.setToolTip(
+            "Quality (lower = better, 0 = lossless / max)")
+        self._quality_label = QLabel("Quality (CRF/CQ):")
+        vform.addRow(self._quality_label, self._quality_spin)
+
+        # Audio mode — embedded / none / both, mirroring the normal
+        # dialog's Video tab. 'both' reveals the sidecar format combo.
+        self._audio_mode_combo = QComboBox()
+        self._audio_mode_combo.addItem("Embedded (default)", "embedded")
+        self._audio_mode_combo.addItem("No audio", "none")
+        self._audio_mode_combo.addItem(
+            "Embedded + sidecar audio file", "both")
+        self._audio_mode_combo.currentIndexChanged.connect(
+            self._on_audio_mode_changed)
+        vform.addRow("Audio mode:", self._audio_mode_combo)
+
+        self._audio_format_label = QLabel("Sidecar format:")
+        self._audio_format_combo = QComboBox()
+        for key in ("wav", "flac", "mp3", "m4a"):
+            self._audio_format_combo.addItem(
+                AUDIO_FORMAT_PRESETS[key]["name"], key)
+        vform.addRow(self._audio_format_label, self._audio_format_combo)
+
+        vl.addLayout(vform)
+        vl.addStretch(1)
+        self._tabs.addTab(video_tab, "Video")
+
+        # --- Image Sequence tab ------------------------------------------
+        img_tab = QWidget()
+        il = QVBoxLayout(img_tab)
+        il.setContentsMargins(s.px(6), s.px(6), s.px(6), s.px(6))
+        iform = QFormLayout()
+        self._img_format_combo = QComboBox()
+        for key, fmt in IMAGE_FORMATS.items():
+            self._img_format_combo.addItem(fmt["name"], key)
+        iform.addRow("Format:", self._img_format_combo)
+        il.addLayout(iform)
+        il.addWidget(QLabel(
+            "Each crop becomes a folder containing 81 frames named "
+            "frame_001.<ext> … frame_081.<ext>."))
+        il.addStretch(1)
+        self._tabs.addTab(img_tab, "Image Sequence")
+
+        outer.addWidget(self._tabs)
         self._on_codec_changed()
+        self._on_audio_mode_changed()
 
         # Status / progress.
         self._progress = QProgressBar()
@@ -262,15 +351,25 @@ class ExportCropsDialog(QDialog):
         for row in self._per_group_rows.values():
             row.setEnabled(not is_root)
 
+    def _selected_video_codec(self) -> str:
+        """Currently-checked codec radio on the Video tab.
+        Falls back to 'h264' if nothing is checked (shouldn't happen)."""
+        btn = self._codec_group.checkedButton()
+        return btn.property("codec_key") if btn else "h264"
+
     def _on_codec_changed(self):
-        codec_id = self._codec_combo.currentData()
-        if codec_id == PNG_SEQUENCE_CODEC:
-            self._quality_spin.setEnabled(False)
-            return
+        codec_id = self._selected_video_codec()
         preset = VIDEO_PRESETS.get(codec_id, {})
         args = preset.get("args", [])
         uses_quality = any("{quality}" in a for a in args)
-        self._quality_spin.setEnabled(uses_quality)
+        self._quality_spin.setVisible(uses_quality)
+        self._quality_label.setVisible(uses_quality)
+
+    def _on_audio_mode_changed(self):
+        mode = self._audio_mode_combo.currentData()
+        show_sidecar = (mode == "both")
+        self._audio_format_label.setVisible(show_sidecar)
+        self._audio_format_combo.setVisible(show_sidecar)
 
     def _on_browse_root(self):
         start = self._root_edit.text().strip() or self._default_dir
@@ -321,15 +420,40 @@ class ExportCropsDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _collect_settings(self) -> Optional[dict]:
-        codec = self._codec_combo.currentData()
+        # Active tab decides the export shape. The crop_exporter still
+        # discriminates on the codec id (image-seq codec keys live in
+        # IMAGE_SEQUENCE_CODECS), so passing mode is purely informational
+        # for downstream code; the codec id is the source of truth.
+        is_image_seq = (self._tabs.currentIndex() == 1)
+        if is_image_seq:
+            fmt_key = self._img_format_combo.currentData()
+            codec = f"{fmt_key}_sequence"
+            if codec not in IMAGE_SEQUENCE_CODECS:
+                # Fallback: PNG is always supported.
+                codec = PNG_SEQUENCE_CODEC
+            mode = "image_sequence"
+            audio_mode = "none"
+            audio_format = "wav"
+        else:
+            codec = self._selected_video_codec()
+            mode = "video"
+            audio_mode = self._audio_mode_combo.currentData() or "embedded"
+            audio_format = self._audio_format_combo.currentData() or "wav"
         quality = self._quality_spin.value()
         flt = self._group_filter.current_filter()
         is_root_mode = self._rb_root.isChecked()
+        common = {
+            "codec": codec,
+            "mode": mode,
+            "quality": quality,
+            "audio_mode": audio_mode,
+            "audio_format": audio_format,
+            "group_filter": flt,
+        }
         if is_root_mode:
             root_dir = self._root_edit.text().strip()
             if not root_dir:
-                self.set_status(
-                    "Choose a root folder first.")
+                self.set_status("Choose a root folder first.")
                 return None
             try:
                 os.makedirs(root_dir, exist_ok=True)
@@ -337,12 +461,10 @@ class ExportCropsDialog(QDialog):
                 self.set_status(f"Couldn't create root folder: {e}")
                 return None
             return {
-                "codec": codec,
-                "quality": quality,
+                **common,
                 "output_mode": "root_subfolders",
                 "root_dir": root_dir,
                 "per_group_paths": {},
-                "group_filter": flt,
             }
         per_group_paths: Dict[Optional[str], str] = {}
         for key, row in self._per_group_rows.items():
@@ -361,12 +483,10 @@ class ExportCropsDialog(QDialog):
                 "Set at least one per-group folder before exporting.")
             return None
         return {
-            "codec": codec,
-            "quality": quality,
+            **common,
             "output_mode": "per_group_paths",
             "root_dir": "",
             "per_group_paths": per_group_paths,
-            "group_filter": flt,
         }
 
     def _on_run(self):
