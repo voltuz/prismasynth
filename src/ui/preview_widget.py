@@ -67,8 +67,14 @@ class PreviewWidget(QWidget):
         self._zoom_percent = 100.0      # only used when mode == "percent"
         self._pan_x = 0.0               # mpv video-pan-x (fraction of window width)
         self._pan_y = 0.0
-        self._source_w = 0              # native source dims (captured in load_source)
+        self._source_w = 0              # native source pixel dims (captured in load_source)
         self._source_h = 0
+        # mpv display dims (DAR / SAR-corrected, rotation-aware). For
+        # anamorphic / rotated sources mpv positions the video using
+        # these, not the encoded pixel dims, so the overlay's fit math
+        # must use them too. Square-pixel sources have display == source.
+        self._display_w = 0
+        self._display_h = 0
         self._panning = False
         self._pan_start_mouse = None
         self._pan_start_offset = (0.0, 0.0)
@@ -259,6 +265,23 @@ class PreviewWidget(QWidget):
                 self._source_h = int(h)
         except Exception:
             pass
+        # Capture display dims (DAR / SAR / rotation-corrected) — used by
+        # _get_render_geometry so the on-screen video rect matches mpv's
+        # actual paint position. dwidth/dheight may not be ready right after
+        # loadfile; fall back to encoded dims and let _apply_zoom refresh.
+        try:
+            dw = self._player.dwidth
+            dh = self._player.dheight
+            if dw and dh:
+                self._display_w = int(dw)
+                self._display_h = int(dh)
+            elif self._source_w > 0:
+                self._display_w = self._source_w
+                self._display_h = self._source_h
+        except Exception:
+            if self._source_w > 0:
+                self._display_w = self._source_w
+                self._display_h = self._source_h
         # Re-project current zoom mode onto the new source
         self._apply_zoom()
         logger.debug("Loaded source: %s", file_path)
@@ -379,10 +402,10 @@ class PreviewWidget(QWidget):
         super().resizeEvent(event)
         if self._black_overlay.isVisible():
             self._black_overlay.setGeometry(self._container.geometry())
-        # Crop overlay covers the whole preview widget so its source↔widget
-        # math can use the container's geometry as offset.
+        # Crop overlay is a top-level window — pin its screen geometry
+        # to our (newly resized) screen rect, not the local rect().
         if hasattr(self, "_crop_overlay"):
-            self._crop_overlay.setGeometry(self.rect())
+            self._crop_overlay.sync_geometry_to_preview()
             self._crop_overlay.request_repaint()
         # Position bottom-left overlay row (zoom combo + mute + volume slider)
         self._reposition_overlays()
@@ -390,6 +413,13 @@ class PreviewWidget(QWidget):
         # be re-translated into mpv's video-zoom.
         if self._zoom_mode == "percent":
             self._apply_zoom()
+
+    def moveEvent(self, event):
+        # PreviewWidget's local position changes when the splitter moves;
+        # the top-level crop overlay needs to track that too.
+        super().moveEvent(event)
+        if hasattr(self, "_crop_overlay"):
+            self._crop_overlay.sync_geometry_to_preview()
 
     def _reposition_overlays(self):
         if not hasattr(self, "_zoom_combo"):
@@ -459,7 +489,13 @@ class PreviewWidget(QWidget):
             return None
         widget_w = max(1, self._container.width())
         widget_h = max(1, self._container.height())
-        aspect = self._source_w / self._source_h
+        # Aspect from mpv's display dims (DAR / SAR / rotation-corrected)
+        # so the computed rect aligns with where mpv actually paints.
+        # Falls back to encoded pixel dims when display dims aren't ready
+        # yet — strict no-op for square-pixel sources.
+        dw = self._display_w if self._display_w > 0 else self._source_w
+        dh = self._display_h if self._display_h > 0 else self._source_h
+        aspect = dw / dh
         fit_w = min(widget_w, widget_h * aspect)
         fit_h = min(widget_h, widget_w / aspect)
         if fit_w <= 0 or fit_h <= 0:
@@ -493,6 +529,21 @@ class PreviewWidget(QWidget):
                     self._source_h = int(h)
             except Exception:
                 pass
+        # Same opportunistic refresh for display dims — they often become
+        # available a frame or two after loadfile.
+        if self._display_w <= 0 or self._display_h <= 0:
+            try:
+                dw = self._player.dwidth
+                dh = self._player.dheight
+                if dw and dh:
+                    self._display_w = int(dw)
+                    self._display_h = int(dh)
+            except Exception:
+                pass
+            if (self._display_w <= 0 or self._display_h <= 0) \
+                    and self._source_w > 0:
+                self._display_w = self._source_w
+                self._display_h = self._source_h
         try:
             if self._zoom_mode == "fit":
                 self._player.video_zoom = 0.0
@@ -712,21 +763,18 @@ class PreviewWidget(QWidget):
     def crop_overlay(self) -> "CropOverlay":
         return self._crop_overlay
 
-    def set_crop_edit_mode(self, on: bool, clip_id=None,
-                           source_w: int = 0, source_h: int = 0,
-                           crops=None, group_colors=None):
-        """Toggle the crop-editing overlay. When ``on`` is True the overlay
-        intercepts left-mouse for draw/move/resize; middle-mouse pan and
-        scroll-wheel zoom continue to work because the overlay ignores them."""
-        # Ensure geometry covers the widget before the first paint —
-        # resizeEvent may not have fired yet on first activation.
-        self._crop_overlay.setGeometry(self.rect())
-        # Keep the bottom controls above the overlay.
+    def set_crop_clip(self, clip_id, source_w: int, source_h: int,
+                      crops, group_colors=None):
+        """Push the currently-displayed clip's crop state into the overlay.
+        Visibility (show/hide) is decided inside the overlay based on
+        whether there are active crops and whether edit mode is on."""
+        # Keep the bottom controls above the overlay z-order-wise; the
+        # overlay is a top-level window now so this only matters as a
+        # safety belt for the in-widget controls.
         self._zoom_combo.raise_()
         self._mute_btn.raise_()
         self._volume_slider.raise_()
-        self._crop_overlay.set_edit_mode(
-            on,
+        self._crop_overlay.set_clip_state(
             clip_id=clip_id,
             source_w=source_w,
             source_h=source_h,
@@ -734,9 +782,10 @@ class PreviewWidget(QWidget):
             group_colors=group_colors,
         )
 
-    def refresh_crops(self, crops, group_colors=None):
-        """Push a fresh crop list into the overlay (e.g. on clips_changed)."""
-        self._crop_overlay.set_crops(crops, group_colors=group_colors)
+    def set_crop_edit_mode(self, on: bool):
+        """Toggle the overlay's interactivity (handles + mouse input).
+        Outline visibility is independent — see ``set_crop_clip``."""
+        self._crop_overlay.set_edit_mode(on)
 
     def set_selected_crop(self, crop_id: str):
         """External selection sync (panel ⇄ preview)."""

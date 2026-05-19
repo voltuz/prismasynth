@@ -74,14 +74,40 @@ class CropOverlay(QWidget):
     delete_requested = Signal(str)
 
     def __init__(self, preview, parent=None):
-        super().__init__(parent or preview)
+        # Top-level frameless tool window — NOT a child widget.
+        #
+        # WA_TranslucentBackground on a child widget on Windows implicitly
+        # promotes the widget to a detached native top-level window
+        # without inheriting its parent's screen position. That caused
+        # three reported symptoms: a static grey rectangle over the
+        # preview (alpha couldn't composite against mpv's sibling HWND),
+        # crops that couldn't reach the visible top-left because the
+        # overlay's local coord frame started somewhere off the preview,
+        # and a mouse-to-paint offset for the same reason.
+        #
+        # Making the overlay an *explicit* top-level window with
+        # `Qt.Tool` (tied to the parent window for show/hide / z-order)
+        # gives proper per-pixel alpha through DWM and lets us pin its
+        # screen geometry to the PreviewWidget's screen rect on every
+        # resize / move event.
+        super().__init__(
+            preview,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool,
+        )
         self._preview = preview
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,
                           True)
         self.setVisible(False)
         # We want keyboard input for Delete / Escape only when edit mode is
         # on; we set this dynamically.
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Receive mouseMoveEvent on hover (not just during drag) so the
+        # cursor logic in mouseMoveEvent → _cursor_for_position can
+        # update over handles / body / empty area. Default is False,
+        # which is why hover cursors never changed.
+        self.setMouseTracking(True)
 
         self._edit_mode: bool = False
         self._clip_id: Optional[str] = None
@@ -109,48 +135,95 @@ class CropOverlay(QWidget):
     # Configuration from owner
     # ------------------------------------------------------------------
 
-    def set_edit_mode(self, on: bool, clip_id: Optional[str] = None,
-                      source_w: int = 0, source_h: int = 0,
-                      crops: Optional[List[CropRegion]] = None,
-                      group_colors: Optional[dict] = None):
-        """Toggle edit mode. When ``on`` is True, ``clip_id`` / source
-        dims / crops must be valid. When False, the overlay clears its
-        state so it doesn't leak between clips."""
-        self._edit_mode = bool(on)
-        if on:
-            self._clip_id = clip_id
-            self._source_w = int(source_w)
-            self._source_h = int(source_h)
-            self._crops = list(crops or [])
-            self._group_color = dict(group_colors or {})
-        else:
-            self._clip_id = None
-            self._source_w = 0
-            self._source_h = 0
-            self._crops = []
+    def sync_geometry_to_preview(self):
+        """Pin the overlay's *screen* geometry to PreviewWidget's screen
+        rect. Caller drives this from PreviewWidget's resize / move
+        events and from MainWindow's move / state-change events; the
+        overlay is a top-level window so it doesn't inherit those
+        automatically."""
+        if not self._preview.isVisible():
+            return
+        top_left = self._preview.mapToGlobal(QPoint(0, 0))
+        size = self._preview.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        self.setGeometry(top_left.x(), top_left.y(),
+                         size.width(), size.height())
+
+    def set_clip_state(self, clip_id: Optional[str], source_w: int,
+                       source_h: int,
+                       crops: Optional[List[CropRegion]] = None,
+                       group_colors: Optional[dict] = None):
+        """Tell the overlay which clip's crops to display. Pass
+        ``clip_id=None`` (or empty crops on a non-gap clip) to clear.
+        Visibility is decided automatically by ``_refresh_visibility``
+        — callers do not need to also call show()/hide().
+
+        This is the single entry point for "what to draw": called on
+        selection_changed, clips_changed, groups_changed."""
+        self._clip_id = clip_id
+        self._source_w = int(source_w) if source_w else 0
+        self._source_h = int(source_h) if source_h else 0
+        self._crops = list(crops or [])
+        if group_colors is not None:
+            self._group_color = dict(group_colors)
+        # Drop stale selection.
+        if self._selected_id and not any(
+                cr.id == self._selected_id for cr in self._crops):
             self._selected_id = ""
-            self._cancel_drag()
+        self._refresh_visibility()
+        self.update()
+
+    def set_edit_mode(self, on: bool):
+        """Toggle interactivity (handles, mouse / Delete / Esc input,
+        and the draw-new affordance). Visibility is independent — active
+        crops still render as outlines when edit mode is off."""
+        self._edit_mode = bool(on)
+        # Hide/re-show around the WA_TransparentForMouseEvents flip.
+        # On a top-level Qt.Tool HWND, Windows only re-emits the
+        # WS_EX_TRANSPARENT ex-style at show() time — toggling the Qt
+        # attribute on a visible native window leaves the OS ex-style
+        # stale, so DWM keeps routing clicks straight through to the
+        # mpv HWND below and the overlay never receives mousePress.
+        # The hide()/show() cycle via _refresh_visibility() forces QPA
+        # to re-emit the correct ex-style.
+        was_visible = self.isVisible()
+        if was_visible:
+            self.hide()
         self.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, not on)
         self.setFocusPolicy(
             Qt.FocusPolicy.StrongFocus if on else Qt.FocusPolicy.NoFocus)
-        self.setVisible(on)
-        if on:
-            self.raise_()
+        if not on:
+            # Leaving edit mode: drop selection + any in-flight drag so
+            # the next entry into edit mode starts fresh.
+            self._selected_id = ""
+            self._cancel_drag()
+        self._refresh_visibility()
+        if on and self.isVisible():
+            # Qt.Tool on Windows can swallow the first click for window
+            # activation — activateWindow() ensures it lands as a real
+            # mousePressEvent.
+            self.activateWindow()
             self.setFocus()
         self.update()
 
-    def set_crops(self, crops: List[CropRegion],
-                  group_colors: Optional[dict] = None):
-        """Refresh the crop list (e.g. on clips_changed). Preserves the
-        current selection if the id still exists."""
-        self._crops = list(crops)
-        if group_colors is not None:
-            self._group_color = dict(group_colors)
-        if self._selected_id and not any(
-                cr.id == self._selected_id for cr in self._crops):
-            self._selected_id = ""
-        self.update()
+    def _refresh_visibility(self):
+        """Show iff there's a clip context AND (edit_mode is on OR at
+        least one crop on the clip is active). Hide otherwise. Always
+        pins screen geometry before showing so the first paint lands
+        aligned with PreviewWidget."""
+        has_clip = bool(self._clip_id) and self._source_w > 0 and self._source_h > 0
+        has_active = has_clip and any(c.active for c in self._crops)
+        should_show = has_clip and (self._edit_mode or has_active)
+        if should_show:
+            if not self.isVisible():
+                self.sync_geometry_to_preview()
+                self.show()
+                self.raise_()
+        else:
+            if self.isVisible():
+                self.hide()
 
     def set_selected_crop(self, crop_id: str):
         if not crop_id:
@@ -188,14 +261,20 @@ class CropOverlay(QWidget):
         cy = widget_h / 2.0 + pan_y * scaled_h
         left = cx - scaled_w / 2.0
         top = cy - scaled_h / 2.0
-        # The overlay widget's geometry covers the whole PreviewWidget;
-        # the video lives inside `_container` which already has 0,0 origin
-        # in this widget's coordinates because both are children of
-        # PreviewWidget with matching position. mapFromGlobal would be
-        # overkill — we use the container's geometry as offset.
-        cont_geo = self._preview._container.geometry()
-        return QRectF(cont_geo.x() + left,
-                      cont_geo.y() + top,
+        # The overlay is a top-level Qt.Tool window whose screen position
+        # is pinned to the PreviewWidget's via sync_geometry_to_preview().
+        # Windows can snap that HWND origin by ±1 px (DPI rounding / DWM
+        # frame extension), which means overlay-local (0,0) is not
+        # *exactly* preview-local (0,0). Strict QRectF.contains() then
+        # fails for body / draw-new clicks even when handles still hit
+        # via their ±6-px slack — matching the observed regression.
+        # Round-trip the container's origin through global coords so the
+        # returned rect lives in overlay-local space, independent of any
+        # OS-level snapping between the two top-level coordinate systems.
+        container_global = self._preview._container.mapToGlobal(QPoint(0, 0))
+        container_in_overlay = self.mapFromGlobal(container_global)
+        return QRectF(container_in_overlay.x() + left,
+                      container_in_overlay.y() + top,
                       scaled_w, scaled_h)
 
     def _source_to_widget(self, x: int, y: int, w: int, h: int
@@ -228,38 +307,51 @@ class CropOverlay(QWidget):
     # ------------------------------------------------------------------
 
     def paintEvent(self, event):
-        if not self._edit_mode or self._source_w <= 0 or self._source_h <= 0:
+        # No `_edit_mode` gate here — outlines must paint when the
+        # overlay is visible in view-only mode too. `_refresh_visibility`
+        # owns the show/hide decision; if we got here the overlay is
+        # showing and there's at least a clip context to draw against.
+        if self._source_w <= 0 or self._source_h <= 0:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        # Find the selected crop and its widget rect for the dim overlay.
-        selected = self._find_crop(self._selected_id)
-        if selected is not None:
-            sel_rect = self._source_to_widget(
-                selected.x, selected.y, selected.w, selected.h)
-        else:
-            sel_rect = None
+        if self._edit_mode:
+            # Layered top-level windows on Windows (Qt.Tool +
+            # WA_TranslucentBackground) hit-test against painted pixel
+            # alpha. Without a non-zero fill, only the crop outlines and
+            # handle squares register as hit-able — clicks in the body
+            # interior or empty video area fall through to the mpv HWND
+            # below before mousePressEvent fires. alpha=1 is
+            # imperceptible visually but makes the entire overlay capture
+            # LMB, so draw / move / resize all reach the press handler.
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
 
-        # Dim overlay outside the selected crop (only when something is
-        # selected — keeps the unselected case readable).
-        if sel_rect is not None:
-            self._paint_dim_outside(painter, sel_rect)
+        # Selection / handles concepts are edit-mode-only.
+        selected = (self._find_crop(self._selected_id)
+                    if self._edit_mode else None)
+        sel_rect = (self._source_to_widget(
+                        selected.x, selected.y, selected.w, selected.h)
+                    if selected is not None else None)
 
-        # Each crop's outline.
+        # Crop outlines. View-only mode hides inactive crops; edit mode
+        # shows them as dashed so the user can find/re-enable them.
         for cr in self._crops:
+            if not cr.active and not self._edit_mode:
+                continue
             wrect = self._source_to_widget(cr.x, cr.y, cr.w, cr.h)
             if wrect is None:
                 continue
+            is_selected = self._edit_mode and (cr.id == self._selected_id)
             self._paint_crop_outline(
-                painter, cr, wrect, selected=(cr.id == self._selected_id))
+                painter, cr, wrect, selected=is_selected)
 
-        # Resize handles for the selected crop.
-        if selected is not None and sel_rect is not None:
+        # Resize handles for the selected crop (edit mode only).
+        if self._edit_mode and selected is not None and sel_rect is not None:
             self._paint_handles(painter, sel_rect)
 
-        # Live draw-new preview.
-        if self._drag_kind == "draw":
+        # Live draw-new preview (edit mode only).
+        if self._edit_mode and self._drag_kind == "draw":
             x0, y0 = self._draw_anchor_src
             x1, y1 = self._widget_to_source(self._last_drag_pos) or (x0, y0)
             sx, sy = min(x0, x1), min(y0, y1)
@@ -308,8 +400,17 @@ class CropOverlay(QWidget):
         color = QColor(self._group_color.get(cr.id, "#cccccc"))
         if not color.isValid():
             color = QColor("#cccccc")
+        if selected:
+            # White halo so the selected crop reads against bright frames
+            # too — compensates for the (intentionally) absent dim layer.
+            halo = QPen(QColor(255, 255, 255, 220))
+            halo.setWidth(3)
+            halo.setStyle(Qt.PenStyle.SolidLine)
+            painter.setPen(halo)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(wrect)
         pen = QPen(color)
-        pen.setWidth(2 if selected else 1)
+        pen.setWidth(1)
         pen.setStyle(Qt.PenStyle.SolidLine if cr.active
                      else Qt.PenStyle.DashLine)
         painter.setPen(pen)

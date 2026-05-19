@@ -474,6 +474,10 @@ class MainWindow(QMainWindow):
         # while edit mode is on (e.g. undo/redo, panel-driven edits).
         self._timeline.clips_changed.connect(self._refresh_crop_overlay)
         self._timeline.groups_changed.connect(self._refresh_crop_overlay)
+        # View-only crop outlines: keep showing as the user changes
+        # selection. selection_changed fires whenever the panel switches
+        # to a new clip, so the overlay's clip-context follows.
+        self._timeline.selection_changed.connect(self._refresh_crop_overlay)
 
         # Media Panel signals
         self._media_panel.source_double_clicked.connect(self._on_source_double_clicked)
@@ -2247,26 +2251,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_crop_edit_mode_changed(self, checked: bool):
-        """User toggled "Edit crops in preview" in the Clip panel."""
-        selected = self._timeline.get_selected_clips()
-        clip = selected[0] if selected else None
-        if not checked or clip is None or clip.is_gap:
-            self._crop_edit_clip_id = None
-            self._preview.set_crop_edit_mode(False)
-            return
-        source = self._sources.get(clip.source_id)
-        if source is None:
-            self._preview.set_crop_edit_mode(False)
-            return
-        self._crop_edit_clip_id = clip.id
-        self._preview.set_crop_edit_mode(
-            True,
-            clip_id=clip.id,
-            source_w=source.width,
-            source_h=source.height,
-            crops=list(clip.crop_regions),
-            group_colors=self._build_crop_group_colors(clip),
-        )
+        """User toggled "Edit crops in preview" in the Clip panel.
+        Edit mode is now a pure interactivity toggle — the clip context
+        is pushed independently by ``_refresh_crop_overlay`` so active
+        crops stay visible whether edit mode is on or off."""
+        self._preview.set_crop_edit_mode(checked)
+        # If the user turned edit mode on, make sure the overlay has
+        # the current clip's state (in case selection changed since
+        # the last refresh and only `selection_changed` updates clip
+        # context).
+        self._refresh_crop_overlay()
 
     def _on_crop_selected_in_panel(self, crop_id: str):
         self._preview.set_selected_crop(crop_id)
@@ -2320,19 +2314,34 @@ class MainWindow(QMainWindow):
         self._timeline.remove_crop_region(clip_id, crop_id)
 
     def _refresh_crop_overlay(self):
-        """Push the current clip's crop list into the overlay. No-op when
-        edit mode is off."""
-        clip_id = self._crop_edit_clip_id
-        if not clip_id:
-            return
-        clip = self._timeline.get_clip_by_id(clip_id)
-        if clip is None or clip.is_gap:
-            self._preview.set_crop_edit_mode(False)
+        """Single source of truth for the overlay's clip context.
+
+        Runs on selection_changed / clips_changed / groups_changed.
+        Pushes the currently-selected clip's crop state into the
+        overlay, which then auto-decides whether to show itself
+        (active crops present OR edit mode on)."""
+        selected = self._timeline.get_selected_clips()
+        if len(selected) != 1 or selected[0].is_gap:
             self._crop_edit_clip_id = None
+            self._preview.set_crop_clip(None, 0, 0, [], {})
             return
-        self._preview.refresh_crops(
-            list(clip.crop_regions),
-            group_colors=self._build_crop_group_colors(clip))
+        clip = selected[0]
+        source = self._sources.get(clip.source_id)
+        if source is None or source.fps <= 0:
+            self._crop_edit_clip_id = None
+            self._preview.set_crop_clip(None, 0, 0, [], {})
+            return
+        # Keep `_crop_edit_clip_id` in sync so the
+        # _on_new_crop_drawn / _on_crop_geometry_changed slots know
+        # which clip the overlay is currently aimed at.
+        self._crop_edit_clip_id = clip.id
+        self._preview.set_crop_clip(
+            clip_id=clip.id,
+            source_w=source.width,
+            source_h=source.height,
+            crops=list(clip.crop_regions),
+            group_colors=self._build_crop_group_colors(clip),
+        )
 
     def _build_crop_group_colors(self, clip) -> dict:
         """Return ``{crop_id: hex_color}`` for every crop on the clip."""
@@ -2829,6 +2838,25 @@ class MainWindow(QMainWindow):
         secs = int(total_secs) % 60
         self._status_clips.setText(f"{count} clips")
         self._status_duration.setText(f"{minutes:02d}:{secs:02d}")
+
+    def moveEvent(self, event):
+        # The top-level crop overlay needs to track main-window drags
+        # because PreviewWidget doesn't get a moveEvent when only the
+        # outer window's screen position changes.
+        super().moveEvent(event)
+        self._resync_crop_overlay_geometry()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Maximise / restore / minimise: re-pin the overlay.
+        from PySide6.QtCore import QEvent as _QE
+        if event.type() == _QE.Type.WindowStateChange:
+            self._resync_crop_overlay_geometry()
+
+    def _resync_crop_overlay_geometry(self):
+        if hasattr(self, "_preview") and hasattr(
+                self._preview, "_crop_overlay"):
+            self._preview._crop_overlay.sync_geometry_to_preview()
 
     def closeEvent(self, event):
         if not self._confirm_discard():
