@@ -446,8 +446,14 @@ class Exporter(QObject):
                      p["is_hdr"], p["src_w"], p["src_h"], p["has_audio"]))
 
         total_frames = sum(s[2] for s in flat_segments)
+        # Captured by _build_segment_cmd's closure: gap segments stamp
+        # bt709 color tags only when the project contains an HDR source,
+        # so the muxer's per-segment color metadata stays consistent
+        # with the real-clip branch's post-tonemap -colorspace flags.
+        # In pure-SDR projects neither branch emits explicit tags.
+        any_hdr = any(p["is_hdr"] for p in source_params.values())
         suffix = ""
-        if any(p["is_hdr"] for p in source_params.values()):
+        if any_hdr:
             suffix = " (GPU tonemap)" if gpu_available else " (CPU tonemap)"
         self.status.emit(
             f"Encoding {len(flat_segments)} segments to {output_path}...{suffix}")
@@ -459,11 +465,22 @@ class Exporter(QObject):
             # using lavfi sources. No source decode involved.
             if path is None:
                 gap_dur = count / src_fps if src_fps > 0 else 0.0
+                # Sample-exact silence: the real-clip audio path uses
+                # `atrim=end_sample=N` on N from _exact_audio_samples so the
+                # encoded count is rational-integer at NTSC. Gaps must
+                # match — using a float -t alone overshoots by ~16 samples
+                # per gap at 23.976 (200,216 vs 200,200 for 100 frames),
+                # which compounds across a multi-cut timeline. The lavfi
+                # -t is given 50ms of headroom so atrim always has room
+                # to clip down; the trim runs in the output filter chain.
+                n_samples = self._exact_audio_samples(count, src_fps, 48000)
+                silence_t = ((n_samples / 48000) + 0.05
+                             if n_samples > 0 else gap_dur)
                 gap_cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
                            "-f", "lavfi", "-t", f"{gap_dur:.6f}",
                            "-i", f"color=c=black:s={width}x{height}:r={fps}"]
                 if not strip_audio:
-                    gap_cmd += ["-f", "lavfi", "-t", f"{gap_dur:.6f}",
+                    gap_cmd += ["-f", "lavfi", "-t", f"{silence_t:.6f}",
                                 "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
                 if not is_nvenc:
                     threads_per = max(2, cpu_count // max_parallel)
@@ -477,9 +494,20 @@ class Exporter(QObject):
                         out_ext_g, ("pcm_s16le", []))
                     gap_cmd += ["-map", "1:a:0",
                                 "-c:a", audio_codec_g, *audio_extra_g,
+                                "-af",
+                                f"aresample=48000,atrim=end_sample={n_samples}",
                                 "-ar", "48000", "-ac", "2"]
                 gap_cmd += ["-fps_mode", "passthrough",
                             "-video_track_timescale", "24000000"]
+                # Match the real-clip branch's post-tonemap color tags
+                # (see the `if hdr:` block below) so stream-copy concat
+                # produces a file with consistent per-segment color
+                # metadata. Players that read file-level color from the
+                # first segment otherwise risk picking up the gap's
+                # unspecified tags instead of bt709.
+                if any_hdr:
+                    gap_cmd += ["-colorspace", "bt709", "-color_trc", "bt709",
+                                "-color_primaries", "bt709"]
                 gap_cmd += ffmpeg_args + [out_file]
                 return gap_cmd
             ss = self._frame_to_seek_ts(src_in, src_fps)
@@ -1084,11 +1112,19 @@ class Exporter(QObject):
 
                 cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
                 if src_path is None:
-                    # Gap segment — emit silence for the gap duration.
+                    # Gap segment — emit silence sized to the exact sample
+                    # count, mirroring the real-clip branch below
+                    # (atrim=end_sample=N on _exact_audio_samples). Float
+                    # `-t` alone overshoots by ~16 samples per gap at
+                    # NTSC; the concat then drifts vs. the video export.
+                    n_samples = self._exact_audio_samples(count, src_fps, 48000)
+                    silence_t = ((n_samples / 48000) + 0.05
+                                 if n_samples > 0 else audio_dur)
                     cmd += [
-                        "-f", "lavfi", "-t", f"{audio_dur:.6f}",
+                        "-f", "lavfi", "-t", f"{silence_t:.6f}",
                         "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
                         "-vn",
+                        "-af", f"atrim=end_sample={n_samples}",
                     ]
                     cmd += ["-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", tmp]
                     commands.append(cmd)

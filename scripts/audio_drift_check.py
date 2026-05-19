@@ -212,6 +212,10 @@ def main(argv=None) -> int:
                    help="Output dir (default: %%TEMP%%/audio_drift_check_<ts>)")
     p.add_argument("--prefix-frames", type=int, default=0,
                    help="Cap output to first N timeline frames (default: full)")
+    p.add_argument("--include-gaps", action="store_true",
+                   help="Include gap segments in the export. Exercises the "
+                        "lavfi anullsrc gap-audio path; pre-fix drifts ~16 "
+                        "samples per gap at NTSC, post-fix is exact.")
     p.add_argument("--timeout", type=float, default=1800.0,
                    help="Export timeout in seconds (default: 1800)")
     args = p.parse_args(argv)
@@ -279,9 +283,12 @@ def main(argv=None) -> int:
     seg_probe = _ExpForSeg(timeline, sources)
     seg_probe._group_filter = group_filter
     seg_probe._use_render_range = use_range
-    seg_probe._include_gaps = False
+    seg_probe._include_gaps = args.include_gaps
     seg_probe._export_fps = fps
     segments = seg_probe._build_segments()
+    if args.include_gaps:
+        n_gap_segments = sum(1 for s in segments if s[0] is None)
+        print(f"[harness] Gap segments in build: {n_gap_segments}")
     n_segments = len(segments)
     total_video_frames = sum(s[2] for s in segments)
     expected_samples = _expected_samples_for_segments(segments, sample_rate=48000)
@@ -308,7 +315,7 @@ def main(argv=None) -> int:
         "fps": fps,
         "audio_mode": "embedded",
         "group_filter": group_filter,
-        "include_gaps": False,
+        "include_gaps": args.include_gaps,
         "use_render_range": use_range,
     }
     print(f"[harness] Output: {output_path}")
