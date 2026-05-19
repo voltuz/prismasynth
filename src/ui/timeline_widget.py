@@ -6,7 +6,7 @@ from typing import Optional, List
 from PySide6.QtWidgets import QWidget, QScrollBar, QVBoxLayout, QToolButton, QMenu
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize
 from PySide6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QPixmap, QAction,
+    QPainter, QPen, QBrush, QColor, QFont, QPixmap, QAction, QPolygon,
     QMouseEvent, QWheelEvent, QPaintEvent, QKeyEvent,
     QDragEnterEvent, QDragMoveEvent, QDragLeaveEvent, QDropEvent,
 )
@@ -843,6 +843,59 @@ class TimelineStrip(QWidget):
                 painter.fillRect(int(draw_x), int(strip_y),
                                  int(draw_w),
                                  int(self.CROP_STRIP_HEIGHT), color)
+                # Keyframe markers — small diamonds at every unique
+                # source-frame position that has at least one keyed
+                # axis. Limited to inside the export window; keys
+                # outside the window are still legal but they don't
+                # affect this strip's render so we skip them visually.
+                if cr.is_animated():
+                    window_lo = anchor_clamped
+                    window_hi = anchor_clamped + req
+                    kf_frames = self._collect_kf_frames(
+                        cr, window_lo, window_hi)
+                    if kf_frames:
+                        self._paint_kf_diamonds(
+                            painter, kf_frames, clip, clip_start_frame,
+                            strip_y)
+
+    @staticmethod
+    def _collect_kf_frames(cr, lo: int, hi: int):
+        """Unique source frames in [lo, hi) that have at least one key
+        across the four axis tracks."""
+        out = set()
+        for track in (cr.x_track, cr.y_track, cr.w_track, cr.h_track):
+            for k in track.keys:
+                if lo <= k.source_frame < hi:
+                    out.add(k.source_frame)
+        return sorted(out)
+
+    def _paint_kf_diamonds(self, painter: QPainter, kf_frames,
+                           clip, clip_start_frame: int, strip_y: int):
+        """Paint a small diamond per unique keyframe source frame.
+        Diamonds sit centered vertically on the strip and clamp
+        horizontally to the visible viewport."""
+        size = max(3, int(self.CROP_STRIP_HEIGHT * 0.9))
+        half = size / 2.0
+        cy = strip_y + self.CROP_STRIP_HEIGHT / 2.0
+        diamond_color = QColor("#ffffff")
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor("#202020"), 1))
+        painter.setBrush(QBrush(diamond_color))
+        viewport_w = self.width()
+        for kf in kf_frames:
+            timeline_frame = clip_start_frame + (kf - clip.source_in)
+            cx = self._frame_to_pixel(timeline_frame) - self._scroll_offset
+            if cx + half < 0 or cx - half > viewport_w:
+                continue
+            poly = QPolygon([
+                QPoint(int(cx),         int(cy - half)),
+                QPoint(int(cx + half),  int(cy)),
+                QPoint(int(cx),         int(cy + half)),
+                QPoint(int(cx - half),  int(cy)),
+            ])
+            painter.drawPolygon(poly)
+        painter.restore()
 
     def _hit_crop_strip(self, x: float, y: float):
         """Return ``(clip_id, crop_id, original_source_anchor,

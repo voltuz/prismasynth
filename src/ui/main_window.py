@@ -34,6 +34,7 @@ from ui.preview_widget import PreviewWidget
 from ui.timeline_widget import TimelineWidget, EditMode
 from ui.toolbar import MainToolbar
 from ui.clip_info_panel import ClipInfoPanel
+from ui.keyframe_editor import KeyframeEditorDock
 from ui.people_panel import PeoplePanel
 from ui.media_panel import MediaPanel
 from ui.source_info_dialog import SourceInfoDialog
@@ -482,6 +483,23 @@ class MainWindow(QMainWindow):
         # selection. selection_changed fires whenever the panel switches
         # to a new clip, so the overlay's clip-context follows.
         self._timeline.selection_changed.connect(self._refresh_crop_overlay)
+        # Keyframe nav & graph editor wiring (panel side).
+        self._clip_info.crop_jump_to_source_frame.connect(
+            self._on_crop_jump_to_source_frame)
+        self._clip_info.crop_edit_curves_requested.connect(
+            self._on_crop_edit_curves_requested)
+
+        # Keyframe editor dock — created hidden+floating so it pops as
+        # a standalone window the first time the user opens it. Kept
+        # around for the session so its size/position persist while
+        # the app is running.
+        self._keyframe_dock = KeyframeEditorDock(self._timeline, self)
+        self._keyframe_dock.setFloating(True)
+        self._keyframe_dock.hide()
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self._keyframe_dock)
+        self._keyframe_dock.playhead_scrub_requested.connect(
+            self._on_keyframe_dock_scrub)
 
         # Media Panel signals
         self._media_panel.source_double_clicked.connect(self._on_source_double_clicked)
@@ -971,6 +989,18 @@ class MainWindow(QMainWindow):
             int(a.text().rstrip("%")): a
             for a in self._scale_action_group.actions()
         }
+
+        view_menu.addSeparator()
+        keyframe_editor_action = QAction("Keyframe Editor", self)
+        keyframe_editor_action.setCheckable(True)
+        keyframe_editor_action.setToolTip(
+            "Show / hide the crop-region keyframe graph editor")
+        keyframe_editor_action.toggled.connect(
+            self._on_keyframe_editor_toggled)
+        # Keep the menu check state in sync when the user closes the dock.
+        self._keyframe_dock.visibilityChanged.connect(
+            keyframe_editor_action.setChecked)
+        view_menu.addAction(keyframe_editor_action)
 
         view_menu.addSeparator()
         from ui import sound_loader
@@ -2313,17 +2343,88 @@ class MainWindow(QMainWindow):
             self._timeline_widget.set_selected_crop_id(new_id)
 
     def _on_crop_geometry_changed(self, crop_id: str, x: int, y: int,
-                                  w: int, h: int):
-        """Overlay drag finished — apply the new geometry through
-        ``TimelineModel.update_crop_region`` so it lands in the undo
-        stack. The overlay has already reverted the live crop to its
-        pre-drag rect, so a single ``update_crop_region`` call snapshots
-        BEFORE and applies AFTER atomically."""
+                                  w: int, h: int, source_frame: int):
+        """Overlay drag finished — write keys at the playhead's source
+        frame (autokey for animated crops) or update the static base
+        (for un-animated crops). ``TimelineModel.set_crop_keyframes_at``
+        handles both cases and pushes a single undo entry."""
         clip_id = self._crop_edit_clip_id
         if not clip_id:
             return
-        self._timeline.update_crop_region(
-            clip_id, crop_id, x=int(x), y=int(y), w=int(w), h=int(h))
+        # Negative source_frame is the overlay's "unknown" sentinel
+        # (no playhead delivered yet). Fall back to the clip-current
+        # playhead so we never write keys at frame -1.
+        if source_frame < 0:
+            clip = self._timeline.get_clip_by_id(clip_id)
+            if clip is not None:
+                source_frame = self._current_playhead_source_frame(clip)
+            else:
+                source_frame = 0
+        self._timeline.set_crop_keyframes_at(
+            clip_id, crop_id, int(source_frame),
+            int(x), int(y), int(w), int(h))
+
+    def _on_crop_jump_to_source_frame(self, clip_id: str, _crop_id: str,
+                                      source_frame: int):
+        """Move the playhead so it lands on ``source_frame`` inside
+        ``clip_id``. The clip-info-panel prev/next keyframe arrows
+        route through here."""
+        clip = self._timeline.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return
+        start_tl = self._timeline.get_clip_timeline_start(clip.id)
+        if start_tl < 0:
+            return
+        offset = max(0, min(clip.duration_frames - 1,
+                            int(source_frame) - clip.source_in))
+        target = start_tl + offset
+        self._timeline_widget.set_playhead(target)
+
+    def _on_keyframe_editor_toggled(self, checked: bool):
+        if checked:
+            if not self._keyframe_dock.isVisible():
+                self._keyframe_dock.show()
+            self._keyframe_dock.raise_()
+        else:
+            self._keyframe_dock.hide()
+
+    def _on_keyframe_dock_scrub(self, source_frame: int):
+        """User dragged the playhead inside the keyframe editor. Map
+        the source frame back to the timeline frame for whichever clip
+        currently hosts the edited crop, then move the playhead. The
+        dock holds its own active-clip reference so this works even
+        when the user opened the editor but hasn't entered Edit-crops
+        mode."""
+        clip_id = self._keyframe_dock.current_clip_id()
+        if not clip_id:
+            return
+        clip = self._timeline.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return
+        start_tl = self._timeline.get_clip_timeline_start(clip.id)
+        if start_tl < 0:
+            return
+        offset = max(0, min(clip.duration_frames - 1,
+                            int(source_frame) - clip.source_in))
+        self._timeline_widget.set_playhead(start_tl + offset)
+
+    def _on_crop_edit_curves_requested(self, clip_id: str, crop_id: str):
+        """Open / refocus the keyframe editor dock and point it at the
+        requested crop."""
+        clip = self._timeline.get_clip_by_id(clip_id)
+        crop_label = ""
+        if clip is not None:
+            for cr in clip.crop_regions:
+                if cr.id == crop_id:
+                    crop_label = cr.label or f"Crop {cr.id[:6]}"
+                    break
+        self._keyframe_dock.show_for_crop(clip_id, crop_id, crop_label)
+        # Sync the dock's playhead marker right away.
+        playhead_tl = self._timeline_widget.strip.playhead_frame
+        result = self._timeline.timeline_frame_to_source_frame(playhead_tl)
+        if result is not None:
+            _c, sf = result
+            self._keyframe_dock.set_playhead(int(sf))
 
     def _on_crop_delete_requested(self, crop_id: str):
         clip_id = self._crop_edit_clip_id
@@ -2360,6 +2461,15 @@ class MainWindow(QMainWindow):
             crops=list(clip.crop_regions),
             group_colors=self._build_crop_group_colors(clip),
         )
+        # Seed the overlay's source-frame so animated geometry samples
+        # correctly on the FIRST paint after a clip switch. Subsequent
+        # frames flow through `_sync_clip_panel_playhead` on every
+        # playhead-changed signal.
+        playhead_tl = self._timeline_widget.strip.playhead_frame
+        result = self._timeline.timeline_frame_to_source_frame(playhead_tl)
+        if result is not None:
+            _c, sf = result
+            self._preview.crop_overlay.set_current_source_frame(int(sf))
 
     def _build_crop_group_colors(self, clip) -> dict:
         """Return ``{crop_id: hex_color}`` for every crop on the clip."""
@@ -2373,13 +2483,23 @@ class MainWindow(QMainWindow):
         return colors
 
     def _sync_clip_panel_playhead(self, timeline_frame: int):
-        """Tell the Clip panel which source frame the playhead is on, so
-        its "From playhead" anchor buttons work without a round-trip."""
+        """Push the playhead's source frame into every UI piece that
+        cares about it: the Clip panel (KF-button visual state and
+        "From playhead" anchor), the crop overlay (animated geometry
+        sampling), and the keyframe-editor dock (playhead marker)."""
         result = self._timeline.timeline_frame_to_source_frame(timeline_frame)
         if result is None:
+            # Gap or beyond timeline — flag as unknown so the overlay
+            # falls back to base values rather than sampling at a
+            # stale source frame. The keyframe editor hides its
+            # playhead marker via the same sentinel.
+            self._preview.crop_overlay.set_current_source_frame(-1)
+            self._keyframe_dock.set_playhead(-1)
             return
         _clip, source_frame = result
         self._clip_info.set_playhead_source_frame(source_frame)
+        self._preview.crop_overlay.set_current_source_frame(source_frame)
+        self._keyframe_dock.set_playhead(source_frame)
 
     def _current_playhead_source_frame(self, clip) -> int:
         """Map the playhead to a source frame inside ``clip``. Clamps to

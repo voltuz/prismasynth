@@ -13,7 +13,9 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
+
+from core.keyframe import KeyframeTrack
 
 
 # --- Fixed output shape (training pipeline requirement) --------------------
@@ -96,8 +98,53 @@ class CropRegion:
     label: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
+    # Per-axis keyframe tracks. Empty track → axis falls back to the
+    # static base value above. Time domain is source frames of the
+    # source video (NOT clip-local, NOT timeline-local), so the keys
+    # stay pinned to the same source content when ``anchor_frame``
+    # moves or the clip's in/out shifts.
+    x_track: KeyframeTrack = field(default_factory=KeyframeTrack)
+    y_track: KeyframeTrack = field(default_factory=KeyframeTrack)
+    w_track: KeyframeTrack = field(default_factory=KeyframeTrack)
+    h_track: KeyframeTrack = field(default_factory=KeyframeTrack)
+
+    # --- Animated geometry sampling --------------------------------
+
+    def track_for(self, axis: str) -> KeyframeTrack:
+        """Map axis name → track. Raises KeyError on unknown axis."""
+        return {"x": self.x_track, "y": self.y_track,
+                "w": self.w_track, "h": self.h_track}[axis]
+
+    def base_value(self, axis: str) -> int:
+        return {"x": self.x, "y": self.y,
+                "w": self.w, "h": self.h}[axis]
+
+    def is_animated(self) -> bool:
+        """True iff any axis track has at least one keyframe."""
+        return bool(self.x_track or self.y_track
+                    or self.w_track or self.h_track)
+
+    def sample(self, source_frame: float) -> Tuple[int, int, int, int]:
+        """Return interpolated (x, y, w, h) at the given source frame.
+
+        Empty tracks fall back to the region's static base value. The
+        result is always int-cast so callers (overlay rendering,
+        exporter expression builder) get pixel-aligned output."""
+        sx = self.x_track.sample(source_frame)
+        sy = self.y_track.sample(source_frame)
+        sw = self.w_track.sample(source_frame)
+        sh = self.h_track.sample(source_frame)
+        return (
+            int(round(self.x if sx is None else sx)),
+            int(round(self.y if sy is None else sy)),
+            int(round(self.w if sw is None else sw)),
+            int(round(self.h if sh is None else sh)),
+        )
+
+    # --- Serialization ---------------------------------------------
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "x": int(self.x),
             "y": int(self.y),
@@ -111,6 +158,17 @@ class CropRegion:
             "active": bool(self.active),
             "label": self.label,
         }
+        # Only persist tracks that actually contain keys so legacy
+        # projects round-trip byte-identical.
+        if self.x_track:
+            d["x_track"] = self.x_track.to_dict()
+        if self.y_track:
+            d["y_track"] = self.y_track.to_dict()
+        if self.w_track:
+            d["w_track"] = self.w_track.to_dict()
+        if self.h_track:
+            d["h_track"] = self.h_track.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "CropRegion":
@@ -127,6 +185,10 @@ class CropRegion:
             group_id=d.get("group_id") or None,
             active=bool(d.get("active", True)),
             label=str(d.get("label", "")),
+            x_track=KeyframeTrack.from_dict(d.get("x_track")),
+            y_track=KeyframeTrack.from_dict(d.get("y_track")),
+            w_track=KeyframeTrack.from_dict(d.get("w_track")),
+            h_track=KeyframeTrack.from_dict(d.get("h_track")),
         )
 
 

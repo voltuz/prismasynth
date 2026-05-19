@@ -500,6 +500,142 @@ class TimelineModel(QObject):
                 return True
         return False
 
+    # --- Crop keyframes ---
+
+    def _find_crop(self, clip_id: str, crop_id: str):
+        """Locate a CropRegion by (clip_id, crop_id) or return None."""
+        clip = self.get_clip_by_id(clip_id)
+        if clip is None or clip.is_gap:
+            return None
+        for cr in clip.crop_regions:
+            if cr.id == crop_id:
+                return cr
+        return None
+
+    @staticmethod
+    def _crop_group_axes(group: str):
+        """Map a UI group label ('position' / 'size') to the axes it
+        owns. Anything else returns an empty tuple."""
+        if group == "position":
+            return ("x", "y")
+        if group == "size":
+            return ("w", "h")
+        return ()
+
+    def toggle_crop_keyframe(self, clip_id: str, crop_id: str,
+                             group: str, source_frame: int) -> Optional[str]:
+        """Add or remove a keyframe for an axis group at ``source_frame``.
+
+        ``group`` is ``"position"`` (toggles x+y together) or ``"size"``
+        (toggles w+h together). When adding, the new key's value is
+        sampled from the current animated geometry at ``source_frame``
+        so the visible rectangle doesn't jump. Returns ``"added"``,
+        ``"removed"``, or ``None`` if the crop wasn't found.
+        """
+        axes = self._crop_group_axes(group)
+        if not axes:
+            return None
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None:
+            return None
+        # Decide the toggle direction from the first axis. Both axes in
+        # the group always reflect the same state because they're
+        # toggled together below.
+        currently_keyed = cr.track_for(axes[0]).has_key_at(int(source_frame))
+        self._push_undo()
+        if currently_keyed:
+            for axis in axes:
+                cr.track_for(axis).remove_key(int(source_frame))
+            self.clips_changed.emit()
+            return "removed"
+        # Adding — sample current geometry so the key matches what the
+        # user sees. ``sample`` falls back to the static base for empty
+        # tracks, which is the correct seed value.
+        x, y, w, h = cr.sample(int(source_frame))
+        vals = {"x": x, "y": y, "w": w, "h": h}
+        for axis in axes:
+            cr.track_for(axis).set_key(
+                int(source_frame), float(vals[axis]))
+        self.clips_changed.emit()
+        return "added"
+
+    def set_crop_keyframes_at(self, clip_id: str, crop_id: str,
+                              source_frame: int,
+                              x: int, y: int, w: int, h: int) -> bool:
+        """Apply geometry from an overlay drag at ``source_frame``.
+
+        For a fully-static region (no keyframes on any axis), updates
+        only the base ``cr.x/y/w/h`` — drags don't silently seed first
+        keyframes. The user has to click the Position or Size keyframe
+        button to opt into animation; once any axis has keys, this
+        method writes keys for each axis that already has any.
+
+        Static axes inside an otherwise-animated region stay static
+        (their values come from the base) so single-axis animations
+        like 'only x moves' are expressible.
+        """
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None:
+            return False
+        self._push_undo()
+        new_vals = {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
+        if cr.is_animated():
+            for axis, val in new_vals.items():
+                track = cr.track_for(axis)
+                if not track:
+                    continue
+                track.set_key(int(source_frame), float(val))
+        # Always refresh the static base — when the region is animated
+        # this is "what the file shows to a legacy reader that ignores
+        # tracks"; when it's static this IS the value.
+        cr.x, cr.y, cr.w, cr.h = (new_vals["x"], new_vals["y"],
+                                  new_vals["w"], new_vals["h"])
+        self.clips_changed.emit()
+        return True
+
+    def move_crop_keyframe(self, clip_id: str, crop_id: str, axis: str,
+                           old_frame: int, new_frame: int,
+                           new_value: float) -> bool:
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None or axis not in ("x", "y", "w", "h"):
+            return False
+        self._push_undo()
+        ok = cr.track_for(axis).move_key(
+            int(old_frame), int(new_frame), float(new_value))
+        if ok:
+            self.clips_changed.emit()
+        return ok
+
+    def delete_crop_keyframe(self, clip_id: str, crop_id: str,
+                             axis: str, source_frame: int) -> bool:
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None or axis not in ("x", "y", "w", "h"):
+            return False
+        self._push_undo()
+        ok = cr.track_for(axis).remove_key(int(source_frame))
+        if ok:
+            self.clips_changed.emit()
+        return ok
+
+    def set_crop_keyframe_interp(self, clip_id: str, crop_id: str,
+                                 axis: str, source_frame: int,
+                                 interp: str,
+                                 in_handle=(0.0, 0.0),
+                                 out_handle=(0.0, 0.0)) -> bool:
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None or axis not in ("x", "y", "w", "h"):
+            return False
+        track = cr.track_for(axis)
+        k = track.find_key(int(source_frame))
+        if k is None:
+            return False
+        self._push_undo()
+        k.interp = interp
+        k.in_handle = (float(in_handle[0]), float(in_handle[1]))
+        k.out_handle = (float(out_handle[0]), float(out_handle[1]))
+        self.clips_changed.emit()
+        return True
+
     def iter_crops(self):
         """Yield ``(clip, crop)`` for every non-gap clip's crops in
         timeline order. Used by the crop exporter and the export dialog

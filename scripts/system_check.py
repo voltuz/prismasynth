@@ -38,10 +38,10 @@ os.environ["PATH"] = str(SRC) + os.pathsep + os.environ.get("PATH", "")
 
 logging.basicConfig(level=logging.WARNING)
 
-SECTIONS = ("env", "compile", "model", "project", "thumb_accuracy",
-            "export_accuracy", "export_timebase", "export_multi_segment",
-            "export_hdr", "export_image_sequence", "export_xml",
-            "export_nvenc")
+SECTIONS = ("env", "compile", "model", "project", "keyframes",
+            "thumb_accuracy", "export_accuracy", "export_timebase",
+            "export_multi_segment", "export_hdr", "export_image_sequence",
+            "export_xml", "export_nvenc")
 
 
 # ----------------------------- output helpers -----------------------------
@@ -357,6 +357,266 @@ def _pixel_diff(a: Path, b: Path):
 
 
 # ---------------------- section: thumb_accuracy ---------------------------
+
+def section_keyframes() -> SectionResult:
+    header("Crop-region keyframe correctness")
+    from core.clip import Clip
+    from core.crop_region import CropRegion
+    from core.keyframe import (
+        INTERP_BEZIER, INTERP_LINEAR, INTERP_STEP, Keyframe, KeyframeTrack,
+    )
+    from core.timeline import TimelineModel
+    from core.crop_exporter import _piecewise_n_expr
+
+    failures = 0
+
+    def check(cond, label):
+        nonlocal failures
+        if cond:
+            ok(label)
+        else:
+            fail(label); failures += 1
+
+    # --- KeyframeTrack basic API ---
+    t = KeyframeTrack()
+    check(t.sample(10) is None,
+          "empty track samples to None (caller falls back to base)")
+    t.set_key(0, 100.0)
+    t.set_key(10, 200.0)
+    check(abs(t.sample(5) - 150.0) < 1e-6,
+          "linear interp at midpoint = 150")
+    check(t.sample(-5) == 100.0 and t.sample(15) == 200.0,
+          "pre/post extrap clamps to nearest key")
+    check(t.prev_key_frame(5) == 0 and t.next_key_frame(5) == 10,
+          "prev/next key lookup")
+    check(t.toggle_key(5, 175.0) == "added" and t.has_key_at(5),
+          "toggle on empty slot adds")
+    check(t.toggle_key(5, 0.0) == "removed" and not t.has_key_at(5),
+          "toggle on existing slot removes")
+    check(t.move_key(0, 7, 110.0) and t.find_key(7).value == 110.0
+          and not t.has_key_at(0),
+          "move_key relocates by frame and value")
+
+    # --- Step / bezier interp ---
+    s = KeyframeTrack()
+    s.set_key(0, 100.0, INTERP_STEP)
+    s.set_key(10, 200.0)
+    check(s.sample(5) == 100.0,
+          "step interp holds value through segment")
+    bz = KeyframeTrack()
+    bz.set_key(0, 0.0, INTERP_BEZIER)
+    bz.set_key(10, 100.0, INTERP_BEZIER)
+    bz.find_key(0).out_handle = (3.0, 80.0)
+    bz.find_key(10).in_handle = (-3.0, -80.0)
+    v_mid = bz.sample(5)
+    check(0.0 <= v_mid <= 100.0,
+          f"bezier sample stays in segment range (got {v_mid:.2f})")
+
+    # --- CropRegion.sample + is_animated ---
+    cr = CropRegion(x=50, y=60, w=200, h=100)
+    check(cr.sample(0) == (50, 60, 200, 100)
+          and not cr.is_animated(),
+          "static CropRegion samples base values")
+    cr.x_track.set_key(0, 10.0)
+    cr.x_track.set_key(10, 30.0)
+    check(cr.is_animated() and cr.sample(5)[0] == 20,
+          "animated x_track drives sample x")
+    check(cr.sample(5)[1] == 60,
+          "non-animated axes still use base in animated region")
+
+    # --- to_dict / from_dict round-trip (with + without tracks) ---
+    plain = CropRegion(x=1, y=2, w=3, h=4)
+    rt = CropRegion.from_dict(plain.to_dict())
+    check(not rt.is_animated() and rt.sample(0) == (1, 2, 3, 4),
+          "legacy CropRegion (no tracks) round-trips byte-clean")
+    keyed = CropRegion(x=0, y=0, w=10, h=10)
+    keyed.x_track.set_key(0, 0.0)
+    keyed.x_track.set_key(20, 50.0, INTERP_BEZIER)
+    keyed.x_track.find_key(20).out_handle = (5.0, 10.0)
+    d = keyed.to_dict()
+    rt2 = CropRegion.from_dict(d)
+    check(rt2.x_track.find_key(20) is not None
+          and rt2.x_track.find_key(20).interp == INTERP_BEZIER
+          and rt2.x_track.find_key(20).out_handle == (5.0, 10.0),
+          "keyframed CropRegion round-trips through JSON dict")
+
+    # --- TimelineModel mutations + undo ---
+    tl = TimelineModel()
+    tl.clear(); tl.clear_undo()
+    clip = Clip(source_id="src", source_in=0, source_out=99)
+    tl.add_clips([clip], assign_colors=False)
+    cr_live = CropRegion(x=0, y=0, w=100, h=100, anchor_frame=0)
+    tl.add_crop_region(clip.id, cr_live)
+
+    res = tl.toggle_crop_keyframe(clip.id, cr_live.id, "position", 5)
+    check(res == "added" and cr_live.x_track.has_key_at(5)
+          and cr_live.y_track.has_key_at(5),
+          "toggle_crop_keyframe(position) adds keys on both x and y")
+    res2 = tl.toggle_crop_keyframe(clip.id, cr_live.id, "position", 5)
+    check(res2 == "removed" and not cr_live.x_track.has_key_at(5),
+          "toggle_crop_keyframe(position) removes existing pair")
+    tl.toggle_crop_keyframe(clip.id, cr_live.id, "size", 10)
+    check(cr_live.w_track.has_key_at(10) and cr_live.h_track.has_key_at(10),
+          "toggle_crop_keyframe(size) keys w and h")
+
+    # set_crop_keyframes_at: static → updates base only; animated → keys.
+    tl.set_crop_keyframes_at(clip.id, cr_live.id, 20, 50, 60, 200, 150)
+    # cr_live still has w/h keys from the size toggle above, so this
+    # writes new w/h keys at 20 too.
+    check(cr_live.w_track.has_key_at(20)
+          and cr_live.h_track.has_key_at(20),
+          "set_crop_keyframes_at writes keys on already-animated axes")
+    check(cr_live.x == 50 and cr_live.y == 60,
+          "set_crop_keyframes_at also refreshes static base values")
+
+    # delete / move / interp setters.
+    moved = tl.move_crop_keyframe(
+        clip.id, cr_live.id, "w", 10, 12, 250.0)
+    check(moved and cr_live.w_track.has_key_at(12)
+          and not cr_live.w_track.has_key_at(10),
+          "move_crop_keyframe relocates a key")
+    deleted = tl.delete_crop_keyframe(clip.id, cr_live.id, "w", 12)
+    check(deleted and not cr_live.w_track.has_key_at(12),
+          "delete_crop_keyframe removes one")
+    cr_live.h_track.set_key(40, 999.0)
+    tl.set_crop_keyframe_interp(
+        clip.id, cr_live.id, "h", 40, INTERP_BEZIER, (-2.0, 0.0), (2.0, 0.0))
+    check(cr_live.h_track.find_key(40).interp == INTERP_BEZIER,
+          "set_crop_keyframe_interp persists interp + handles")
+
+    # Undo: rewinds keyframe ops same as clip edits.
+    pre_count = len(cr_live.w_track.keys)
+    tl.set_crop_keyframes_at(clip.id, cr_live.id, 30, 11, 12, 222, 333)
+    new_w_at_30 = cr_live.w_track.find_key(30)
+    check(new_w_at_30 is not None,
+          "fresh key visible before undo")
+    tl.undo()
+    # After undo the live cr_live reference is stale; ask the model.
+    cr_after = tl.get_clip_by_id(clip.id).crop_regions[0]
+    check(not cr_after.w_track.has_key_at(30)
+          and len(cr_after.w_track.keys) == pre_count,
+          "undo reverses set_crop_keyframes_at")
+    tl.redo()
+    cr_again = tl.get_clip_by_id(clip.id).crop_regions[0]
+    check(cr_again.w_track.has_key_at(30),
+          "redo restores it")
+
+    # --- Fuzz: random keyframe ops never corrupt invariants ---
+    tl.clear(); tl.clear_undo()
+    clip2 = Clip(source_id="src", source_in=0, source_out=199)
+    tl.add_clips([clip2], assign_colors=False)
+    cr2 = CropRegion(x=0, y=0, w=100, h=100, anchor_frame=0)
+    tl.add_crop_region(clip2.id, cr2)
+    rng = random.Random(1337)
+    ops_done = 0
+
+    def _current_cr():
+        # Undo can rewind past the clip / crop creation — return None
+        # to signal "nothing to fuzz on this iteration".
+        clip_now = tl.get_clip_by_id(clip2.id)
+        if clip_now is None or not clip_now.crop_regions:
+            return None
+        return clip_now.crop_regions[0]
+
+    for _ in range(200):
+        op = rng.choice(["toggle_pos", "toggle_sz", "drag", "move",
+                         "delete", "interp", "undo", "redo"])
+        try:
+            cr_now = _current_cr()
+            if cr_now is None and op not in ("undo", "redo"):
+                # Skip the op — only undo/redo can resurrect the crop.
+                continue
+            frame = rng.randint(0, 199)
+            if op == "toggle_pos":
+                tl.toggle_crop_keyframe(clip2.id, cr_now.id, "position", frame)
+            elif op == "toggle_sz":
+                tl.toggle_crop_keyframe(clip2.id, cr_now.id, "size", frame)
+            elif op == "drag":
+                tl.set_crop_keyframes_at(
+                    clip2.id, cr_now.id, frame,
+                    rng.randint(0, 500), rng.randint(0, 500),
+                    rng.randint(10, 200), rng.randint(10, 200))
+            elif op == "move":
+                # Move a random existing key to a random new frame.
+                all_keys = []
+                for ax in ("x", "y", "w", "h"):
+                    for k in cr_now.track_for(ax).keys:
+                        all_keys.append((ax, k.source_frame))
+                if all_keys:
+                    ax, sf = rng.choice(all_keys)
+                    tl.move_crop_keyframe(
+                        clip2.id, cr_now.id, ax, sf, frame,
+                        float(rng.randint(0, 500)))
+            elif op == "delete":
+                all_keys = []
+                for ax in ("x", "y", "w", "h"):
+                    for k in cr_now.track_for(ax).keys:
+                        all_keys.append((ax, k.source_frame))
+                if all_keys:
+                    ax, sf = rng.choice(all_keys)
+                    tl.delete_crop_keyframe(clip2.id, cr_now.id, ax, sf)
+            elif op == "interp":
+                all_keys = []
+                for ax in ("x", "y", "w", "h"):
+                    for k in cr_now.track_for(ax).keys:
+                        all_keys.append((ax, k.source_frame))
+                if all_keys:
+                    ax, sf = rng.choice(all_keys)
+                    interp = rng.choice(
+                        [INTERP_LINEAR, INTERP_BEZIER, INTERP_STEP])
+                    tl.set_crop_keyframe_interp(
+                        clip2.id, cr_now.id, ax, sf, interp)
+            elif op == "undo":
+                tl.undo()
+            elif op == "redo":
+                tl.redo()
+            ops_done += 1
+        except Exception as e:
+            fail(f"keyframe fuzz op {op} raised: {e}")
+            failures += 1
+            break
+        # Invariants: tracks remain sorted, keys are unique per frame,
+        # sample() never crashes. Skip when undo rewound past creation.
+        cr_now = _current_cr()
+        if cr_now is None:
+            continue
+        for ax in ("x", "y", "w", "h"):
+            track = cr_now.track_for(ax)
+            frames = [k.source_frame for k in track.keys]
+            if frames != sorted(frames):
+                fail(f"track {ax} not sorted: {frames}")
+                failures += 1
+                break
+            if len(set(frames)) != len(frames):
+                fail(f"track {ax} has duplicate frames: {frames}")
+                failures += 1
+                break
+            try:
+                _ = track.sample(rng.randint(-50, 250))
+            except Exception as e:
+                fail(f"sample raised: {e}")
+                failures += 1
+                break
+        else:
+            continue
+        break
+    else:
+        ok(f"keyframe fuzz: {ops_done} random ops, invariants held")
+
+    # --- Exporter expression builder ---
+    expr_const = _piecewise_n_expr([42] * 81)
+    check(expr_const == "42",
+          "piecewise expression collapses constant span to bare value")
+    expr_step = _piecewise_n_expr([10, 10, 10, 20, 20])
+    check("if(lte(n,2),10," in expr_step,
+          f"piecewise expression run-length encodes (got {expr_step})")
+    expr_uniq = _piecewise_n_expr([0, 1, 2])
+    check(expr_uniq.count("if(") == 2,
+          "piecewise expression nests one if() per distinct run")
+
+    return SectionResult("keyframes", passed=failures == 0,
+                         failures=failures)
+
 
 def section_thumb_accuracy(videos: List[Path]) -> SectionResult:
     header("Thumbnail frame-accuracy")
@@ -1344,6 +1604,8 @@ def main():
         run_section("model", section_model)
     if "project" not in skip:
         run_section("project", section_project)
+    if "keyframes" not in skip:
+        run_section("keyframes", section_keyframes)
     # XML export uses a fake source, no --video needed.
     if "export_xml" not in skip:
         run_section("export_xml", section_export_xml)

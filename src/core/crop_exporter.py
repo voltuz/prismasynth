@@ -28,7 +28,7 @@ from PySide6.QtCore import QObject, Signal
 
 from core.crop_region import (
     CropRegion, OUTPUT_FPS, OUTPUT_FRAMES, crop_matches_filter,
-    exact_audio_samples_81_at_16,
+    exact_audio_samples_81_at_16, required_source_frames,
 )
 from core.exporter import (
     Exporter, _AUDIO_CODEC_FOR_EXT, _AUDIO_FORMAT_PRESETS,
@@ -70,6 +70,40 @@ def _stem_of(path: str) -> str:
     if not path:
         return "source"
     return os.path.splitext(os.path.basename(path))[0] or "source"
+
+
+def _piecewise_n_expr(values) -> str:
+    """Build an ffmpeg expression that returns ``values[k]`` when the
+    frame counter ``n`` equals ``k``, falling through to the last
+    element for any ``n >= len(values)``.
+
+    Output shape:
+      ``if(eq(n,0),v0,if(eq(n,1),v1,...,if(eq(n,K-1),v_{K-1},v_{K-1})))``
+    Run-length collapses consecutive equal values so a static axis on
+    an otherwise-animated region emits a single integer instead of a
+    full ladder. Returns the bare value when the entire span is one
+    constant.
+    """
+    if not values:
+        return "0"
+    # Collapse runs so static axes don't emit a 100-deep ladder.
+    runs = []  # list of (start_idx, end_idx_inclusive, value)
+    run_start = 0
+    for i in range(1, len(values)):
+        if values[i] != values[run_start]:
+            runs.append((run_start, i - 1, values[run_start]))
+            run_start = i
+    runs.append((run_start, len(values) - 1, values[run_start]))
+    if len(runs) == 1:
+        return str(int(runs[0][2]))
+    # Build nested if(): one branch per run. We use ``lte(n,end)`` so
+    # the value applies from the run's start (covered by the previous
+    # branch's failure) through its end. The final run is the fall-
+    # through default.
+    expr = str(int(runs[-1][2]))
+    for start, end, val in reversed(runs[:-1]):
+        expr = f"if(lte(n,{end}),{int(val)},{expr})"
+    return expr
 
 
 class CropExporter(QObject):
@@ -377,7 +411,8 @@ class CropExporter(QObject):
         cmd += [
             "-an",
             "-vf", self._video_filter(
-                cr, is_hdr=is_hdr, include_setpts=False),
+                cr, is_hdr=is_hdr, include_setpts=False,
+                src_fps=src_fps),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
             "-map_chapters", "-1", "-dn", "-sn",
@@ -391,8 +426,48 @@ class CropExporter(QObject):
 
     # --- Command builders --------------------------------------------
 
+    @staticmethod
+    def _animated_crop_filter(cr: CropRegion, src_fps: float) -> str:
+        """Build a frame-dependent ``crop=`` filter element when any of
+        the region's axis tracks has keyframes. Returns the static
+        positional form when the region is fully un-animated.
+
+        The animated form uses ffmpeg's expression evaluator with the
+        ``n`` variable (frame index into the crop filter, counting
+        source frames after the -ss seek): each axis becomes a 1-deep
+        nested ``if(eq(n,k), vk, ...)`` ladder sampled at every source
+        frame inside the export window. Per-frame values come from
+        ``CropRegion.sample(anchor_frame + k)`` so the expression is a
+        snapshot of the keyframe state at export time — once emitted
+        the chain runs as plain numeric eval, no per-frame Python.
+        """
+        if not cr.is_animated():
+            return f"crop={cr.w}:{cr.h}:{cr.x}:{cr.y}"
+        # Source-frame count to cover the 81-output-frame window. +2
+        # frame slack so fps=16 has lookahead room on the last sample.
+        n_src = required_source_frames(src_fps) + 2
+        anchor = int(cr.anchor_frame)
+        xs, ys, ws, hs = [], [], [], []
+        for k in range(n_src):
+            x, y, w, h = cr.sample(anchor + k)
+            xs.append(int(x))
+            ys.append(int(y))
+            # Width / height must be at least 2 px for the encoder
+            # chroma stride. The overlay already enforces MIN_CROP_SIZE
+            # but interpolation can land below it briefly.
+            ws.append(max(2, int(w)))
+            hs.append(max(2, int(h)))
+        return (
+            "crop="
+            f"w='{_piecewise_n_expr(ws)}'"
+            f":h='{_piecewise_n_expr(hs)}'"
+            f":x='{_piecewise_n_expr(xs)}'"
+            f":y='{_piecewise_n_expr(ys)}'"
+        )
+
     def _video_filter(self, cr: CropRegion, is_hdr: bool = False,
-                      include_setpts: bool = True) -> str:
+                      include_setpts: bool = True,
+                      src_fps: float = 0.0) -> str:
         """Filter chain for the cropped 81-frame@16fps window.
 
         SDR path: ``crop=W:H:X:Y → fps=16 → setpts=PTS-STARTPTS``.
@@ -435,7 +510,7 @@ class CropExporter(QObject):
             parts.append(
                 "setparams=color_primaries=bt709:"
                 "color_trc=bt709:colorspace=bt709")
-        parts.append(f"crop={cr.w}:{cr.h}:{cr.x}:{cr.y}")
+        parts.append(self._animated_crop_filter(cr, src_fps))
         parts.append(f"fps={OUTPUT_FPS}")
         if include_setpts:
             parts.append("setpts=PTS-STARTPTS")
@@ -475,7 +550,7 @@ class CropExporter(QObject):
             cmd += ["-ss", f"{post_ss:.6f}"]
         cmd += [
             "-an",
-            "-vf", self._video_filter(cr, is_hdr=is_hdr),
+            "-vf", self._video_filter(cr, is_hdr=is_hdr, src_fps=src_fps),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
             "-video_track_timescale", "24000000",

@@ -67,7 +67,10 @@ class CropOverlay(QWidget):
     # Crop selection emitted when the user clicks on a rectangle.
     crop_selected = Signal(str)
     # User changed the crop's geometry (x/y/w/h) — owner should persist.
-    crop_geometry_changed = Signal(str, int, int, int, int)
+    # The source-frame argument is the playhead's source frame at the
+    # moment the drag committed; for animated crops the owner writes
+    # a keyframe at that frame, for static crops it updates the base.
+    crop_geometry_changed = Signal(str, int, int, int, int, int)
     # User finished drawing a new rectangle — owner should add it.
     new_crop_drawn = Signal(int, int, int, int)
     # Delete pressed while a crop is selected.
@@ -119,6 +122,10 @@ class CropOverlay(QWidget):
         # Group color lookup by crop id (set by owner so we don't reach
         # into TimelineModel from here).
         self._group_color: dict[str, str] = {}
+        # Current source frame the preview is showing. Used to sample
+        # animated CropRegions per-frame. ``-1`` = unknown (sample()
+        # falls back to base values, same as a region with no keys).
+        self._current_source_frame: int = -1
 
         # Drag state
         self._drag_kind: str = ""        # "draw" | "move" | "resize" | ""
@@ -127,6 +134,11 @@ class CropOverlay(QWidget):
         self._drag_start_widget: QPoint = QPoint()
         # Source-space starting rect (x, y, w, h) for the dragged crop.
         self._drag_start_rect: tuple = (0, 0, 0, 0)
+        # Source-space rect currently rendered for the dragged crop.
+        # ``None`` outside drags. We hold this here (instead of mutating
+        # cr.x/y/w/h directly) so the underlying data model isn't
+        # polluted mid-drag — keyframe writes happen only on release.
+        self._drag_live_rect: Optional[Tuple[int, int, int, int]] = None
         # For draw-new: anchor (corner where the drag started) in source coords.
         self._draw_anchor_src: tuple = (0, 0)
         self._draw_aspect: Optional[Tuple[int, int]] = None  # locked ratio
@@ -236,10 +248,40 @@ class CropOverlay(QWidget):
     def selected_crop_id(self) -> str:
         return self._selected_id
 
+    def set_current_source_frame(self, source_frame: int):
+        """Owner pushes the playhead's source frame here on every frame
+        change. The overlay samples animated CropRegions at this frame
+        for paint and hit-test. Same-frame calls early-out so timer-
+        driven playback doesn't burn paints. ``-1`` means unknown (the
+        overlay falls back to base values, same as a static region)."""
+        sf = int(source_frame)
+        if sf == self._current_source_frame:
+            return
+        self._current_source_frame = sf
+        # Repaint only when there's an animated crop on the clip;
+        # static-only setups don't depend on the source frame.
+        if any(cr.is_animated() for cr in self._crops):
+            self.update()
+
     def request_repaint(self):
         """Owner calls this when zoom/pan changes so the overlay redraws
         without needing to re-push the crop list."""
         self.update()
+
+    # ------------------------------------------------------------------
+    # Per-frame geometry sampling
+    # ------------------------------------------------------------------
+
+    def _view_rect(self, cr: CropRegion) -> Tuple[int, int, int, int]:
+        """Return the source-space (x, y, w, h) for this crop right
+        now. Honours an in-progress drag (the live rect held outside
+        the data model) and otherwise samples the animation tracks at
+        the current source frame."""
+        if (self._drag_kind in ("move", "resize")
+                and cr.id == self._drag_crop_id
+                and self._drag_live_rect is not None):
+            return self._drag_live_rect
+        return cr.sample(self._current_source_frame)
 
     # ------------------------------------------------------------------
     # Coordinate transforms (source ↔ widget)
@@ -330,16 +372,19 @@ class CropOverlay(QWidget):
         # Selection / handles concepts are edit-mode-only.
         selected = (self._find_crop(self._selected_id)
                     if self._edit_mode else None)
-        sel_rect = (self._source_to_widget(
-                        selected.x, selected.y, selected.w, selected.h)
-                    if selected is not None else None)
+        if selected is not None:
+            sx, sy, sw, sh = self._view_rect(selected)
+            sel_rect = self._source_to_widget(sx, sy, sw, sh)
+        else:
+            sel_rect = None
 
         # Crop outlines. View-only mode hides inactive crops; edit mode
         # shows them as dashed so the user can find/re-enable them.
         for cr in self._crops:
             if not cr.active and not self._edit_mode:
                 continue
-            wrect = self._source_to_widget(cr.x, cr.y, cr.w, cr.h)
+            vx, vy, vw, vh = self._view_rect(cr)
+            wrect = self._source_to_widget(vx, vy, vw, vh)
             if wrect is None:
                 continue
             is_selected = self._edit_mode and (cr.id == self._selected_id)
@@ -454,8 +499,8 @@ class CropOverlay(QWidget):
         # Hit-test handles of selected crop first.
         selected = self._find_crop(self._selected_id)
         if selected is not None:
-            sel_rect = self._source_to_widget(
-                selected.x, selected.y, selected.w, selected.h)
+            sx, sy, sw, sh = self._view_rect(selected)
+            sel_rect = self._source_to_widget(sx, sy, sw, sh)
             if sel_rect is not None:
                 handle = self._handle_hit(pt, sel_rect)
                 if handle:
@@ -468,7 +513,8 @@ class CropOverlay(QWidget):
                     return
         # Hit-test any crop body (topmost wins; iterate reversed).
         for cr in reversed(self._crops):
-            wrect = self._source_to_widget(cr.x, cr.y, cr.w, cr.h)
+            vx, vy, vw, vh = self._view_rect(cr)
+            wrect = self._source_to_widget(vx, vy, vw, vh)
             if wrect is not None and wrect.contains(pt):
                 self.crop_selected.emit(cr.id)
                 self._selected_id = cr.id
@@ -518,6 +564,7 @@ class CropOverlay(QWidget):
         self._drag_kind = ""
         self._drag_handle = ""
         self._drag_crop_id = ""
+        self._drag_live_rect = None
         self.unsetCursor()
         event.accept()
 
@@ -563,8 +610,8 @@ class CropOverlay(QWidget):
     def _cursor_for_position(self, pt: QPoint) -> QCursor:
         selected = self._find_crop(self._selected_id)
         if selected is not None:
-            sel_rect = self._source_to_widget(
-                selected.x, selected.y, selected.w, selected.h)
+            sx, sy, sw, sh = self._view_rect(selected)
+            sel_rect = self._source_to_widget(sx, sy, sw, sh)
             if sel_rect is not None:
                 handle = self._handle_hit(pt, sel_rect)
                 if handle:
@@ -572,7 +619,8 @@ class CropOverlay(QWidget):
                 if sel_rect.contains(pt):
                     return QCursor(Qt.CursorShape.SizeAllCursor)
         for cr in self._crops:
-            wrect = self._source_to_widget(cr.x, cr.y, cr.w, cr.h)
+            vx, vy, vw, vh = self._view_rect(cr)
+            wrect = self._source_to_widget(vx, vy, vw, vh)
             if wrect is not None and wrect.contains(pt):
                 return QCursor(Qt.CursorShape.PointingHandCursor)
         vr = self._video_rect_in_widget()
@@ -599,17 +647,25 @@ class CropOverlay(QWidget):
         self._draw_aspect = resolve_aspect(sel) if sel is not None else None
 
     def _begin_move(self, crop: CropRegion, pt: QPoint):
+        # Start rect = currently-displayed geometry. That's the sampled
+        # value when the region is animated, the base when it isn't.
+        # We hold the live rect outside the data model so the crop's
+        # own x/y/w/h aren't mutated mid-drag (writing keys at release
+        # is the only path that touches the model).
         self._drag_kind = "move"
         self._drag_crop_id = crop.id
+        self._drag_handle = ""
         self._drag_start_widget = pt
-        self._drag_start_rect = (crop.x, crop.y, crop.w, crop.h)
+        self._drag_start_rect = self._view_rect(crop)
+        self._drag_live_rect = self._drag_start_rect
 
     def _begin_resize(self, crop: CropRegion, handle: str, pt: QPoint):
         self._drag_kind = "resize"
         self._drag_crop_id = crop.id
         self._drag_handle = handle
         self._drag_start_widget = pt
-        self._drag_start_rect = (crop.x, crop.y, crop.w, crop.h)
+        self._drag_start_rect = self._view_rect(crop)
+        self._drag_live_rect = self._drag_start_rect
 
     def _do_move(self, pt: QPoint):
         crop = self._find_crop(self._drag_crop_id)
@@ -624,10 +680,10 @@ class CropOverlay(QWidget):
         x0, y0, w, h = self._drag_start_rect
         nx = max(0, min(self._source_w - w, x0 + dx))
         ny = max(0, min(self._source_h - h, y0 + dy))
-        if nx == crop.x and ny == crop.y:
+        new_rect = (int(nx), int(ny), int(w), int(h))
+        if new_rect == self._drag_live_rect:
             return
-        crop.x = int(nx)
-        crop.y = int(ny)
+        self._drag_live_rect = new_rect
         self.update()
 
     def _do_resize(self, pt: QPoint):
@@ -700,10 +756,10 @@ class CropOverlay(QWidget):
             nw, nh = x2 - x1, y2 - y1
         if nw < MIN_CROP_SIZE or nh < MIN_CROP_SIZE:
             return
-        crop.x = int(x1)
-        crop.y = int(y1)
-        crop.w = int(nw)
-        crop.h = int(nh)
+        new_rect = (int(x1), int(y1), int(nw), int(nh))
+        if new_rect == self._drag_live_rect:
+            return
+        self._drag_live_rect = new_rect
         self.update()
 
     def _delta_widget_to_source(self, delta: QPoint) -> Optional[Tuple[int, int]]:
@@ -745,21 +801,25 @@ class CropOverlay(QWidget):
 
     def _commit_geometry_change(self):
         crop = self._find_crop(self._drag_crop_id)
-        if crop is None:
+        if crop is None or self._drag_live_rect is None:
             return
-        # Capture the new values, then revert the live crop to its pre-drag
-        # rect. That way the model's undo snapshot inside
-        # ``update_crop_region`` captures the BEFORE state — the receiver
-        # then applies the new values atomically as a single undo entry.
-        nx, ny, nw, nh = crop.x, crop.y, crop.w, crop.h
+        nx, ny, nw, nh = self._drag_live_rect
         sx, sy, sw, sh = self._drag_start_rect
         if (nx, ny, nw, nh) == (sx, sy, sw, sh):
             return
-        crop.x, crop.y, crop.w, crop.h = sx, sy, sw, sh
+        # Owner decides whether to write keys or update the static base
+        # — we pass the playhead-derived source frame through. The
+        # overlay never mutates the model; cr.x/y/w/h still hold the
+        # pre-drag values and ``_view_rect`` was returning the live
+        # rect via ``_drag_live_rect``. Clearing the drag state below
+        # in mouseReleaseEvent flips ``_view_rect`` back to the
+        # sampled value, which by then includes the newly-written key.
         self.crop_geometry_changed.emit(
-            crop.id, int(nx), int(ny), int(nw), int(nh))
+            crop.id, int(nx), int(ny), int(nw), int(nh),
+            int(self._current_source_frame))
 
     def _cancel_drag(self):
         self._drag_kind = ""
         self._drag_crop_id = ""
         self._drag_handle = ""
+        self._drag_live_rect = None

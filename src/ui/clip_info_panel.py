@@ -86,6 +86,10 @@ class _CropRow(QFrame):
     group_changed = Signal(str, object)               # crop_id, group_id or None
     delete_requested = Signal(str)
     selected = Signal(str)
+    # Keyframe controls.
+    keyframe_toggle_requested = Signal(str, str)      # crop_id, group ("position"/"size")
+    jump_to_source_frame = Signal(str, int)           # crop_id, source_frame
+    edit_curves_requested = Signal(str)               # crop_id
 
     def __init__(self, crop: CropRegion, groups: Dict[str, "Group"],
                  parent=None):
@@ -151,7 +155,117 @@ class _CropRow(QFrame):
         self._group_combo.currentIndexChanged.connect(self._on_group_changed)
         layout.addWidget(self._group_combo, 1, 4, 1, 2)
 
+        # Row 2: keyframe controls (prev/diamond/next per group)
+        # + Edit curves button.
+        kf_row = QHBoxLayout()
+        kf_row.setSpacing(s.px(2))
+        kf_row.setContentsMargins(0, 0, 0, 0)
+        (self._pos_prev, self._pos_diamond, self._pos_next) = (
+            self._build_kf_triplet("position", "Position"))
+        kf_row.addWidget(self._pos_prev)
+        kf_row.addWidget(self._pos_diamond)
+        kf_row.addWidget(self._pos_next)
+        kf_row.addSpacing(s.px(6))
+        (self._sz_prev, self._sz_diamond, self._sz_next) = (
+            self._build_kf_triplet("size", "Size"))
+        kf_row.addWidget(self._sz_prev)
+        kf_row.addWidget(self._sz_diamond)
+        kf_row.addWidget(self._sz_next)
+        kf_row.addStretch(1)
+        self._edit_curves_btn = QPushButton("Edit curves…")
+        self._edit_curves_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._edit_curves_btn.clicked.connect(
+            lambda: self.edit_curves_requested.emit(self._crop_id))
+        kf_row.addWidget(self._edit_curves_btn)
+        layout.addLayout(kf_row, 2, 0, 1, 6)
+
+        # KF visual state. Stays as the "empty" state until ClipInfoPanel
+        # pushes a refresh.
+        self._refresh_kf_visuals("empty", "empty",
+                                False, False, False, False)
+
         self.update_from(crop, groups)
+
+    # --- KF helpers --------------------------------------------------
+
+    def _build_kf_triplet(self, group: str, label: str):
+        """Build (prev_arrow, diamond_btn, next_arrow) for a KF group."""
+        s = ui_scale()
+        prev_btn = QToolButton()
+        prev_btn.setText("◀")
+        prev_btn.setFixedSize(s.px(18), s.px(18))
+        prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        prev_btn.setToolTip(f"Previous {label} keyframe")
+        prev_btn.clicked.connect(
+            lambda _=False, g=group: self._on_kf_jump(g, direction=-1))
+
+        diamond_btn = QToolButton()
+        diamond_btn.setText("◆")
+        diamond_btn.setFixedSize(s.px(36), s.px(18))
+        diamond_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        diamond_btn.setToolTip(
+            f"Toggle {label} keyframe at playhead "
+            "(filled = key here, half = key elsewhere, empty = none)")
+        diamond_btn.clicked.connect(
+            lambda _=False, g=group:
+            self.keyframe_toggle_requested.emit(self._crop_id, g))
+
+        next_btn = QToolButton()
+        next_btn.setText("▶")
+        next_btn.setFixedSize(s.px(18), s.px(18))
+        next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        next_btn.setToolTip(f"Next {label} keyframe")
+        next_btn.clicked.connect(
+            lambda _=False, g=group: self._on_kf_jump(g, direction=+1))
+        return (prev_btn, diamond_btn, next_btn)
+
+    def _on_kf_jump(self, group: str, direction: int):
+        # Cached on the row by ClipInfoPanel.refresh_keyframe_states.
+        target = (self._jump_targets.get((group, direction))
+                  if hasattr(self, "_jump_targets") else None)
+        if target is None:
+            return
+        self.jump_to_source_frame.emit(self._crop_id, int(target))
+
+    def refresh_kf_state(self, pos_state: str, sz_state: str,
+                         pos_prev: Optional[int], pos_next: Optional[int],
+                         sz_prev: Optional[int], sz_next: Optional[int]):
+        """Push the live keyframe state of this row's crop. ``*_state`` is
+        one of ``"empty"`` / ``"half"`` / ``"on"``. ``*_prev`` /
+        ``*_next`` are source-frame jump targets or None when no key
+        exists on that side."""
+        self._jump_targets = {
+            ("position", -1): pos_prev,
+            ("position", +1): pos_next,
+            ("size", -1): sz_prev,
+            ("size", +1): sz_next,
+        }
+        self._refresh_kf_visuals(
+            pos_state, sz_state,
+            pos_prev is not None, pos_next is not None,
+            sz_prev is not None, sz_next is not None,
+        )
+
+    @staticmethod
+    def _diamond_style(state: str) -> str:
+        # Color codes: empty=grey, half=warning yellow, on=orange.
+        color = {"empty": "#666666",
+                 "half": "#d1a72c",
+                 "on": "#e8a735"}.get(state, "#666666")
+        return ("QToolButton { background: transparent; color: "
+                f"{color}; border: 1px solid #444; border-radius: 3px;"
+                " font-weight: bold; }"
+                "QToolButton:hover { border-color: #888; }")
+
+    def _refresh_kf_visuals(self, pos_state: str, sz_state: str,
+                            pos_prev: bool, pos_next: bool,
+                            sz_prev: bool, sz_next: bool):
+        self._pos_diamond.setStyleSheet(self._diamond_style(pos_state))
+        self._sz_diamond.setStyleSheet(self._diamond_style(sz_state))
+        self._pos_prev.setEnabled(pos_prev)
+        self._pos_next.setEnabled(pos_next)
+        self._sz_prev.setEnabled(sz_prev)
+        self._sz_next.setEnabled(sz_next)
 
     # ------------------------------------------------------------------
 
@@ -257,6 +371,13 @@ class ClipInfoPanel(QWidget):
     # Crop selection sync: row click in the panel ⇄ click in the preview.
     # Empty string means "deselect".
     crop_selected = Signal(str)
+    # Keyframe nav: user clicked a prev/next arrow. MainWindow converts
+    # the source frame to a timeline frame for the clip currently
+    # holding this crop and moves the playhead.
+    crop_jump_to_source_frame = Signal(str, str, int)  # clip_id, crop_id, source_frame
+    # User clicked "Edit curves…" on a row. MainWindow opens / focuses
+    # the keyframe-editor dock and points it at this crop.
+    crop_edit_curves_requested = Signal(str, str)      # clip_id, crop_id
 
     def __init__(self, timeline: TimelineModel, parent=None):
         super().__init__(parent)
@@ -369,6 +490,7 @@ class ClipInfoPanel(QWidget):
     def set_playhead_source_frame(self, frame: int):
         """MainWindow calls this on every playhead change."""
         self._playhead_source_frame = int(frame)
+        self._refresh_keyframe_states()
 
     def update_clip(self, clip: Optional[Clip],
                     sources: Dict[str, VideoSource]):
@@ -521,13 +643,105 @@ class ClipInfoPanel(QWidget):
             row.group_changed.connect(self._on_row_group_changed)
             row.delete_requested.connect(self._on_row_delete)
             row.selected.connect(self._on_row_selected)
+            row.keyframe_toggle_requested.connect(
+                self._on_row_keyframe_toggle)
+            row.jump_to_source_frame.connect(
+                self._on_row_jump_to_source_frame)
+            row.edit_curves_requested.connect(
+                self._on_row_edit_curves)
             idx = self._rows_layout.count() - 1
             self._rows_layout.insertWidget(idx, row)
             self._crop_rows[cr.id] = row
             if cr.id == self._selected_crop_id:
                 row.set_selected(True)
 
+        self._refresh_keyframe_states()
         self._update_crop_section_enabled()
+
+    # ------------------------------------------------------------------
+    # Keyframe state refresh (playhead-driven)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _combine_group_state(track_a, track_b, frame: int) -> str:
+        """Diamond visual state for an axis pair. 'on' iff BOTH axes
+        have a key at this frame; 'half' if either has any key; else
+        'empty'."""
+        if not track_a and not track_b:
+            return "empty"
+        has_here = (track_a.has_key_at(frame) and track_b.has_key_at(frame))
+        if has_here:
+            return "on"
+        return "half"
+
+    @staticmethod
+    def _group_prev(track_a, track_b, frame: int):
+        a = track_a.prev_key_frame(frame)
+        b = track_b.prev_key_frame(frame)
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return max(a, b)  # closest preceding key
+
+    @staticmethod
+    def _group_next(track_a, track_b, frame: int):
+        a = track_a.next_key_frame(frame)
+        b = track_b.next_key_frame(frame)
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return min(a, b)  # closest following key
+
+    def _refresh_keyframe_states(self):
+        """Recompute every row's KF visual + nav-enable state. Cheap —
+        runs on playhead moves and on clips_changed."""
+        clip = self._current_clip
+        if clip is None or clip.is_gap:
+            return
+        live = self._timeline.get_clip_by_id(clip.id)
+        if live is None:
+            return
+        frame = int(self._playhead_source_frame)
+        for cr in live.crop_regions:
+            row = self._crop_rows.get(cr.id)
+            if row is None:
+                continue
+            pos_state = self._combine_group_state(
+                cr.x_track, cr.y_track, frame)
+            sz_state = self._combine_group_state(
+                cr.w_track, cr.h_track, frame)
+            row.refresh_kf_state(
+                pos_state, sz_state,
+                self._group_prev(cr.x_track, cr.y_track, frame),
+                self._group_next(cr.x_track, cr.y_track, frame),
+                self._group_prev(cr.w_track, cr.h_track, frame),
+                self._group_next(cr.w_track, cr.h_track, frame),
+            )
+
+    # ------------------------------------------------------------------
+    # Row keyframe callbacks
+    # ------------------------------------------------------------------
+
+    def _on_row_keyframe_toggle(self, crop_id: str, group: str):
+        if self._current_clip is None:
+            return
+        self._timeline.toggle_crop_keyframe(
+            self._current_clip.id, crop_id, group,
+            int(self._playhead_source_frame))
+
+    def _on_row_jump_to_source_frame(self, crop_id: str, source_frame: int):
+        if self._current_clip is None:
+            return
+        self.crop_jump_to_source_frame.emit(
+            self._current_clip.id, crop_id, int(source_frame))
+
+    def _on_row_edit_curves(self, crop_id: str):
+        if self._current_clip is None:
+            return
+        self.crop_edit_curves_requested.emit(
+            self._current_clip.id, crop_id)
 
     # ------------------------------------------------------------------
     # Row callbacks → TimelineModel mutations
