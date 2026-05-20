@@ -445,7 +445,7 @@ def section_keyframes() -> SectionResult:
     tl.clear(); tl.clear_undo()
     clip = Clip(source_id="src", source_in=0, source_out=99)
     tl.add_clips([clip], assign_colors=False)
-    cr_live = CropRegion(x=0, y=0, w=100, h=100, anchor_frame=0)
+    cr_live = CropRegion(x=0, y=0, w=100, h=100)
     tl.add_crop_region(clip.id, cr_live)
 
     res = tl.toggle_crop_keyframe(clip.id, cr_live.id, "position", 5)
@@ -484,6 +484,22 @@ def section_keyframes() -> SectionResult:
     check(cr_live.h_track.find_key(40).interp == INTERP_BEZIER,
           "set_crop_keyframe_interp persists interp + handles")
 
+    # Group interp: set interp on both axes of a group at one frame in
+    # a single undo push (used by the clip panel's quick-interp control).
+    tl.toggle_crop_keyframe(clip.id, cr_live.id, "position", 60)
+    undo_before = len(tl._undo_stack)
+    ok_grp = tl.set_crop_keyframe_group_interp(
+        clip.id, cr_live.id, "position", 60, INTERP_STEP)
+    check(ok_grp
+          and cr_live.x_track.find_key(60).interp == INTERP_STEP
+          and cr_live.y_track.find_key(60).interp == INTERP_STEP,
+          "set_crop_keyframe_group_interp sets both group axes")
+    check(len(tl._undo_stack) == undo_before + 1,
+          "set_crop_keyframe_group_interp is a single undo entry")
+    check(tl.set_crop_keyframe_group_interp(
+              clip.id, cr_live.id, "position", 9999, INTERP_LINEAR) is False,
+          "group interp no-ops when no key at frame")
+
     # Undo: rewinds keyframe ops same as clip edits.
     pre_count = len(cr_live.w_track.keys)
     tl.set_crop_keyframes_at(clip.id, cr_live.id, 30, 11, 12, 222, 333)
@@ -505,7 +521,7 @@ def section_keyframes() -> SectionResult:
     tl.clear(); tl.clear_undo()
     clip2 = Clip(source_id="src", source_in=0, source_out=199)
     tl.add_clips([clip2], assign_colors=False)
-    cr2 = CropRegion(x=0, y=0, w=100, h=100, anchor_frame=0)
+    cr2 = CropRegion(x=0, y=0, w=100, h=100)
     tl.add_crop_region(clip2.id, cr2)
     rng = random.Random(1337)
     ops_done = 0
@@ -613,6 +629,106 @@ def section_keyframes() -> SectionResult:
     expr_uniq = _piecewise_n_expr([0, 1, 2])
     check(expr_uniq.count("if(") == 2,
           "piecewise expression nests one if() per distinct run")
+
+    # --- Export segments ---
+    from core.crop_region import Segment
+
+    # Segment round-trip.
+    seg_rt = Segment.from_dict(
+        Segment(anchor_frame=500, active=False).to_dict())
+    check(seg_rt.anchor_frame == 500 and seg_rt.active is False
+          and len(seg_rt.id) > 0,
+          "Segment to_dict/from_dict round-trips")
+
+    # New CropRegion has exactly one default segment.
+    fresh = CropRegion(x=0, y=0, w=10, h=10)
+    check(len(fresh.segments) == 1,
+          "new CropRegion starts with one segment")
+
+    # Legacy anchor_frame migrates to a single segment.
+    legacy = CropRegion.from_dict({"x": 1, "y": 2, "w": 3, "h": 4,
+                                   "anchor_frame": 1234})
+    check(len(legacy.segments) == 1
+          and legacy.segments[0].anchor_frame == 1234,
+          "legacy anchor_frame migrates to one segment")
+
+    # Multi-segment round-trip preserves order + flags.
+    multi = CropRegion(x=0, y=0, w=10, h=10, segments=[
+        Segment(anchor_frame=10), Segment(anchor_frame=200, active=False)])
+    multi_rt = CropRegion.from_dict(multi.to_dict())
+    check(len(multi_rt.segments) == 2
+          and multi_rt.segments[1].anchor_frame == 200
+          and multi_rt.segments[1].active is False,
+          "multi-segment CropRegion round-trips")
+
+    # Model mutations + undo.
+    tl2 = TimelineModel()
+    tl2.clear(); tl2.clear_undo()
+    clip3 = Clip(source_id="src", source_in=0, source_out=999)
+    tl2.add_clips([clip3], assign_colors=False)
+    cr3 = CropRegion(x=0, y=0, w=100, h=100,
+                     segments=[Segment(anchor_frame=0)])
+    tl2.add_crop_region(clip3.id, cr3)
+
+    sid2 = tl2.add_crop_segment(clip3.id, cr3.id, 300)
+    check(sid2 is not None and len(cr3.segments) == 2,
+          "add_crop_segment appends a segment")
+    tl2.undo()
+    cr3_after = tl2.get_clip_by_id(clip3.id).crop_regions[0]
+    check(len(cr3_after.segments) == 1,
+          "undo reverses add_crop_segment")
+    tl2.redo()
+    cr3 = tl2.get_clip_by_id(clip3.id).crop_regions[0]
+    sid_new = cr3.segments[1].id
+    check(tl2.toggle_crop_segment_active(clip3.id, cr3.id, sid_new)
+          and cr3.segments[1].active is False,
+          "toggle_crop_segment_active flips the flag")
+    check(tl2.move_crop_segment(clip3.id, cr3.id, sid_new, 450)
+          and cr3.segments[1].anchor_frame == 450,
+          "move_crop_segment sets the anchor")
+
+    # Can't delete the last segment.
+    first_id = cr3.segments[0].id
+    check(tl2.remove_crop_segment(clip3.id, cr3.id, sid_new) is True
+          and len(cr3.segments) == 1,
+          "remove_crop_segment removes a non-last segment")
+    check(tl2.remove_crop_segment(clip3.id, cr3.id, first_id) is False
+          and len(cr3.segments) == 1,
+          "remove_crop_segment refuses the last segment")
+
+    # Exporter emits one job per ACTIVE segment.
+    try:
+        from core.crop_exporter import CropExporter
+        from core.video_source import VideoSource
+        td_seg = Path(tempfile.mkdtemp(prefix="psynth_seg_"))
+        try:
+            tl3 = TimelineModel()
+            tl3.clear(); tl3.clear_undo()
+            clip4 = Clip(source_id="src", source_in=0, source_out=9999)
+            tl3.add_clips([clip4], assign_colors=False)
+            cr4 = CropRegion(x=0, y=0, w=100, h=100, segments=[
+                Segment(anchor_frame=0),
+                Segment(anchor_frame=300),
+                Segment(anchor_frame=600, active=False),  # muted
+            ])
+            tl3.add_crop_region(clip4.id, cr4)
+            srcs = {"src": VideoSource(
+                id="src", file_path="fake.mov", total_frames=20000,
+                fps=24.0, width=1920, height=1080, codec="h264")}
+            exporter = CropExporter(tl3, srcs)
+            jobs = exporter._build_jobs({
+                "codec": "h264", "quality": 18,
+                "output_mode": "root_subfolders",
+                "root_dir": str(td_seg), "group_filter": None,
+            })
+            check(len(jobs) == 2,
+                  f"_build_jobs emits one job per active segment "
+                  f"(got {len(jobs)}, expected 2)")
+        finally:
+            shutil.rmtree(td_seg, ignore_errors=True)
+    except Exception as e:
+        fail(f"segment _build_jobs check raised: {e}")
+        failures += 1
 
     return SectionResult("keyframes", passed=failures == 0,
                          failures=failures)

@@ -84,6 +84,9 @@ class KeyframeGraph(QWidget):
         self._timeline = timeline
         self._clip_id: Optional[str] = None
         self._crop_id: Optional[str] = None
+        # Source fps of the targeted crop's clip — used to size the
+        # 81-frame@16fps export-segment bands. 0 = unknown (no bands).
+        self._src_fps: float = 0.0
         # Source-frame range visible in the X axis.
         self._x_min: float = 0.0
         self._x_max: float = 100.0
@@ -115,10 +118,13 @@ class KeyframeGraph(QWidget):
 
     # --- Public API -----------------------------------------------------
 
-    def set_target(self, clip_id: Optional[str], crop_id: Optional[str]):
-        """Point the editor at a specific (clip, crop). ``None`` clears."""
+    def set_target(self, clip_id: Optional[str], crop_id: Optional[str],
+                   src_fps: float = 0.0):
+        """Point the editor at a specific (clip, crop). ``None`` clears.
+        ``src_fps`` sizes the export-segment bands."""
         self._clip_id = clip_id
         self._crop_id = crop_id
+        self._src_fps = float(src_fps)
         self._selection.clear()
         self._cancel_drag()
         self._fit_x_axis()
@@ -247,6 +253,7 @@ class KeyframeGraph(QWidget):
             painter.end()
             return
 
+        self._paint_segment_bands(painter, cr)
         self._paint_playhead(painter)
         for axis in _AXES:
             if not self._visible[axis]:
@@ -254,6 +261,27 @@ class KeyframeGraph(QWidget):
             self._paint_track(painter, cr, axis)
         self._paint_axis_labels(painter, cr)
         painter.end()
+
+    def _paint_segment_bands(self, painter: QPainter, cr: CropRegion):
+        """Shade each export segment's source-frame window so the user
+        sees which slices of the animation actually get exported.
+        Read-only. Needs ``_src_fps`` to size the 81-frame@16fps window."""
+        if self._src_fps <= 0:
+            return
+        from core.crop_region import required_source_frames
+        req = required_source_frames(self._src_fps)
+        r = self._plot_rect()
+        for seg in cr.segments:
+            x0 = self._frame_to_px(seg.anchor_frame)
+            x1 = self._frame_to_px(seg.anchor_frame + req)
+            # Clip to the plot rect horizontally.
+            lo = max(r.left(), min(x0, x1))
+            hi = min(r.right(), max(x0, x1))
+            if hi <= lo:
+                continue
+            alpha = 46 if seg.active else 20
+            painter.fillRect(int(lo), r.top(), int(hi - lo), r.height(),
+                             QColor(232, 167, 53, alpha))
 
     def _paint_grid(self, painter: QPainter):
         r = self._plot_rect()
@@ -904,8 +932,8 @@ class KeyframeEditorDock(QDockWidget):
         self.setWidget(container)
 
     def show_for_crop(self, clip_id: str, crop_id: str,
-                      crop_label: str = ""):
-        self._graph.set_target(clip_id, crop_id)
+                      crop_label: str = "", src_fps: float = 0.0):
+        self._graph.set_target(clip_id, crop_id, src_fps)
         title = "Keyframe Editor"
         if crop_label:
             title += f" — {crop_label}"

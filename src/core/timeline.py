@@ -500,6 +500,65 @@ class TimelineModel(QObject):
                 return True
         return False
 
+    # --- Crop export segments ---
+
+    def add_crop_segment(self, clip_id: str, crop_id: str,
+                         anchor_frame: int, active: bool = True
+                         ) -> Optional[str]:
+        """Append an export Segment to a crop. Returns the segment id,
+        or None if the crop wasn't found."""
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None:
+            return None
+        from core.crop_region import Segment
+        seg = Segment(anchor_frame=int(anchor_frame), active=bool(active))
+        self._push_undo()
+        cr.segments = list(cr.segments) + [seg]
+        self.clips_changed.emit()
+        return seg.id
+
+    def remove_crop_segment(self, clip_id: str, crop_id: str,
+                            segment_id: str) -> bool:
+        """Remove a segment. Refuses to remove the last one (a crop
+        always keeps at least one export window)."""
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None or len(cr.segments) <= 1:
+            return False
+        new_list = [s for s in cr.segments if s.id != segment_id]
+        if len(new_list) == len(cr.segments):
+            return False
+        self._push_undo()
+        cr.segments = new_list
+        self.clips_changed.emit()
+        return True
+
+    def toggle_crop_segment_active(self, clip_id: str, crop_id: str,
+                                   segment_id: str) -> bool:
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None:
+            return False
+        seg = cr.find_segment(segment_id)
+        if seg is None:
+            return False
+        self._push_undo()
+        seg.active = not seg.active
+        self.clips_changed.emit()
+        return True
+
+    def move_crop_segment(self, clip_id: str, crop_id: str,
+                          segment_id: str, anchor_frame: int) -> bool:
+        """Set a segment's anchor frame (caller clamps to valid range)."""
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None:
+            return False
+        seg = cr.find_segment(segment_id)
+        if seg is None or seg.anchor_frame == int(anchor_frame):
+            return False
+        self._push_undo()
+        seg.anchor_frame = int(anchor_frame)
+        self.clips_changed.emit()
+        return True
+
     # --- Crop keyframes ---
 
     def _find_crop(self, clip_id: str, crop_id: str):
@@ -633,6 +692,32 @@ class TimelineModel(QObject):
         k.interp = interp
         k.in_handle = (float(in_handle[0]), float(in_handle[1]))
         k.out_handle = (float(out_handle[0]), float(out_handle[1]))
+        self.clips_changed.emit()
+        return True
+
+    def set_crop_keyframe_group_interp(self, clip_id: str, crop_id: str,
+                                       group: str, source_frame: int,
+                                       interp: str) -> bool:
+        """Set ``interp`` on every axis in a group ("position"→x,y /
+        "size"→w,h) that has a key at ``source_frame``, in a single undo
+        push. Used by the clip panel's quick-interp control so changing
+        e.g. a Position keyframe's easing is one undo entry, not two.
+        Handles are left untouched (the graph editor owns those).
+        Returns True if at least one axis key was updated."""
+        axes = self._crop_group_axes(group)
+        if not axes:
+            return False
+        cr = self._find_crop(clip_id, crop_id)
+        if cr is None:
+            return False
+        targets = [cr.track_for(axis).find_key(int(source_frame))
+                   for axis in axes]
+        targets = [k for k in targets if k is not None]
+        if not targets:
+            return False
+        self._push_undo()
+        for k in targets:
+            k.interp = interp
         self.clips_changed.emit()
         return True
 

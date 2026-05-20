@@ -71,6 +71,38 @@ def resolve_aspect(cr: "CropRegion") -> Optional[tuple]:
     return ASPECT_PRESETS.get(cr.aspect_ratio)
 
 
+# --- Export segment ------------------------------------------------------
+
+@dataclass
+class Segment:
+    """One 81-frame@16fps export window of a crop region.
+
+    A crop region's keyframe animation is shared across all its
+    segments; each segment just picks which source-frame slice
+    (``[anchor_frame, anchor_frame + required_source_frames)``) gets
+    exported. ``active=False`` segments render dimmed and are skipped on
+    export."""
+
+    anchor_frame: int = 0
+    active: bool = True
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "anchor_frame": int(self.anchor_frame),
+            "active": bool(self.active),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Segment":
+        return cls(
+            id=d.get("id") or uuid.uuid4().hex[:12],
+            anchor_frame=int(d.get("anchor_frame", 0)),
+            active=bool(d.get("active", True)),
+        )
+
+
 # --- Data class ----------------------------------------------------------
 
 @dataclass
@@ -80,9 +112,6 @@ class CropRegion:
     y: int = 0
     w: int = 0
     h: int = 0
-
-    # First source frame of the 81-output-frame window.
-    anchor_frame: int = 0
 
     # See ASPECT_PRESETS. "custom" uses custom_ratio_w/h.
     aspect_ratio: str = "free"
@@ -97,6 +126,11 @@ class CropRegion:
 
     label: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+
+    # Export windows. A crop always has at least one. Each segment is an
+    # 81-frame@16fps window anchored at a source frame; the crop's
+    # animation tracks are shared across all of them.
+    segments: list = field(default_factory=lambda: [Segment()])
 
     # Per-axis keyframe tracks. Empty track → axis falls back to the
     # static base value above. Time domain is source frames of the
@@ -118,6 +152,12 @@ class CropRegion:
     def base_value(self, axis: str) -> int:
         return {"x": self.x, "y": self.y,
                 "w": self.w, "h": self.h}[axis]
+
+    def find_segment(self, segment_id: str) -> Optional["Segment"]:
+        for s in self.segments:
+            if s.id == segment_id:
+                return s
+        return None
 
     def is_animated(self) -> bool:
         """True iff any axis track has at least one keyframe."""
@@ -150,7 +190,7 @@ class CropRegion:
             "y": int(self.y),
             "w": int(self.w),
             "h": int(self.h),
-            "anchor_frame": int(self.anchor_frame),
+            "segments": [s.to_dict() for s in self.segments],
             "aspect_ratio": self.aspect_ratio,
             "custom_ratio_w": int(self.custom_ratio_w),
             "custom_ratio_h": int(self.custom_ratio_h),
@@ -172,13 +212,25 @@ class CropRegion:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CropRegion":
+        # Segments: prefer the new list; migrate legacy single
+        # ``anchor_frame``; fall back to one default segment. Always
+        # guarantee at least one segment.
+        raw_segments = d.get("segments")
+        if raw_segments:
+            segments = [Segment.from_dict(s) for s in raw_segments]
+        elif "anchor_frame" in d:
+            segments = [Segment(anchor_frame=int(d.get("anchor_frame", 0)))]
+        else:
+            segments = [Segment()]
+        if not segments:
+            segments = [Segment()]
         return cls(
             id=d.get("id") or uuid.uuid4().hex[:12],
             x=int(d.get("x", 0)),
             y=int(d.get("y", 0)),
             w=int(d.get("w", 0)),
             h=int(d.get("h", 0)),
-            anchor_frame=int(d.get("anchor_frame", 0)),
+            segments=segments,
             aspect_ratio=str(d.get("aspect_ratio", "free")),
             custom_ratio_w=int(d.get("custom_ratio_w", 0)),
             custom_ratio_h=int(d.get("custom_ratio_h", 0)),

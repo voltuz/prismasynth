@@ -488,6 +488,9 @@ class MainWindow(QMainWindow):
             self._on_crop_jump_to_source_frame)
         self._clip_info.crop_edit_curves_requested.connect(
             self._on_crop_edit_curves_requested)
+        # Segment selection from the panel → mirror the halo on timeline.
+        self._clip_info.crop_segment_selected.connect(
+            self._on_crop_segment_selected_in_panel)
 
         # Keyframe editor dock — created hidden+floating so it pops as
         # a standalone window the first time the user opens it. Kept
@@ -2304,15 +2307,20 @@ class MainWindow(QMainWindow):
         self._clip_info.set_selected_crop(crop_id)
         self._timeline_widget.set_selected_crop_id(crop_id)
 
-    def _on_crop_selected_in_timeline(self, clip_id: str, crop_id: str):
-        """User clicked a crop strip on the timeline. Select the parent
-        clip if it isn't already, then route the crop selection to the
-        panel + preview overlay."""
+    def _on_crop_selected_in_timeline(self, clip_id: str, crop_id: str,
+                                      segment_id: str):
+        """User clicked a crop segment block on the timeline. Select the
+        parent clip if needed, route the crop selection to the panel +
+        preview overlay, and mark the clicked segment as the drag/clone
+        target across panel + timeline."""
         if clip_id not in self._timeline.selected_ids:
             self._timeline.set_selection([clip_id])
         self._clip_info.set_selected_crop(crop_id)
         self._preview.set_selected_crop(crop_id)
         self._timeline_widget.set_selected_crop_id(crop_id)
+        # Segment selection (timeline halo already set on press; sync panel).
+        self._timeline_widget.set_selected_segment_id(segment_id)
+        self._clip_info.set_selected_segment(segment_id)
 
     def _on_new_crop_drawn(self, x: int, y: int, w: int, h: int):
         """Overlay finished a draw-new drag → add a CropRegion to the
@@ -2327,13 +2335,15 @@ class MainWindow(QMainWindow):
         source = self._sources.get(clip.source_id)
         if source is None or source.fps <= 0:
             return
-        from core.crop_region import CropRegion, can_host_crop, clamp_anchor
+        from core.crop_region import (
+            CropRegion, Segment, can_host_crop, clamp_anchor)
         if not can_host_crop(clip, source.fps):
             return
         anchor = clamp_anchor(
             self._current_playhead_source_frame(clip), clip, source.fps)
         cr = CropRegion(x=int(x), y=int(y), w=int(w), h=int(h),
-                        anchor_frame=anchor, aspect_ratio="free")
+                        segments=[Segment(anchor_frame=anchor)],
+                        aspect_ratio="free")
         new_id = self._timeline.add_crop_region(clip_id, cr)
         if new_id:
             # Sync selection so the freshly-drawn rect shows its handles
@@ -2408,17 +2418,30 @@ class MainWindow(QMainWindow):
                             int(source_frame) - clip.source_in))
         self._timeline_widget.set_playhead(start_tl + offset)
 
+    def _on_crop_segment_selected_in_panel(self, clip_id: str,
+                                           crop_id: str, segment_id: str):
+        """Panel changed the export-segment selection → mirror only the
+        segment halo on the timeline. The crop halo is owned by the
+        separate ``crop_selected`` signal, so this never fights it.
+        Empty ``segment_id`` clears the halo."""
+        self._timeline_widget.set_selected_segment_id(segment_id)
+
     def _on_crop_edit_curves_requested(self, clip_id: str, crop_id: str):
         """Open / refocus the keyframe editor dock and point it at the
         requested crop."""
         clip = self._timeline.get_clip_by_id(clip_id)
         crop_label = ""
+        src_fps = 0.0
         if clip is not None:
+            source = self._sources.get(clip.source_id)
+            if source is not None:
+                src_fps = source.fps
             for cr in clip.crop_regions:
                 if cr.id == crop_id:
                     crop_label = cr.label or f"Crop {cr.id[:6]}"
                     break
-        self._keyframe_dock.show_for_crop(clip_id, crop_id, crop_label)
+        self._keyframe_dock.show_for_crop(
+            clip_id, crop_id, crop_label, src_fps)
         # Sync the dock's playhead marker right away.
         playhead_tl = self._timeline_widget.strip.playhead_frame
         result = self._timeline.timeline_frame_to_source_frame(playhead_tl)

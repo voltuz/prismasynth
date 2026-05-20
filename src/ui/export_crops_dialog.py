@@ -401,18 +401,21 @@ class ExportCropsDialog(QDialog):
     def _refresh_summary(self):
         flt = self._group_filter.current_filter()
         from core.crop_region import crop_matches_filter
+        # One output file per ACTIVE segment of each exportable crop.
         count = 0
         for _clip, cr in self._timeline.iter_crops():
             if not cr.active:
                 continue
-            if crop_matches_filter(cr, flt):
-                count += 1
+            if not crop_matches_filter(cr, flt):
+                continue
+            count += sum(1 for seg in cr.segments if seg.active)
         if count == 0:
             self._summary_label.setText(
-                "No crops match the current filter. Add crops in the Clip panel.")
+                "No segments match the current filter. Add crops / segments "
+                "in the Clip panel.")
         else:
             self._summary_label.setText(
-                f"Will export {count} crop"
+                f"Will export {count} segment"
                 f"{'s' if count != 1 else ''} — "
                 f"each is 81 frames @ 16 fps "
                 f"(native crop pixels, with audio).")

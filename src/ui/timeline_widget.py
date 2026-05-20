@@ -93,7 +93,7 @@ class TimelineStrip(QWidget):
     cut_requested = Signal(int)    # cut-mode click at timeline frame
     sources_dropped = Signal(list, int)   # source_ids (list[str]), insert frame
     files_dropped = Signal(list, int)     # file paths (list[str]), insert frame
-    crop_clicked = Signal(str, str)       # clip_id, crop_id (strip hit)
+    crop_clicked = Signal(str, str, str)  # clip_id, crop_id, segment_id (block hit)
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -138,12 +138,21 @@ class TimelineStrip(QWidget):
         # consumed by mouseMove/mouseRelease. Tuple: (clip_id, crop_id,
         # original_source_anchor, clip_timeline_start, required_src_frames).
         self._dragging_crop_strip: Optional[tuple] = None
+        # True while the active strip drag is an Alt-clone (a temp segment
+        # was appended to drag; committed as an add on release).
+        self._crop_strip_clone: bool = False
+        # True when the press landed on the already-selected segment — a
+        # pure click (no drag) then deselects it on release.
+        self._crop_strip_was_selected: bool = False
         # Track press-x so we can distinguish "click only" from "drag" and
         # apply a small dead-zone before mutating the anchor.
         self._crop_strip_press_x: float = 0.0
         # Selected crop id mirrored from main_window via set_selected_crop_id;
         # used purely for the white selection halo on the matching strip.
         self._selected_crop_id: str = ""
+        # Selected segment id — drives the white halo on the matching block
+        # and marks the drag/clone/delete target.
+        self._selected_segment_id: str = ""
 
         # Materialise scaled chrome metrics BEFORE any size-dependent calls
         # below — setMinimumHeight reads self.HEADER_HEIGHT etc.
@@ -214,6 +223,14 @@ class TimelineStrip(QWidget):
         if new == self._selected_crop_id:
             return
         self._selected_crop_id = new
+        self.update()
+
+    def set_selected_segment_id(self, segment_id: str):
+        """External segment-selection sync (panel ⇄ timeline)."""
+        new = segment_id or ""
+        if new == self._selected_segment_id:
+            return
+        self._selected_segment_id = new
         self.update()
 
     @property
@@ -783,12 +800,13 @@ class TimelineStrip(QWidget):
 
     def _paint_crop_strips(self, painter: QPainter, clip_y: int,
                            viewport_width: int):
-        """Paint one strip per crop on every clip that has crops, in a
-        band below the group-chip strip. Strip width = the 81-frame
-        export window's source-frame width at the current zoom; strip
-        left edge = window start. Color = the crop's group color (grey
-        if untagged); orange if the clip is too short to host the
-        window. Selected crop gets a 1-px white halo."""
+        """Paint each crop's export segments as blocks on the crop's
+        single row, in a band below the group-chip strip. Each block's
+        width = the 81-frame export window's source-frame width at the
+        current zoom; left edge = the segment's anchor. Color = the
+        crop's group color (grey if untagged); orange if the clip is too
+        short to host the window; dimmed when the crop or segment is
+        inactive. The selected segment gets a 1-px white halo."""
         groups = self._model.groups
         crop_band_y = (clip_y + self._clip_height
                        + self.GROUP_STRIP_RESERVE)
@@ -808,55 +826,134 @@ class TimelineStrip(QWidget):
             too_short = req > clip_src_frames
             for i, cr in enumerate(clip.crop_regions):
                 strip_y = crop_band_y + i * row_h
-                # Use clamp_anchor so an out-of-range anchor (e.g. after a
-                # destructive split) pins to the clip's rightmost legal
-                # frame and the strip never overflows the clip's body.
-                anchor_clamped = clamp_anchor(cr.anchor_frame, clip, source.fps)
-                anchor_tl = clip_start_frame + (anchor_clamped - clip.source_in)
-                end_tl = anchor_tl + req
-                anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
-                end_px = self._frame_to_pixel(end_tl) - self._scroll_offset
-                width = max(MIN_CROP_STRIP_PX, end_px - anchor_px)
-                # Off-screen culling.
-                if anchor_px + width < 0 or anchor_px > viewport_width:
-                    continue
+                # Base color for the crop (group color / grey / orange).
                 if too_short:
-                    color = QColor(CROP_WARNING_COLOR)
+                    base_color = QColor(CROP_WARNING_COLOR)
                 elif cr.group_id and cr.group_id in groups:
-                    color = QColor(groups[cr.group_id].color)
-                    if not color.isValid():
-                        color = QColor("#888888")
+                    base_color = QColor(groups[cr.group_id].color)
+                    if not base_color.isValid():
+                        base_color = QColor("#888888")
                 else:
-                    color = QColor("#888888")
-                alpha = 255 if cr.active else 76
-                color.setAlpha(alpha)
-                # Clip to viewport.
-                draw_x = max(0, anchor_px)
-                draw_w = min(viewport_width, anchor_px + width) - draw_x
-                if draw_w <= 0:
+                    base_color = QColor("#888888")
+                # Each segment of the crop is a block on this one row.
+                # Collect unclipped pixel spans for every segment so the
+                # overlap hatch can be computed (off-screen ones included).
+                seg_spans = []
+                # Pixel edges of the selected segment — the overlap painter
+                # skips its own boundary line there since the selection halo
+                # already draws a white border (avoids a doubled-up edge).
+                sel_edges = None
+                for seg in cr.segments:
+                    # clamp_anchor pins an out-of-range anchor to the
+                    # clip's rightmost legal frame so the block never
+                    # overflows the clip body.
+                    anchor_clamped = clamp_anchor(
+                        seg.anchor_frame, clip, source.fps)
+                    anchor_tl = (clip_start_frame
+                                 + (anchor_clamped - clip.source_in))
+                    end_tl = anchor_tl + req
+                    anchor_px = (self._frame_to_pixel(anchor_tl)
+                                 - self._scroll_offset)
+                    end_px = (self._frame_to_pixel(end_tl)
+                              - self._scroll_offset)
+                    width = max(MIN_CROP_STRIP_PX, end_px - anchor_px)
+                    seg_spans.append((anchor_px, anchor_px + width))
+                    if seg.id == self._selected_segment_id:
+                        sel_edges = (anchor_px, anchor_px + width)
+                    # Off-screen culling (block paint only — span already
+                    # recorded for overlap detection).
+                    if anchor_px + width < 0 or anchor_px > viewport_width:
+                        continue
+                    color = QColor(base_color)
+                    # A segment dims if its crop OR the segment itself is
+                    # inactive (either excludes it from export).
+                    color.setAlpha(255 if (cr.active and seg.active) else 76)
+                    draw_x = max(0, anchor_px)
+                    draw_w = min(viewport_width, anchor_px + width) - draw_x
+                    if draw_w <= 0:
+                        continue
+                    if seg.id == self._selected_segment_id:
+                        halo = QColor(255, 255, 255, 220)
+                        painter.fillRect(int(draw_x) - 1, int(strip_y) - 1,
+                                         int(draw_w) + 2,
+                                         int(self.CROP_STRIP_HEIGHT) + 2, halo)
+                    painter.fillRect(int(draw_x), int(strip_y),
+                                     int(draw_w),
+                                     int(self.CROP_STRIP_HEIGHT), color)
+                    # Keyframe diamonds for keys inside THIS segment's
+                    # window (animation is shared crop-wide; each block
+                    # shows the slice it will export).
+                    if cr.is_animated():
+                        kf_frames = self._collect_kf_frames(
+                            cr, anchor_clamped, anchor_clamped + req)
+                        if kf_frames:
+                            self._paint_kf_diamonds(
+                                painter, kf_frames, clip, clip_start_frame,
+                                strip_y)
+                # Hatch the spans where two+ of this crop's segments overlap.
+                self._paint_segment_overlaps(
+                    painter, seg_spans, strip_y, viewport_width, sel_edges)
+
+    def _paint_segment_overlaps(self, painter: QPainter, spans,
+                                strip_y: int, viewport_width: int,
+                                selected_edges=None):
+        """Hatch the pixel spans where two or more of a crop's segments
+        overlap, so a shared export window reads as striped rather than
+        one block silently sitting on top of another. Each overlap's
+        edges (where one segment ends) get a light vertical line so the
+        user can tell where the shared region stops and the part that
+        doesn't belong to the selected segment begins.
+
+        ``selected_edges`` is the (left, right) pixel pair of the selected
+        segment, if any. The selection halo already paints a white border
+        there, so we skip our own line at those x's — otherwise halo +
+        line stack into a doubled-width edge."""
+        if len(spans) < 2:
+            return
+        hatch = QBrush(QColor(255, 255, 255, 150),
+                       Qt.BrushStyle.FDiagPattern)
+        # Edge lines are drawn as 1px filled columns (NOT a QPen stroke) at
+        # the same alpha as the selection halo, so a boundary marked by the
+        # halo and one marked here render pixel-identically (a width-1 pen
+        # stroke rasterises softer/thinner than a fillRect column).
+        edge_color = QColor(255, 255, 255, 220)
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        h = int(self.CROP_STRIP_HEIGHT)
+        y0 = int(strip_y)
+        # Edge columns span the selected-segment halo's extent (1px above /
+        # below the strip) so both boundaries read the same height whether
+        # or not one of them sits on the selected (haloed) segment's edge.
+        line_y0 = y0 - 1
+        line_h = h + 2
+
+        def _is_selected_edge(edge: float) -> bool:
+            if selected_edges is None:
+                return False
+            return any(abs(edge - e) < 0.5 for e in selected_edges)
+
+        n = len(spans)
+        for i in range(n):
+            for j in range(i + 1, n):
+                lo = max(spans[i][0], spans[j][0])
+                hi = min(spans[i][1], spans[j][1])
+                if hi <= lo:
                     continue
-                if cr.id == self._selected_crop_id:
-                    halo = QColor(255, 255, 255, 220)
-                    painter.fillRect(int(draw_x) - 1, int(strip_y) - 1,
-                                     int(draw_w) + 2,
-                                     int(self.CROP_STRIP_HEIGHT) + 2, halo)
-                painter.fillRect(int(draw_x), int(strip_y),
-                                 int(draw_w),
-                                 int(self.CROP_STRIP_HEIGHT), color)
-                # Keyframe markers — small diamonds at every unique
-                # source-frame position that has at least one keyed
-                # axis. Limited to inside the export window; keys
-                # outside the window are still legal but they don't
-                # affect this strip's render so we skip them visually.
-                if cr.is_animated():
-                    window_lo = anchor_clamped
-                    window_hi = anchor_clamped + req
-                    kf_frames = self._collect_kf_frames(
-                        cr, window_lo, window_hi)
-                    if kf_frames:
-                        self._paint_kf_diamonds(
-                            painter, kf_frames, clip, clip_start_frame,
-                            strip_y)
+                dx = max(0.0, lo)
+                dw = min(viewport_width, hi) - dx
+                if dw <= 0:
+                    continue
+                painter.fillRect(int(dx), y0, int(dw), h, hatch)
+                # 1px filled column at each overlap boundary (= a segment
+                # edge). Skip edges already drawn by the selection halo,
+                # and only draw on-screen.
+                for edge in (lo, hi):
+                    if _is_selected_edge(edge):
+                        continue
+                    if 0 <= edge <= viewport_width:
+                        painter.fillRect(int(edge), line_y0, 1, line_h,
+                                         edge_color)
+        painter.restore()
 
     @staticmethod
     def _collect_kf_frames(cr, lo: int, hi: int):
@@ -898,10 +995,10 @@ class TimelineStrip(QWidget):
         painter.restore()
 
     def _hit_crop_strip(self, x: float, y: float):
-        """Return ``(clip_id, crop_id, original_source_anchor,
+        """Return ``(clip_id, crop_id, segment_id, original_source_anchor,
         clip_timeline_start, req_src_frames)`` if the point hits a crop
-        strip, else None. Iterates clips and per-clip crops in reverse
-        so the topmost overlapping strip wins."""
+        segment block, else None. Iterates clips / crops / segments in
+        reverse so the topmost overlapping block wins."""
         clip_y = self.HEADER_HEIGHT + ui_scale().px(2)
         crop_band_y = clip_y + self._clip_height + self.GROUP_STRIP_RESERVE
         band_h = self._crop_band_height()
@@ -924,18 +1021,24 @@ class TimelineStrip(QWidget):
             req = required_source_frames(source.fps)
             for i in range(len(clip.crop_regions) - 1, -1, -1):
                 cr = clip.crop_regions[i]
-                anchor_clamped = clamp_anchor(cr.anchor_frame, clip, source.fps)
-                anchor_tl = clip_start_frame + (anchor_clamped - clip.source_in)
-                end_tl = anchor_tl + req
-                anchor_px = self._frame_to_pixel(anchor_tl) - self._scroll_offset
-                end_px = self._frame_to_pixel(end_tl) - self._scroll_offset
-                width = max(MIN_CROP_STRIP_PX, end_px - anchor_px)
                 strip_y = crop_band_y + i * row_h
-                if (anchor_px <= x < anchor_px + width
-                        and strip_y <= y < strip_y + self.CROP_STRIP_HEIGHT):
-                    # Reverse iteration means first hit is the topmost.
-                    return (clip.id, cr.id, cr.anchor_frame,
-                            clip_start_frame, req)
+                if not (strip_y <= y < strip_y + self.CROP_STRIP_HEIGHT):
+                    continue
+                # Reverse so a later (top-painted) segment wins on overlap.
+                for seg in reversed(cr.segments):
+                    anchor_clamped = clamp_anchor(
+                        seg.anchor_frame, clip, source.fps)
+                    anchor_tl = (clip_start_frame
+                                 + (anchor_clamped - clip.source_in))
+                    end_tl = anchor_tl + req
+                    anchor_px = (self._frame_to_pixel(anchor_tl)
+                                 - self._scroll_offset)
+                    end_px = (self._frame_to_pixel(end_tl)
+                              - self._scroll_offset)
+                    width = max(MIN_CROP_STRIP_PX, end_px - anchor_px)
+                    if anchor_px <= x < anchor_px + width:
+                        return (clip.id, cr.id, seg.id, seg.anchor_frame,
+                                clip_start_frame, req)
         return None
 
     def _paint_playhead(self, painter: QPainter, clip_y: int, total_height: int):
@@ -989,11 +1092,42 @@ class TimelineStrip(QWidget):
             # still routes selection to the panel + preview overlay.
             strip_hit = self._hit_crop_strip(x, y)
             if strip_hit is not None:
-                self._dragging_crop_strip = strip_hit
+                clip_id, crop_id, seg_id, orig, start_tl, req = strip_hit
+                alt = bool(event.modifiers()
+                           & Qt.KeyboardModifier.AltModifier)
+                self._crop_strip_clone = False
+                if alt:
+                    # Alt-drag clones: append a temp segment to drag now,
+                    # commit it as an add (one undo) on release.
+                    clip = self._model.get_clip_by_id(clip_id)
+                    cr = (self._model._find_crop(clip_id, crop_id)
+                          if clip is not None else None)
+                    src_seg = cr.find_segment(seg_id) if cr is not None else None
+                    if cr is not None and src_seg is not None:
+                        from core.crop_region import Segment
+                        clone = Segment(anchor_frame=src_seg.anchor_frame,
+                                        active=src_seg.active)
+                        cr.segments = list(cr.segments) + [clone]
+                        seg_id = clone.id
+                        orig = clone.anchor_frame
+                        self._crop_strip_clone = True
+                # Was this block already the selected segment? If so, a
+                # pure click (no drag) deselects it on release; a drag
+                # still moves it. Clones are always freshly selected.
+                self._crop_strip_was_selected = (
+                    (not self._crop_strip_clone)
+                    and seg_id == self._selected_segment_id)
+                self._selected_segment_id = seg_id
+                self._dragging_crop_strip = (
+                    clip_id, crop_id, seg_id, orig, start_tl, req)
                 self._crop_strip_press_x = float(x)
-                clip_id, crop_id, _orig, _start_tl, _req = strip_hit
-                self.crop_clicked.emit(clip_id, crop_id)
+                # Select on press for immediate feedback, except when
+                # re-pressing the already-selected block (defer to release
+                # so a drag isn't pre-empted by a deselect).
+                if not self._crop_strip_was_selected:
+                    self.crop_clicked.emit(clip_id, crop_id, seg_id)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
+                self.update()
                 return
 
             # Check if dragging the track bottom edge to resize
@@ -1128,19 +1262,16 @@ class TimelineStrip(QWidget):
             return
         if abs(x - self._crop_strip_press_x) < 3.0:
             return
-        clip_id, crop_id, original_anchor, clip_start_tl, req = info
+        clip_id, crop_id, segment_id, original_anchor, clip_start_tl, req = info
         clip = self._model.get_clip_by_id(clip_id)
         if clip is None or clip.is_gap:
             return
-        target = None
-        for cr in clip.crop_regions:
-            if cr.id == crop_id:
-                target = cr
-                break
-        if target is None:
+        cr = self._model._find_crop(clip_id, crop_id)
+        seg = cr.find_segment(segment_id) if cr is not None else None
+        if seg is None:
             return
         # Mouse delta in pixels → source-frame delta, applied to the
-        # PRE-DRAG anchor so the strip translates by exactly the drag
+        # PRE-DRAG anchor so the block translates by exactly the drag
         # distance regardless of subpixel rounding history.
         dx_px = x - self._crop_strip_press_x
         if self._pixels_per_frame <= 0:
@@ -1151,36 +1282,58 @@ class TimelineStrip(QWidget):
         lo = clip.source_in
         hi = max(lo, clip.source_out - req + 1)
         source_anchor = max(lo, min(hi, source_anchor))
-        if source_anchor != target.anchor_frame:
-            target.anchor_frame = source_anchor
+        if source_anchor != seg.anchor_frame:
+            seg.anchor_frame = source_anchor
             self.update()
 
     def _finish_crop_strip_drag(self):
-        """Restore the pre-drag anchor on the live object and commit the
-        final value through ``update_crop_region`` so one drag = one undo."""
+        """Commit the drag as one undo entry. Normal drag → move the
+        segment's anchor; Alt-clone → drop the temp clone and re-add it
+        through the model at the final position."""
         info = self._dragging_crop_strip
+        is_clone = self._crop_strip_clone
+        was_selected = self._crop_strip_was_selected
         self._dragging_crop_strip = None
+        self._crop_strip_clone = False
+        self._crop_strip_was_selected = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
         if info is None:
             return
-        clip_id, crop_id, original_anchor, _start_tl, _req = info
-        clip = self._model.get_clip_by_id(clip_id)
-        if clip is None or clip.is_gap:
+        clip_id, crop_id, segment_id, original_anchor, _start_tl, _req = info
+        cr = self._model._find_crop(clip_id, crop_id)
+        seg = cr.find_segment(segment_id) if cr is not None else None
+        if cr is None or seg is None:
             return
-        target = None
-        for cr in clip.crop_regions:
-            if cr.id == crop_id:
-                target = cr
-                break
-        if target is None:
+        final_anchor = seg.anchor_frame
+        seg_active = seg.active
+        if is_clone:
+            # Remove the temp clone we appended at press, then add it
+            # properly through the model (single undo entry).
+            cr.segments = [s for s in cr.segments if s.id != segment_id]
+            if final_anchor == original_anchor:
+                # Pure Alt-click, no drag → don't create a stray clone.
+                self.update()
+                return
+            new_id = self._model.add_crop_segment(
+                clip_id, crop_id, final_anchor, active=seg_active)
+            if new_id:
+                self._selected_segment_id = new_id
+                # Re-route selection so the panel highlights the committed
+                # clone (the press emitted the now-discarded temp id).
+                self.crop_clicked.emit(clip_id, crop_id, new_id)
             return
-        final_anchor = target.anchor_frame
         if final_anchor == original_anchor:
-            # No-op drag (pure click) — don't pollute the undo stack.
+            # Pure click (no drag). Re-clicking the already-selected
+            # segment deselects it (crop stays selected); otherwise it was
+            # already selected on press — nothing more to do.
+            if was_selected:
+                self._selected_segment_id = ""
+                self.crop_clicked.emit(clip_id, crop_id, "")
+                self.update()
             return
-        target.anchor_frame = original_anchor
-        self._model.update_crop_region(
-            clip_id, crop_id, anchor_frame=final_anchor)
+        seg.anchor_frame = original_anchor    # revert; model re-applies
+        self._model.move_crop_segment(
+            clip_id, crop_id, segment_id, final_anchor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self._dragging_crop_strip is not None and \
@@ -1329,7 +1482,7 @@ class TimelineWidget(QWidget):
     cache_thumbnails_clicked = Signal()  # button hit; main_window decides start vs cancel
     sources_dropped = Signal(list, int)  # source_ids, insert_frame
     files_dropped = Signal(list, int)    # file paths, insert_frame
-    crop_clicked = Signal(str, str)      # clip_id, crop_id (strip hit)
+    crop_clicked = Signal(str, str, str)  # clip_id, crop_id, segment_id (block hit)
 
     def __init__(self, model: TimelineModel, parent=None):
         super().__init__(parent)
@@ -1428,6 +1581,10 @@ class TimelineWidget(QWidget):
     def set_selected_crop_id(self, crop_id: str):
         """External crop-selection sync (panel ⇄ preview ⇄ timeline)."""
         self._strip.set_selected_crop_id(crop_id)
+
+    def set_selected_segment_id(self, segment_id: str):
+        """External segment-selection sync (panel ⇄ timeline)."""
+        self._strip.set_selected_segment_id(segment_id)
 
     @property
     def thumbnails_enabled(self) -> bool:

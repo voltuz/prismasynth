@@ -13,17 +13,18 @@ control.
 
 from typing import Dict, Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QIntValidator
+from PySide6.QtCore import QEvent, QPointF, QSize, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QIntValidator, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QAbstractButton, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from core.clip import Clip
 from core.crop_region import (
-    ASPECT_PRESETS, CropRegion, can_host_crop, clamp_anchor,
+    ASPECT_PRESETS, CropRegion, Segment, can_host_crop, clamp_anchor,
     required_source_frames, resolve_aspect,
 )
 from core.timeline import TimelineModel
@@ -75,10 +76,72 @@ class _CustomAspectDialog(QDialog):
         return (self._w.value(), self._h.value())
 
 
+class _KeyframeDiamond(QAbstractButton):
+    """Custom-painted AE/Premiere-style keyframe diamond toggle.
+
+    Three states drive the fill:
+      - ``"empty"`` — no keys on the group's tracks at all → dim hollow.
+      - ``"half"``  — track has keys but none at the playhead → hollow accent.
+      - ``"on"``    — a key exists at the playhead → solid accent.
+
+    Clicking toggles the key at the playhead (owner wires ``clicked``).
+    ``set_state`` early-outs on no-change so playback doesn't churn
+    repaints (the v0.17.1 anti-stutter discipline)."""
+
+    _DIM = QColor("#666666")
+    _ACCENT = QColor("#e8a735")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._state = "empty"
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        s = ui_scale()
+        self.setFixedSize(s.px(22), s.px(22))
+
+    def state(self) -> str:
+        return self._state
+
+    def set_state(self, state: str):
+        if state == self._state:
+            return
+        self._state = state
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        s = ui_scale()
+        return QSize(s.px(22), s.px(22))
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        cx = rect.center().x() + 0.5
+        cy = rect.center().y() + 0.5
+        r = min(rect.width(), rect.height()) / 2.0 - ui_scale().px(4)
+        diamond = QPolygonF([
+            QPointF(cx, cy - r),
+            QPointF(cx + r, cy),
+            QPointF(cx, cy + r),
+            QPointF(cx - r, cy),
+        ])
+        outline = max(1, ui_scale().px(1.5))
+        if self._state == "on":
+            p.setPen(QPen(self._ACCENT, 1))
+            p.setBrush(QBrush(self._ACCENT))
+        elif self._state == "half":
+            p.setPen(QPen(self._ACCENT, outline))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        else:  # empty
+            p.setPen(QPen(self._DIM, outline))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPolygon(diamond)
+        p.end()
+
+
 class _CropRow(QFrame):
     """One row in the cropping list: eye / label / aspect / group /
-    trash. Window position (formerly an 'anchor frame' spinbox) is now
-    edited via the timeline strip's drag interaction."""
+    trash. Keyframe controls live in a dedicated section below the crop
+    list (see ``ClipInfoPanel`` Keyframes group), not in the row."""
 
     active_toggled = Signal(str)
     label_changed = Signal(str, str)
@@ -86,10 +149,6 @@ class _CropRow(QFrame):
     group_changed = Signal(str, object)               # crop_id, group_id or None
     delete_requested = Signal(str)
     selected = Signal(str)
-    # Keyframe controls.
-    keyframe_toggle_requested = Signal(str, str)      # crop_id, group ("position"/"size")
-    jump_to_source_frame = Signal(str, int)           # crop_id, source_frame
-    edit_curves_requested = Signal(str)               # crop_id
 
     def __init__(self, crop: CropRegion, groups: Dict[str, "Group"],
                  parent=None):
@@ -155,127 +214,7 @@ class _CropRow(QFrame):
         self._group_combo.currentIndexChanged.connect(self._on_group_changed)
         layout.addWidget(self._group_combo, 1, 4, 1, 2)
 
-        # Row 2: keyframe controls (prev/diamond/next per group)
-        # + Edit curves button.
-        kf_row = QHBoxLayout()
-        kf_row.setSpacing(s.px(2))
-        kf_row.setContentsMargins(0, 0, 0, 0)
-        (self._pos_prev, self._pos_diamond, self._pos_next) = (
-            self._build_kf_triplet("position", "Position"))
-        kf_row.addWidget(self._pos_prev)
-        kf_row.addWidget(self._pos_diamond)
-        kf_row.addWidget(self._pos_next)
-        kf_row.addSpacing(s.px(6))
-        (self._sz_prev, self._sz_diamond, self._sz_next) = (
-            self._build_kf_triplet("size", "Size"))
-        kf_row.addWidget(self._sz_prev)
-        kf_row.addWidget(self._sz_diamond)
-        kf_row.addWidget(self._sz_next)
-        kf_row.addStretch(1)
-        self._edit_curves_btn = QPushButton("Edit curves…")
-        self._edit_curves_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._edit_curves_btn.clicked.connect(
-            lambda: self.edit_curves_requested.emit(self._crop_id))
-        kf_row.addWidget(self._edit_curves_btn)
-        layout.addLayout(kf_row, 2, 0, 1, 6)
-
-        # KF visual state. Stays as the "empty" state until ClipInfoPanel
-        # pushes a refresh. ``_kf_visuals_cache`` is the last tuple
-        # actually applied to the widgets — used by ``_refresh_kf_visuals``
-        # to early-out when nothing changed (avoids per-playhead-frame
-        # setStyleSheet churn during playback, which re-polishes the
-        # widget subtree even for an identical string).
-        self._kf_visuals_cache: Optional[tuple] = None
-        self._refresh_kf_visuals("empty", "empty",
-                                False, False, False, False)
-
         self.update_from(crop, groups)
-
-    # --- KF helpers --------------------------------------------------
-
-    def _build_kf_triplet(self, group: str, label: str):
-        """Build (prev_arrow, diamond_btn, next_arrow) for a KF group."""
-        s = ui_scale()
-        prev_btn = QToolButton()
-        prev_btn.setText("◀")
-        prev_btn.setFixedSize(s.px(18), s.px(18))
-        prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        prev_btn.setToolTip(f"Previous {label} keyframe")
-        prev_btn.clicked.connect(
-            lambda _=False, g=group: self._on_kf_jump(g, direction=-1))
-
-        diamond_btn = QToolButton()
-        diamond_btn.setText("◆")
-        diamond_btn.setFixedSize(s.px(36), s.px(18))
-        diamond_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        diamond_btn.setToolTip(
-            f"Toggle {label} keyframe at playhead "
-            "(filled = key here, half = key elsewhere, empty = none)")
-        diamond_btn.clicked.connect(
-            lambda _=False, g=group:
-            self.keyframe_toggle_requested.emit(self._crop_id, g))
-
-        next_btn = QToolButton()
-        next_btn.setText("▶")
-        next_btn.setFixedSize(s.px(18), s.px(18))
-        next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        next_btn.setToolTip(f"Next {label} keyframe")
-        next_btn.clicked.connect(
-            lambda _=False, g=group: self._on_kf_jump(g, direction=+1))
-        return (prev_btn, diamond_btn, next_btn)
-
-    def _on_kf_jump(self, group: str, direction: int):
-        # Cached on the row by ClipInfoPanel.refresh_keyframe_states.
-        target = (self._jump_targets.get((group, direction))
-                  if hasattr(self, "_jump_targets") else None)
-        if target is None:
-            return
-        self.jump_to_source_frame.emit(self._crop_id, int(target))
-
-    def refresh_kf_state(self, pos_state: str, sz_state: str,
-                         pos_prev: Optional[int], pos_next: Optional[int],
-                         sz_prev: Optional[int], sz_next: Optional[int]):
-        """Push the live keyframe state of this row's crop. ``*_state`` is
-        one of ``"empty"`` / ``"half"`` / ``"on"``. ``*_prev`` /
-        ``*_next`` are source-frame jump targets or None when no key
-        exists on that side."""
-        self._jump_targets = {
-            ("position", -1): pos_prev,
-            ("position", +1): pos_next,
-            ("size", -1): sz_prev,
-            ("size", +1): sz_next,
-        }
-        self._refresh_kf_visuals(
-            pos_state, sz_state,
-            pos_prev is not None, pos_next is not None,
-            sz_prev is not None, sz_next is not None,
-        )
-
-    @staticmethod
-    def _diamond_style(state: str) -> str:
-        # Color codes: empty=grey, half=warning yellow, on=orange.
-        color = {"empty": "#666666",
-                 "half": "#d1a72c",
-                 "on": "#e8a735"}.get(state, "#666666")
-        return ("QToolButton { background: transparent; color: "
-                f"{color}; border: 1px solid #444; border-radius: 3px;"
-                " font-weight: bold; }"
-                "QToolButton:hover { border-color: #888; }")
-
-    def _refresh_kf_visuals(self, pos_state: str, sz_state: str,
-                            pos_prev: bool, pos_next: bool,
-                            sz_prev: bool, sz_next: bool):
-        incoming = (pos_state, sz_state, pos_prev, pos_next,
-                    sz_prev, sz_next)
-        if incoming == self._kf_visuals_cache:
-            return
-        self._pos_diamond.setStyleSheet(self._diamond_style(pos_state))
-        self._sz_diamond.setStyleSheet(self._diamond_style(sz_state))
-        self._pos_prev.setEnabled(pos_prev)
-        self._pos_next.setEnabled(pos_next)
-        self._sz_prev.setEnabled(sz_prev)
-        self._sz_next.setEnabled(sz_next)
-        self._kf_visuals_cache = incoming
 
     # ------------------------------------------------------------------
 
@@ -292,6 +231,11 @@ class _CropRow(QFrame):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.selected.emit(self._crop_id)
+            # Accept so the click doesn't bubble to the rows host, whose
+            # blank-space event filter would otherwise immediately
+            # deselect the crop we just selected.
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     # ------------------------------------------------------------------
@@ -372,6 +316,96 @@ class _CropRow(QFrame):
         self.group_changed.emit(self._crop_id, data)
 
 
+class _SegmentRow(QFrame):
+    """One export-segment row: active eye + '@ frame N' + trash."""
+
+    active_toggled = Signal(str)        # segment_id
+    delete_requested = Signal(str)      # segment_id
+    selected = Signal(str)              # segment_id
+
+    def __init__(self, segment: Segment, can_delete: bool, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            "_SegmentRow { border: 1px solid #3c3c3c; border-radius: 3px; }"
+            "_SegmentRow[selected=\"true\"] { border: 1px solid #5577aa; }"
+        )
+        self._segment_id = segment.id
+        s = ui_scale()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(s.px(6), s.px(3), s.px(6), s.px(3))
+        row.setSpacing(s.px(6))
+
+        self._eye_btn = QToolButton()
+        self._eye_btn.setCheckable(True)
+        self._eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._eye_btn.setFixedSize(s.px(22), s.px(22))
+        self._eye_btn.setIconSize(QSize(s.px(14), s.px(14)))
+        self._eye_icon_on = icon("eye")
+        self._eye_icon_off = icon("eye-off")
+        self._eye_btn.toggled.connect(self._on_eye)
+        row.addWidget(self._eye_btn)
+
+        self._frame_label = QLabel()
+        self._frame_label.setStyleSheet("color: #ccc;")
+        row.addWidget(self._frame_label, 1)
+
+        self._delete_btn = QToolButton()
+        self._delete_btn.setIcon(icon("trash"))
+        self._delete_btn.setIconSize(QSize(s.px(14), s.px(14)))
+        self._delete_btn.setFixedSize(s.px(22), s.px(22))
+        self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._delete_btn.setToolTip("Remove segment")
+        self._delete_btn.setStyleSheet(
+            "QToolButton { background: transparent;"
+            " border: 1px solid #555; border-radius: 3px; }"
+            "QToolButton:hover { background: rgba(232, 122, 117, 40); }"
+        )
+        self._delete_btn.clicked.connect(
+            lambda: self.delete_requested.emit(self._segment_id))
+        row.addWidget(self._delete_btn)
+
+        self._suppress = False
+        self.update_from(segment, can_delete)
+
+    def segment_id(self) -> str:
+        return self._segment_id
+
+    def update_from(self, segment: Segment, can_delete: bool):
+        self._suppress = True
+        try:
+            self._eye_btn.setChecked(segment.active)
+            self._eye_btn.setIcon(
+                self._eye_icon_on if segment.active else self._eye_icon_off)
+            self._eye_btn.setToolTip(
+                "Active — toggle to skip this segment on export"
+                if segment.active
+                else "Inactive — toggle to include this segment on export")
+            self._frame_label.setText(f"@ frame {segment.anchor_frame}")
+            # The last remaining segment can't be removed.
+            self._delete_btn.setEnabled(can_delete)
+        finally:
+            self._suppress = False
+
+    def set_selected(self, selected: bool):
+        self.setProperty("selected", "true" if selected else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self._segment_id)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _on_eye(self, _checked: bool):
+        if self._suppress:
+            return
+        self.active_toggled.emit(self._segment_id)
+
+
 class ClipInfoPanel(QWidget):
     """Right-column "Clip" panel — details + cropping regions."""
 
@@ -388,6 +422,9 @@ class ClipInfoPanel(QWidget):
     # User clicked "Edit curves…" on a row. MainWindow opens / focuses
     # the keyframe-editor dock and points it at this crop.
     crop_edit_curves_requested = Signal(str, str)      # clip_id, crop_id
+    # User selected an export segment (panel side). MainWindow mirrors
+    # the halo onto the timeline.
+    crop_segment_selected = Signal(str, str, str)      # clip_id, crop_id, segment_id
 
     def __init__(self, timeline: TimelineModel, parent=None):
         super().__init__(parent)
@@ -397,15 +434,18 @@ class ClipInfoPanel(QWidget):
         self._current_source: Optional[VideoSource] = None
         self._crop_rows: Dict[str, _CropRow] = {}
         self._selected_crop_id: Optional[str] = None
+        self._selected_segment_id: Optional[str] = None
+        self._seg_rows: Dict[str, "_SegmentRow"] = {}
         # Playhead source frame is set by MainWindow on every playhead change
         # so "From playhead" can fill the anchor without a round-trip.
         self._playhead_source_frame: int = 0
-        # KF-refresh fast path state — see ``_refresh_keyframe_states``.
-        # ``_kf_states_seeded`` flips True after the first pass per clip
-        # load so we can skip subsequent zero-key passes; cleared in
-        # ``_refresh_crops`` when rows are rebuilt.
-        self._kf_states_seeded: bool = False
-        self._had_animated_last_pass: bool = False
+        # The crop the dedicated Keyframes section currently targets, and
+        # cached jump targets (group, direction) -> source frame | None
+        # populated by ``_refresh_keyframe_section`` for the prev/next
+        # nav arrows.
+        self._kf_section_crop_id: Optional[str] = None
+        self._kf_jump_targets: Dict[tuple, Optional[int]] = {}
+        self._kf_suppress: bool = False
 
         s = ui_scale()
         self.setMinimumWidth(s.px(220))
@@ -482,6 +522,22 @@ class ClipInfoPanel(QWidget):
 
         layout.addWidget(self._crops_group, 1)
 
+        # ---- Segments (export windows of the selected crop) ------------
+        self._build_segments_section(layout)
+
+        # ---- Keyframes (dedicated section for the selected crop) --------
+        self._build_keyframe_section(layout)
+
+        # Blank-space deselect: filter mouse presses delivered to the
+        # Clip-panel container backgrounds. installEventFilter only sees
+        # events delivered to that exact widget (not its children), so
+        # each fires only when the click lands on its own blank surface
+        # — interactive children that consume their clicks never trigger
+        # a deselect.
+        for w in (self, self._group, self._crops_group, self._kf_group,
+                  self._scroll.viewport(), self._rows_host):
+            w.installEventFilter(self)
+
         # Refresh hooks — clips_changed covers crop add/remove/edit; we also
         # refresh on groups_changed so the group combos in each row stay
         # in sync with the registry.
@@ -489,6 +545,249 @@ class ClipInfoPanel(QWidget):
         self._timeline.groups_changed.connect(self._refresh_crops)
 
         self._update_crop_section_enabled()
+        self._refresh_keyframe_section()
+        self._refresh_segments_section()
+
+    def eventFilter(self, obj, event):
+        # Click on blank Clip-panel space → clear crop selection.
+        if (event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._selected_crop_id is not None):
+            self._deselect_crop()
+        return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------------
+    # Keyframes section (dedicated, targets the selected crop)
+    # ------------------------------------------------------------------
+
+    def _build_keyframe_section(self, outer_layout: QVBoxLayout):
+        """Build the spacious 'Keyframes' group box under the crop list.
+
+        Shows controls for the currently-targeted crop only: a diamond
+        toggle + nav + count + quick-interp per parameter group
+        (Position = x,y / Size = w,h), plus an Open-graph-editor button.
+        Curve/handle visualization stays in the detached editor."""
+        s = ui_scale()
+        self._kf_group = QGroupBox("Keyframes")
+        outer = QVBoxLayout(self._kf_group)
+        outer.setContentsMargins(s.px(8), s.px(8), s.px(8), s.px(8))
+        outer.setSpacing(s.px(6))
+
+        # Header: which crop + live playhead frame.
+        self._kf_header = QLabel("Select a crop")
+        self._kf_header.setStyleSheet("color: #ddd; font-weight: bold;")
+        self._kf_header.setWordWrap(True)
+        outer.addWidget(self._kf_header)
+
+        self._kf_frame_label = QLabel("frame —")
+        self._kf_frame_label.setStyleSheet("color: #888; font-size: 11px;")
+        outer.addWidget(self._kf_frame_label)
+
+        # Per-group grid. Columns: name (flex) | nav cluster | count | interp.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(s.px(6))
+        grid.setVerticalSpacing(s.px(6))
+        grid.setColumnStretch(0, 1)          # name column flexes
+        self._kf_widgets: Dict[str, dict] = {}
+        for row, (group, label) in enumerate(
+                (("position", "Position"), ("size", "Size"))):
+            name = QLabel(label)
+            name.setStyleSheet("color: #ccc;")
+            grid.addWidget(name, row, 0)
+
+            # NLE-style keyframe navigator: ◀ ◆ ▶ as one tight cluster
+            # (prev key · toggle key at playhead · next key).
+            prev_btn = QToolButton()
+            prev_btn.setText("◀")
+            prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            prev_btn.setToolTip(f"Previous {label} keyframe")
+            prev_btn.clicked.connect(
+                lambda _=False, g=group: self._on_kf_jump(g, -1))
+
+            diamond = _KeyframeDiamond()
+            diamond.setToolTip(
+                f"Toggle {label} keyframe at the playhead")
+            diamond.clicked.connect(
+                lambda _=False, g=group: self._on_kf_toggle(g))
+
+            next_btn = QToolButton()
+            next_btn.setText("▶")
+            next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            next_btn.setToolTip(f"Next {label} keyframe")
+            next_btn.clicked.connect(
+                lambda _=False, g=group: self._on_kf_jump(g, +1))
+
+            nav = QHBoxLayout()
+            nav.setContentsMargins(0, 0, 0, 0)
+            nav.setSpacing(s.px(2))
+            nav.addWidget(prev_btn)
+            nav.addWidget(diamond)
+            nav.addWidget(next_btn)
+            grid.addLayout(nav, row, 1)
+
+            count = QLabel("0 keys")
+            count.setStyleSheet("color: #888; font-size: 11px;")
+            count.setMinimumWidth(s.px(48))
+            grid.addWidget(count, row, 2)
+
+            interp = QComboBox()
+            interp.addItem("Linear", "linear")
+            interp.addItem("Bezier", "bezier")
+            interp.addItem("Step", "step")
+            interp.setToolTip(
+                f"Interpolation of the {label} keyframe at the playhead")
+            interp.currentIndexChanged.connect(
+                lambda _idx, g=group: self._on_kf_interp_changed(g))
+            grid.addWidget(interp, row, 3)
+
+            self._kf_widgets[group] = {
+                "diamond": diamond, "name": name,
+                "prev": prev_btn, "next": next_btn,
+                "count": count, "interp": interp,
+            }
+        outer.addLayout(grid)
+
+        self._kf_open_editor = QPushButton("Open graph editor")
+        self._kf_open_editor.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._kf_open_editor.clicked.connect(self._on_kf_open_editor)
+        outer.addWidget(self._kf_open_editor)
+
+        outer_layout.addWidget(self._kf_group)
+
+    # ------------------------------------------------------------------
+    # Segments section (export windows of the selected crop)
+    # ------------------------------------------------------------------
+
+    def _build_segments_section(self, outer_layout: QVBoxLayout):
+        s = ui_scale()
+        self._seg_group = QGroupBox("Segments")
+        v = QVBoxLayout(self._seg_group)
+        v.setContentsMargins(s.px(8), s.px(6), s.px(8), s.px(8))
+        v.setSpacing(s.px(4))
+
+        self._seg_add_btn = QPushButton("+ Add segment")
+        self._seg_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._seg_add_btn.clicked.connect(self._on_add_segment)
+        v.addWidget(self._seg_add_btn)
+
+        self._seg_hint = QLabel("Select a crop to manage export segments.")
+        self._seg_hint.setWordWrap(True)
+        self._seg_hint.setStyleSheet("color: #888; font-size: 11px;")
+        v.addWidget(self._seg_hint)
+
+        self._seg_scroll = QScrollArea()
+        self._seg_scroll.setWidgetResizable(True)
+        self._seg_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._seg_scroll.setMaximumHeight(s.px(140))
+        self._seg_rows_host = QWidget()
+        self._seg_rows_layout = QVBoxLayout(self._seg_rows_host)
+        self._seg_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._seg_rows_layout.setSpacing(s.px(3))
+        self._seg_rows_layout.addStretch(1)
+        self._seg_scroll.setWidget(self._seg_rows_host)
+        v.addWidget(self._seg_scroll)
+
+        outer_layout.addWidget(self._seg_group)
+
+    def set_selected_segment(self, segment_id: str):
+        """External sync (timeline click). Highlights the row; no emit."""
+        self._apply_segment_selection(segment_id, emit=False)
+
+    def _apply_segment_selection(self, segment_id, emit: bool = True):
+        """Single point of truth for export-segment selection: updates
+        state, row halos, and (when ``emit``) the ``crop_segment_selected``
+        signal. No-ops when unchanged."""
+        sid = segment_id or None
+        if sid == self._selected_segment_id:
+            return
+        self._selected_segment_id = sid
+        for rid, row in self._seg_rows.items():
+            row.set_selected(rid == sid)
+        if emit:
+            cr = self._kf_target_crop()
+            clip_id = (self._current_clip.id
+                       if (self._current_clip
+                           and not self._current_clip.is_gap) else "")
+            crop_id = cr.id if cr is not None else ""
+            self.crop_segment_selected.emit(clip_id, crop_id, sid or "")
+
+    def _refresh_segments_section(self):
+        """Rebuild the Segments list for the targeted crop. Runs on
+        selection / clips_changed, NOT on playhead moves (segment
+        anchors don't depend on the playhead)."""
+        # Drop old rows.
+        for row in list(self._seg_rows.values()):
+            self._seg_rows_layout.removeWidget(row)
+            row.deleteLater()
+        self._seg_rows.clear()
+
+        cr = self._kf_target_crop()
+        if cr is None:
+            self._seg_hint.setVisible(True)
+            self._seg_add_btn.setEnabled(False)
+            self._selected_segment_id = None
+            return
+        self._seg_hint.setVisible(False)
+        self._seg_add_btn.setEnabled(True)
+        # Drop a stale selection that doesn't belong to this crop.
+        if (self._selected_segment_id is not None
+                and cr.find_segment(self._selected_segment_id) is None):
+            self._selected_segment_id = None
+        can_delete = len(cr.segments) > 1
+        for seg in cr.segments:
+            row = _SegmentRow(seg, can_delete, parent=self._seg_rows_host)
+            row.active_toggled.connect(self._on_segment_active_toggled)
+            row.delete_requested.connect(self._on_segment_delete)
+            row.selected.connect(self._on_segment_row_selected)
+            idx = self._seg_rows_layout.count() - 1
+            self._seg_rows_layout.insertWidget(idx, row)
+            self._seg_rows[seg.id] = row
+            row.set_selected(seg.id == self._selected_segment_id)
+
+    # --- Segment handlers ---------------------------------------------
+
+    def _on_add_segment(self):
+        cr = self._kf_target_crop()
+        clip = self._current_clip
+        source = self._current_source
+        if (cr is None or clip is None or clip.is_gap
+                or source is None or source.fps <= 0):
+            return
+        anchor = clamp_anchor(
+            self._playhead_source_frame, clip, source.fps)
+        seg_id = self._timeline.add_crop_segment(clip.id, cr.id, anchor)
+        if seg_id:
+            self._selected_segment_id = seg_id
+            self.crop_segment_selected.emit(clip.id, cr.id, seg_id)
+
+    def _on_segment_active_toggled(self, segment_id: str):
+        cr = self._kf_target_crop()
+        if cr is None or self._current_clip is None:
+            return
+        self._timeline.toggle_crop_segment_active(
+            self._current_clip.id, cr.id, segment_id)
+
+    def _on_segment_delete(self, segment_id: str):
+        cr = self._kf_target_crop()
+        if cr is None or self._current_clip is None:
+            return
+        if self._selected_segment_id == segment_id:
+            self._selected_segment_id = None
+        self._timeline.remove_crop_segment(
+            self._current_clip.id, cr.id, segment_id)
+
+    def _on_segment_row_selected(self, segment_id: str):
+        cr = self._kf_target_crop()
+        if cr is None or self._current_clip is None:
+            return
+        if segment_id == self._selected_segment_id:
+            # Re-click the selected segment → deselect (crop stays).
+            self._apply_segment_selection(None)
+            return
+        # Promote the sole-crop fallback to an explicit crop selection
+        # (idempotent when the crop is already selected), then select.
+        self._apply_crop_selection(cr.id)
+        self._apply_segment_selection(segment_id)
 
     # ------------------------------------------------------------------
 
@@ -513,7 +812,7 @@ class ClipInfoPanel(QWidget):
         if f == self._playhead_source_frame:
             return
         self._playhead_source_frame = f
-        self._refresh_keyframe_states()
+        self._refresh_keyframe_section()
 
     def update_clip(self, clip: Optional[Clip],
                     sources: Dict[str, VideoSource]):
@@ -585,14 +884,33 @@ class ClipInfoPanel(QWidget):
         self._update_crop_section_enabled()
 
     def set_selected_crop(self, crop_id: str):
-        """External callers (preview overlay) set the selected crop here."""
+        """External callers (preview overlay / timeline) set the selected
+        crop here. ``emit=False`` keeps this the receiving end so the
+        selection doesn't loop back out as a fresh ``crop_selected``."""
+        self._apply_crop_selection(crop_id, emit=False)
+
+    def _apply_crop_selection(self, crop_id, emit: bool = True):
+        """Single point of truth for crop selection: updates state, row
+        highlights, the ``crop_selected`` signal, and the Keyframes
+        section. No-ops when the selection is unchanged."""
         if crop_id == "":
             crop_id = None
-        if self._selected_crop_id == crop_id:
+        if crop_id == self._selected_crop_id:
             return
         self._selected_crop_id = crop_id
         for cid, row in self._crop_rows.items():
             row.set_selected(cid == crop_id)
+        if emit:
+            self.crop_selected.emit(crop_id or "")
+        # Switching / clearing the crop clears its segment selection too
+        # (and emits so the timeline halo drops). Cheap no-op when no
+        # segment was selected.
+        self._apply_segment_selection(None)
+        self._refresh_keyframe_section()
+        self._refresh_segments_section()
+
+    def _deselect_crop(self):
+        self._apply_crop_selection(None)
 
     # ------------------------------------------------------------------
     # Crop section state
@@ -637,12 +955,7 @@ class ClipInfoPanel(QWidget):
         """Rebuild the row widgets from the current clip's crop_regions.
         Cheap and bulletproof — rebuilds on every clips_changed."""
         clip = self._current_clip
-        # Drop all existing rows; we rebuild fresh each time. Fresh
-        # rows have empty visual caches, so the seed pass needs to
-        # happen — clear the panel-level fast-path flag so the next
-        # ``_refresh_keyframe_states`` walks all rows once.
-        self._kf_states_seeded = False
-        self._had_animated_last_pass = False
+        # Drop all existing rows; we rebuild fresh each time.
         for row in list(self._crop_rows.values()):
             self._rows_layout.removeWidget(row)
             row.deleteLater()
@@ -650,6 +963,8 @@ class ClipInfoPanel(QWidget):
 
         if clip is None or clip.is_gap or self._current_source is None:
             self._update_crop_section_enabled()
+            self._refresh_keyframe_section()
+            self._refresh_segments_section()
             return
 
         # Re-resolve in case the live model object differs from the cached
@@ -657,6 +972,8 @@ class ClipInfoPanel(QWidget):
         live = self._timeline.get_clip_by_id(clip.id)
         if live is None:
             self._update_crop_section_enabled()
+            self._refresh_keyframe_section()
+            self._refresh_segments_section()
             return
         self._current_clip = live
         clip = live
@@ -671,34 +988,35 @@ class ClipInfoPanel(QWidget):
             row.group_changed.connect(self._on_row_group_changed)
             row.delete_requested.connect(self._on_row_delete)
             row.selected.connect(self._on_row_selected)
-            row.keyframe_toggle_requested.connect(
-                self._on_row_keyframe_toggle)
-            row.jump_to_source_frame.connect(
-                self._on_row_jump_to_source_frame)
-            row.edit_curves_requested.connect(
-                self._on_row_edit_curves)
             idx = self._rows_layout.count() - 1
             self._rows_layout.insertWidget(idx, row)
             self._crop_rows[cr.id] = row
             if cr.id == self._selected_crop_id:
                 row.set_selected(True)
 
-        self._refresh_keyframe_states()
         self._update_crop_section_enabled()
+        self._refresh_keyframe_section()
+        self._refresh_segments_section()
 
     # ------------------------------------------------------------------
     # Keyframe state refresh (playhead-driven)
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _group_tracks(cr, group: str):
+        """Return the two axis tracks for a parameter group."""
+        if group == "position":
+            return (cr.x_track, cr.y_track)
+        return (cr.w_track, cr.h_track)
+
+    @staticmethod
     def _combine_group_state(track_a, track_b, frame: int) -> str:
-        """Diamond visual state for an axis pair. 'on' iff BOTH axes
-        have a key at this frame; 'half' if either has any key; else
-        'empty'."""
+        """Diamond visual state for an axis pair: 'on' if either axis
+        has a key at this frame, 'half' if either has any key elsewhere,
+        else 'empty'."""
         if not track_a and not track_b:
             return "empty"
-        has_here = (track_a.has_key_at(frame) and track_b.has_key_at(frame))
-        if has_here:
+        if track_a.has_key_at(frame) or track_b.has_key_at(frame):
             return "on"
         return "half"
 
@@ -722,74 +1040,147 @@ class ClipInfoPanel(QWidget):
             return a
         return min(a, b)  # closest following key
 
-    def _refresh_keyframe_states(self):
-        """Recompute every row's KF visual + nav-enable state.
+    @staticmethod
+    def _group_key_count(track_a, track_b) -> int:
+        """Distinct keyed frames across the two axes of a group."""
+        frames = {k.source_frame for k in track_a.keys}
+        frames |= {k.source_frame for k in track_b.keys}
+        return len(frames)
 
-        Runs on every playhead source-frame change (up to 60Hz during
-        playback) plus on clips_changed. Two layers of early-out keep
-        the per-frame cost near zero:
+    @staticmethod
+    def _group_interp_at(track_a, track_b, frame: int):
+        """Common interp of the group's keys at ``frame``, or None when
+        no key exists there or the two axes disagree."""
+        interps = set()
+        for tr in (track_a, track_b):
+            k = tr.find_key(frame)
+            if k is not None:
+                interps.add(k.interp)
+        if len(interps) == 1:
+            return next(iter(interps))
+        return None
 
-        * Panel-level: when no crop on the current clip is animated
-          AND none was animated last pass AND every row has already
-          been seeded with its empty state, skip the per-row loop
-          entirely — playhead motion can't move an empty-track diamond.
-        * Row-level (in ``_CropRow._refresh_kf_visuals``): tuple cache
-          of the last applied state, early-outs identical pushes so
-          ``setStyleSheet`` isn't called on every tick (previously the
-          stutter source — Qt re-polishes the widget subtree even when
-          the stylesheet string is unchanged).
-        """
+    def _kf_target_crop(self):
+        """Resolve which crop the Keyframes section reflects: the
+        selected crop if it belongs to the current clip, else the sole
+        crop when there's exactly one (display-only), else None."""
         clip = self._current_clip
         if clip is None or clip.is_gap:
-            return
+            return None
         live = self._timeline.get_clip_by_id(clip.id)
         if live is None:
-            return
-        any_animated = any(cr.is_animated() for cr in live.crop_regions)
-        if (not any_animated and not self._had_animated_last_pass
-                and self._kf_states_seeded):
-            return
-        self._had_animated_last_pass = any_animated
-        self._kf_states_seeded = True
+            return None
+        crops = live.crop_regions
+        if self._selected_crop_id:
+            for cr in crops:
+                if cr.id == self._selected_crop_id:
+                    return cr
+        if len(crops) == 1:
+            return crops[0]
+        return None
+
+    def _refresh_keyframe_section(self):
+        """Update the dedicated Keyframes section for the target crop.
+
+        Runs on playhead changes (already same-frame-guarded upstream),
+        clips_changed, and selection changes. The diamond widgets and
+        combos early-out on unchanged values, so this is cheap to call
+        and won't churn during playback."""
+        cr = self._kf_target_crop()
+        self._kf_section_crop_id = cr.id if cr is not None else None
         frame = int(self._playhead_source_frame)
-        for cr in live.crop_regions:
-            row = self._crop_rows.get(cr.id)
-            if row is None:
-                continue
-            pos_state = self._combine_group_state(
-                cr.x_track, cr.y_track, frame)
-            sz_state = self._combine_group_state(
-                cr.w_track, cr.h_track, frame)
-            row.refresh_kf_state(
-                pos_state, sz_state,
-                self._group_prev(cr.x_track, cr.y_track, frame),
-                self._group_next(cr.x_track, cr.y_track, frame),
-                self._group_prev(cr.w_track, cr.h_track, frame),
-                self._group_next(cr.w_track, cr.h_track, frame),
-            )
+
+        if cr is None:
+            self._kf_header.setText("Select a crop")
+            self._kf_frame_label.setText("frame —")
+            self._kf_jump_targets = {}
+            for w in self._kf_widgets.values():
+                w["diamond"].set_state("empty")
+                w["diamond"].setEnabled(False)
+                w["prev"].setEnabled(False)
+                w["next"].setEnabled(False)
+                w["count"].setText("—")
+                self._set_interp_combo(w["interp"], None, enabled=False)
+            self._kf_open_editor.setEnabled(False)
+            return
+
+        label = cr.label or f"Crop {cr.id[:6]}"
+        self._kf_header.setText(f"Keyframes — {label}")
+        self._kf_frame_label.setText(f"frame {frame}")
+        self._kf_open_editor.setEnabled(True)
+
+        jump: Dict[tuple, Optional[int]] = {}
+        for group in ("position", "size"):
+            ta, tb = self._group_tracks(cr, group)
+            w = self._kf_widgets[group]
+            w["diamond"].setEnabled(True)
+            w["diamond"].set_state(
+                self._combine_group_state(ta, tb, frame))
+            prev_f = self._group_prev(ta, tb, frame)
+            next_f = self._group_next(ta, tb, frame)
+            jump[(group, -1)] = prev_f
+            jump[(group, +1)] = next_f
+            w["prev"].setEnabled(prev_f is not None)
+            w["next"].setEnabled(next_f is not None)
+            n = self._group_key_count(ta, tb)
+            w["count"].setText(f"{n} key" if n == 1 else f"{n} keys")
+            interp = self._group_interp_at(ta, tb, frame)
+            self._set_interp_combo(
+                w["interp"], interp, enabled=interp is not None)
+        self._kf_jump_targets = jump
+
+    def _set_interp_combo(self, combo: QComboBox, interp,
+                          enabled: bool):
+        """Set the interp combo selection without firing its change
+        handler. ``interp`` None leaves the current index but disables."""
+        self._kf_suppress = True
+        try:
+            combo.setEnabled(enabled)
+            if interp is not None:
+                idx = combo.findData(interp)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+        finally:
+            self._kf_suppress = False
 
     # ------------------------------------------------------------------
-    # Row keyframe callbacks
+    # Keyframes section handlers
     # ------------------------------------------------------------------
 
-    def _on_row_keyframe_toggle(self, crop_id: str, group: str):
-        if self._current_clip is None:
+    def _on_kf_toggle(self, group: str):
+        if (self._current_clip is None
+                or self._kf_section_crop_id is None):
             return
         self._timeline.toggle_crop_keyframe(
-            self._current_clip.id, crop_id, group,
+            self._current_clip.id, self._kf_section_crop_id, group,
             int(self._playhead_source_frame))
 
-    def _on_row_jump_to_source_frame(self, crop_id: str, source_frame: int):
-        if self._current_clip is None:
+    def _on_kf_jump(self, group: str, direction: int):
+        if (self._current_clip is None
+                or self._kf_section_crop_id is None):
+            return
+        target = self._kf_jump_targets.get((group, direction))
+        if target is None:
             return
         self.crop_jump_to_source_frame.emit(
-            self._current_clip.id, crop_id, int(source_frame))
+            self._current_clip.id, self._kf_section_crop_id, int(target))
 
-    def _on_row_edit_curves(self, crop_id: str):
-        if self._current_clip is None:
+    def _on_kf_interp_changed(self, group: str):
+        if (self._kf_suppress or self._current_clip is None
+                or self._kf_section_crop_id is None):
+            return
+        combo = self._kf_widgets[group]["interp"]
+        interp = combo.currentData()
+        self._timeline.set_crop_keyframe_group_interp(
+            self._current_clip.id, self._kf_section_crop_id, group,
+            int(self._playhead_source_frame), interp)
+
+    def _on_kf_open_editor(self):
+        if (self._current_clip is None
+                or self._kf_section_crop_id is None):
             return
         self.crop_edit_curves_requested.emit(
-            self._current_clip.id, crop_id)
+            self._current_clip.id, self._kf_section_crop_id)
 
     # ------------------------------------------------------------------
     # Row callbacks → TimelineModel mutations
@@ -851,12 +1242,11 @@ class ClipInfoPanel(QWidget):
         self._timeline.remove_crop_region(self._current_clip.id, crop_id)
 
     def _on_row_selected(self, crop_id: str):
+        # Re-clicking the already-selected crop toggles it off.
         if self._selected_crop_id == crop_id:
-            return
-        self._selected_crop_id = crop_id
-        for cid, row in self._crop_rows.items():
-            row.set_selected(cid == crop_id)
-        self.crop_selected.emit(crop_id)
+            self._apply_crop_selection(None)
+        else:
+            self._apply_crop_selection(crop_id)
 
     # ------------------------------------------------------------------
     # + Add crop / Edit-mode toggle
@@ -882,13 +1272,13 @@ class ClipInfoPanel(QWidget):
         ch = max(16, sh // 2)
         cx = (sw - cw) // 2
         cy = (sh - ch) // 2
-        # Default anchor: playhead's source frame, clamped to the valid
-        # range for this clip's source FPS.
+        # Default first segment: playhead's source frame, clamped to the
+        # valid range for this clip's source FPS.
         anchor = clamp_anchor(
             self._playhead_source_frame, clip, source.fps)
         cr = CropRegion(
             x=cx, y=cy, w=cw, h=ch,
-            anchor_frame=anchor,
+            segments=[Segment(anchor_frame=anchor)],
             aspect_ratio="free",
         )
         new_id = self._timeline.add_crop_region(clip.id, cr)

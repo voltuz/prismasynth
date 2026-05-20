@@ -248,28 +248,34 @@ class CropExporter(QObject):
             if target_dir is None:
                 # Per-group path not set for this crop's bucket — skip.
                 continue
-            # Filename: <source>_f{anchor}_{w}x{h}_{crop_id_short}.<ext>
             stem = _stem_of(source.file_path)
-            base_name = (
-                f"{stem}_f{cr.anchor_frame}_{cr.w}x{cr.h}_{cr.id[:6]}")
-            if is_image_sequence:
-                # Output is a folder per crop containing frame_001.<ext> ...
-                out_path = os.path.join(target_dir, base_name)
-            else:
-                out_path = os.path.join(target_dir, base_name + out_ext)
-            jobs.append({
-                "clip_id": clip.id,
-                "crop_id": cr.id,
-                "crop": cr,
-                "source_path": source.file_path,
-                "source_fps": source.fps,
-                "has_audio": bool(source.audio_channels > 0),
-                "out_path": out_path,
-                "out_ext": out_ext,
-                "is_image_sequence": is_image_sequence,
-                "image_ext": IMAGE_SEQUENCE_CODECS.get(codec, ".png"),
-                "preset": preset,
-            })
+            # One job per ACTIVE segment. Filename includes the segment's
+            # anchor + crop/segment short ids so windows never collide.
+            for seg in cr.segments:
+                if not seg.active:
+                    continue
+                anchor = int(seg.anchor_frame)
+                base_name = (
+                    f"{stem}_f{anchor}_{cr.w}x{cr.h}"
+                    f"_{cr.id[:6]}_{seg.id[:4]}")
+                if is_image_sequence:
+                    out_path = os.path.join(target_dir, base_name)
+                else:
+                    out_path = os.path.join(target_dir, base_name + out_ext)
+                jobs.append({
+                    "clip_id": clip.id,
+                    "crop_id": cr.id,
+                    "crop": cr,
+                    "anchor_frame": anchor,
+                    "source_path": source.file_path,
+                    "source_fps": source.fps,
+                    "has_audio": bool(source.audio_channels > 0),
+                    "out_path": out_path,
+                    "out_ext": out_ext,
+                    "is_image_sequence": is_image_sequence,
+                    "image_ext": IMAGE_SEQUENCE_CODECS.get(codec, ".png"),
+                    "preset": preset,
+                })
         return jobs
 
     def _resolve_output_dir(self, output_mode: str, root_dir: str,
@@ -334,6 +340,7 @@ class CropExporter(QObject):
 
     def _run_job(self, job: dict, settings: dict):
         cr: CropRegion = job["crop"]
+        anchor: int = int(job["anchor_frame"])
         src_path: str = job["source_path"]
         src_fps: float = job["source_fps"]
         has_audio: bool = job["has_audio"]
@@ -342,7 +349,8 @@ class CropExporter(QObject):
 
         if is_image_sequence:
             ext = job.get("image_ext", ".png")
-            self._run_image_sequence_job(cr, src_path, src_fps, out_path, ext)
+            self._run_image_sequence_job(
+                cr, anchor, src_path, src_fps, out_path, ext)
             return
 
         preset: dict = job["preset"]
@@ -358,7 +366,7 @@ class CropExporter(QObject):
         if audio_mode == "none":
             # Single-pass video write — no audio track, no mux.
             cmd = self._build_video_cmd(
-                cr, src_path, src_fps, codec_args, out_path, is_hdr)
+                cr, anchor, src_path, src_fps, codec_args, out_path, is_hdr)
             self._run_pipeline([cmd])
             return
 
@@ -367,9 +375,9 @@ class CropExporter(QObject):
         temp_a = base + ".a.wav"
         cmds = [
             self._build_video_cmd(
-                cr, src_path, src_fps, codec_args, temp_v, is_hdr),
+                cr, anchor, src_path, src_fps, codec_args, temp_v, is_hdr),
             self._build_audio_cmd(
-                cr, src_path, src_fps, has_audio, temp_a),
+                cr, anchor, src_path, src_fps, has_audio, temp_a),
             self._build_mux_cmd(temp_v, temp_a, out_path),
         ]
         try:
@@ -388,8 +396,8 @@ class CropExporter(QObject):
                 except OSError:
                     pass
 
-    def _run_image_sequence_job(self, cr: CropRegion, src_path: str,
-                                src_fps: float, out_dir: str,
+    def _run_image_sequence_job(self, cr: CropRegion, anchor_frame: int,
+                                src_path: str, src_fps: float, out_dir: str,
                                 ext: str = ".png"):
         """Write 81 numbered image files (PNG/JPG/EXR) to ``out_dir``.
 
@@ -399,7 +407,7 @@ class CropExporter(QObject):
         PNG and OpenEXR are lossless; no quality knob applies."""
         os.makedirs(out_dir, exist_ok=True)
         is_hdr = self._is_hdr_source(src_path)
-        pre_ss, post_ss = self._two_stage_seek(cr.anchor_frame, src_fps)
+        pre_ss, post_ss = self._two_stage_seek(anchor_frame, src_fps)
         cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
         if is_hdr:
             cmd += self._gpu_hw_args()
@@ -411,7 +419,7 @@ class CropExporter(QObject):
         cmd += [
             "-an",
             "-vf", self._video_filter(
-                cr, is_hdr=is_hdr, include_setpts=False,
+                cr, anchor_frame, is_hdr=is_hdr, include_setpts=False,
                 src_fps=src_fps),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
@@ -427,7 +435,8 @@ class CropExporter(QObject):
     # --- Command builders --------------------------------------------
 
     @staticmethod
-    def _animated_crop_filter(cr: CropRegion, src_fps: float) -> str:
+    def _animated_crop_filter(cr: CropRegion, anchor_frame: int,
+                              src_fps: float) -> str:
         """Build a frame-dependent ``crop=`` filter element when any of
         the region's axis tracks has keyframes. Returns the static
         positional form when the region is fully un-animated.
@@ -446,7 +455,7 @@ class CropExporter(QObject):
         # Source-frame count to cover the 81-output-frame window. +2
         # frame slack so fps=16 has lookahead room on the last sample.
         n_src = required_source_frames(src_fps) + 2
-        anchor = int(cr.anchor_frame)
+        anchor = int(anchor_frame)
         xs, ys, ws, hs = [], [], [], []
         for k in range(n_src):
             x, y, w, h = cr.sample(anchor + k)
@@ -465,7 +474,8 @@ class CropExporter(QObject):
             f":y='{_piecewise_n_expr(ys)}'"
         )
 
-    def _video_filter(self, cr: CropRegion, is_hdr: bool = False,
+    def _video_filter(self, cr: CropRegion, anchor_frame: int,
+                      is_hdr: bool = False,
                       include_setpts: bool = True,
                       src_fps: float = 0.0) -> str:
         """Filter chain for the cropped 81-frame@16fps window.
@@ -510,7 +520,7 @@ class CropExporter(QObject):
             parts.append(
                 "setparams=color_primaries=bt709:"
                 "color_trc=bt709:colorspace=bt709")
-        parts.append(self._animated_crop_filter(cr, src_fps))
+        parts.append(self._animated_crop_filter(cr, anchor_frame, src_fps))
         parts.append(f"fps={OUTPUT_FPS}")
         if include_setpts:
             parts.append("setpts=PTS-STARTPTS")
@@ -536,10 +546,10 @@ class CropExporter(QObject):
         post_ss = max(0.0, ss - pre_ss)
         return pre_ss, post_ss
 
-    def _build_video_cmd(self, cr: CropRegion, src_path: str,
-                         src_fps: float, codec_args: list,
+    def _build_video_cmd(self, cr: CropRegion, anchor_frame: int,
+                         src_path: str, src_fps: float, codec_args: list,
                          out_file: str, is_hdr: bool = False) -> list:
-        pre_ss, post_ss = self._two_stage_seek(cr.anchor_frame, src_fps)
+        pre_ss, post_ss = self._two_stage_seek(anchor_frame, src_fps)
         cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
         if is_hdr:
             cmd += self._gpu_hw_args()
@@ -550,7 +560,8 @@ class CropExporter(QObject):
             cmd += ["-ss", f"{post_ss:.6f}"]
         cmd += [
             "-an",
-            "-vf", self._video_filter(cr, is_hdr=is_hdr, src_fps=src_fps),
+            "-vf", self._video_filter(
+                cr, anchor_frame, is_hdr=is_hdr, src_fps=src_fps),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
             "-video_track_timescale", "24000000",
@@ -604,8 +615,8 @@ class CropExporter(QObject):
             self._hdr_cache[src_path] = result
         return result
 
-    def _build_audio_cmd(self, cr: CropRegion, src_path: str,
-                         src_fps: float, has_audio: bool,
+    def _build_audio_cmd(self, cr: CropRegion, anchor_frame: int,
+                         src_path: str, src_fps: float, has_audio: bool,
                          out_wav: str) -> list:
         """Single-stage seek + sample-precise atrim.
 
@@ -618,7 +629,7 @@ class CropExporter(QObject):
         n_samples = exact_audio_samples_81_at_16(48000)
         cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
         if has_audio:
-            ss = Exporter._frame_to_seek_ts(cr.anchor_frame, src_fps)
+            ss = Exporter._frame_to_seek_ts(anchor_frame, src_fps)
             if ss > 0:
                 cmd += ["-ss", f"{ss:.6f}"]
             cmd += [
