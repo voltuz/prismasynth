@@ -411,6 +411,15 @@ def section_keyframes() -> SectionResult:
     v_mid = bz.sample(5)
     check(0.0 <= v_mid <= 100.0,
           f"bezier sample stays in segment range (got {v_mid:.2f})")
+    # In-handle of the RIGHT key must shape the segment even when the
+    # LEFT key is linear (a segment is bezier if either endpoint is).
+    inh = KeyframeTrack()
+    inh.set_key(0, 0.0, INTERP_LINEAR)
+    inh.set_key(10, 100.0, INTERP_BEZIER)
+    inh.find_key(10).in_handle = (-8.0, 0.0)  # flat approach into the key
+    check(abs(inh.sample(5) - 50.0) > 1.0,
+          f"right-key in_handle bends a linear-left segment "
+          f"(got {inh.sample(5):.2f}, linear would be 50)")
 
     # --- CropRegion.sample + is_animated ---
     cr = CropRegion(x=50, y=60, w=200, h=100)

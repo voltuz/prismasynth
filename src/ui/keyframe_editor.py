@@ -78,6 +78,9 @@ class KeyframeGraph(QWidget):
 
     # Emitted when the user drags the playhead marker.
     playhead_scrub_requested = Signal(int)  # source_frame
+    # Emitted on every live drag mutation so the owner can repaint the
+    # crop overlay in real time (without a heavy clips_changed rebuild).
+    live_edit_changed = Signal()
 
     def __init__(self, timeline: TimelineModel, parent=None):
         super().__init__(parent)
@@ -97,18 +100,22 @@ class KeyframeGraph(QWidget):
         # Playhead in source-frame space.
         self._playhead: int = -1
         # Drag state.
-        self._drag_kind: str = ""  # "" | "key" | "handle_in" | "handle_out" | "pan" | "scrub"
+        self._drag_kind: str = ""  # "" | "key" | "handle" | "pan" | "scrub"
         self._drag_origin_widget: QPoint = QPoint()
-        # For key drag: (axis, src_frame, value) for each selected key
-        # captured at drag start so we can recover on cancel and so the
-        # final commit uses the original source frame as the move key.
-        self._drag_keys_start: List[Tuple[str, int, float]] = []
-        # Per-key live override during drag: (axis, src_frame) → (new_src, new_val)
-        # Visible only in paint; committed in mouseReleaseEvent.
-        self._drag_live: Dict[Tuple[str, int], Tuple[int, float]] = {}
-        # For handle drag: (axis, src_frame, "in"|"out", start_handle_value)
-        self._drag_handle_target: Optional[Tuple[str, int, str, Tuple[float, float]]] = None
-        self._drag_handle_live: Optional[Tuple[float, float]] = None
+        # Live drag: we mutate the model keyframes directly so the curve
+        # and the preview crop update in real time, holding the actual
+        # Keyframe object refs (valid because no clips_changed/snapshot
+        # fires mid-drag). One undo snapshot per drag, pushed lazily on
+        # the first effective change.
+        # Each entry: (axis, track, key_obj, start_frame, start_value).
+        self._drag_keys: List[tuple] = []
+        # Per-axis value-units-per-pixel captured at drag start so the
+        # vertical mapping stays linear even though the keys (and thus
+        # the track value range) mutate live during the drag.
+        self._drag_value_per_px: Dict[str, float] = {}
+        # (axis, track, key_obj, side, start_in, start_out)
+        self._drag_handle: Optional[tuple] = None
+        self._drag_pushed_undo: bool = False
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
         self.setMinimumWidth(360)
@@ -389,16 +396,10 @@ class KeyframeGraph(QWidget):
 
     def _paint_key_dot(self, painter: QPainter, cr: CropRegion,
                        axis: str, k: Keyframe, color: QColor):
-        # Use the live drag override when this exact key is being
-        # dragged — so the dot follows the cursor rather than jumping
-        # back to its (now-stale) source frame.
-        live = self._drag_live.get((axis, k.source_frame))
-        if live is not None:
-            sf, val = live
-        else:
-            sf, val = k.source_frame, k.value
-        x = self._frame_to_px(sf)
-        y = self._value_to_px(cr, axis, val)
+        # Drags mutate the model key directly, so reading source_frame /
+        # value here already reflects an in-progress edit.
+        x = self._frame_to_px(k.source_frame)
+        y = self._value_to_px(cr, axis, k.value)
         selected = (axis, k.source_frame) in self._selection
         if selected:
             painter.setPen(QPen(QColor("#ffffff"), 2))
@@ -416,18 +417,12 @@ class KeyframeGraph(QWidget):
                        axis: str, k: Keyframe, color: QColor,
                        x: float, y: float):
         # Convert the handle's (frame, value) offsets to pixel-space.
+        # Drags mutate k.in_handle / k.out_handle live, so reading them
+        # straight from the model already reflects an in-progress edit.
         dx_in = k.in_handle[0]
         dy_in = k.in_handle[1]
         dx_out = k.out_handle[0]
         dy_out = k.out_handle[1]
-        # Live override.
-        if self._drag_handle_target is not None:
-            ax, sf, side, _ = self._drag_handle_target
-            if ax == axis and sf == k.source_frame and self._drag_handle_live:
-                if side == "in":
-                    dx_in, dy_in = self._drag_handle_live
-                else:
-                    dx_out, dy_out = self._drag_handle_live
         # Each handle is offset in (frame, value) space — convert via
         # the per-track Y range so the handle pixel offset isn't tied
         # to value magnitude.
@@ -552,12 +547,12 @@ class KeyframeGraph(QWidget):
                 axis, sf, side = hh
                 cr = self._current_crop()
                 if cr is not None:
-                    k = self._track_for(cr, axis).find_key(sf)
+                    track = self._track_for(cr, axis)
+                    k = track.find_key(sf)
                     if k is not None:
-                        start = (k.in_handle if side == "in"
-                                 else k.out_handle)
-                        self._drag_handle_target = (axis, sf, side, start)
-                        self._drag_handle_live = start
+                        self._drag_handle = (axis, track, k, side,
+                                             k.in_handle, k.out_handle)
+                        self._drag_pushed_undo = False
                         self._drag_kind = "handle"
                         self._drag_origin_widget = pt
                         event.accept()
@@ -631,10 +626,9 @@ class KeyframeGraph(QWidget):
             self._commit_handle_drag()
         self._drag_kind = ""
         self._drag_origin_widget = QPoint()
-        self._drag_handle_target = None
-        self._drag_handle_live = None
-        self._drag_keys_start = []
-        self._drag_live = {}
+        self._drag_handle = None
+        self._drag_keys = []
+        self._drag_pushed_undo = False
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event):
@@ -681,114 +675,143 @@ class KeyframeGraph(QWidget):
             return
         self._drag_kind = "key"
         self._drag_origin_widget = pt
-        self._drag_keys_start = []
+        self._drag_pushed_undo = False
+        # Hold the actual Keyframe objects so the live mutation tracks
+        # them as their source_frame changes (no lookup-by-frame).
+        self._drag_keys = []
+        r = self._plot_rect()
+        self._drag_value_per_px = {}
         for axis, sf in self._selection:
-            k = self._track_for(cr, axis).find_key(sf)
+            track = self._track_for(cr, axis)
+            k = track.find_key(sf)
             if k is None:
                 continue
-            self._drag_keys_start.append((axis, sf, k.value))
+            self._drag_keys.append((axis, track, k, sf, k.value))
+            if axis not in self._drag_value_per_px:
+                lo, hi = self._track_value_range(cr, axis)
+                self._drag_value_per_px[axis] = (
+                    (hi - lo) / max(1, r.height()))
 
     def _do_key_drag(self, pt: QPoint):
+        if not self._drag_keys:
+            return
         cr = self._current_crop()
         if cr is None:
-            return
-        # X delta in frames.
-        dx_px = pt.x() - self._drag_origin_widget.x()
-        r = self._plot_rect()
-        if r.width() <= 0:
-            return
-        d_frame = dx_px / r.width() * (self._x_max - self._x_min)
-        # Y delta is per-track because each track has its own scale.
-        new_live: Dict[Tuple[str, int], Tuple[int, float]] = {}
-        dy_px = pt.y() - self._drag_origin_widget.y()
-        for axis, sf, v0 in self._drag_keys_start:
-            lo, hi = self._track_value_range(cr, axis)
-            value_per_px = (hi - lo) / max(1, r.height())
-            new_val = v0 - dy_px * value_per_px  # Y is flipped
-            new_sf = int(round(sf + d_frame))
-            new_live[(axis, sf)] = (new_sf, new_val)
-        self._drag_live = new_live
-        self.update()
-
-    def _commit_key_drag(self):
-        if not self._drag_keys_start:
-            return
-        # Build the per-axis move plan. We push undo once via a manual
-        # snapshot then mutate keys without re-snapshotting per call.
-        new_sel: List[Tuple[str, int]] = []
-        any_change = False
-        for axis, sf, _v0 in self._drag_keys_start:
-            live = self._drag_live.get((axis, sf))
-            if live is None:
-                new_sel.append((axis, sf))
-                continue
-            new_sf, new_val = live
-            if new_sf != sf or not _values_equal(new_val, _v0):
-                any_change = True
-            ok = self._timeline.move_crop_keyframe(
-                self._clip_id, self._crop_id, axis, sf, new_sf, new_val)
-            new_sel.append((axis, new_sf if ok else sf))
-        self._selection = new_sel
-        # Multiple move_crop_keyframe calls each push their own undo
-        # snapshot. That's noisy for a multi-key drag but the only way
-        # to ride the existing undo plumbing without leaking abstraction
-        # — single-key drags (the common case) are exactly one entry.
-        if any_change:
-            self.update()
-
-    def _do_handle_drag(self, pt: QPoint):
-        cr = self._current_crop()
-        if cr is None or self._drag_handle_target is None:
-            return
-        axis, sf, side, start = self._drag_handle_target
-        k = self._track_for(cr, axis).find_key(sf)
-        if k is None:
             return
         r = self._plot_rect()
         if r.width() <= 0 or r.height() <= 0:
             return
-        # Convert the handle's pixel position back to (frame_offset,
-        # value_offset) relative to the key.
-        d_frame = self._px_to_frame(pt.x()) - sf
-        # In handles must have negative dx (point backward in time);
-        # out handles positive. Clamp so handles don't cross the key.
-        if side == "in" and d_frame > 0:
-            d_frame = 0.0
-        if side == "out" and d_frame < 0:
-            d_frame = 0.0
-        v_at_pt = self._px_to_value(cr, axis, pt.y())
-        d_val = v_at_pt - k.value
-        self._drag_handle_live = (d_frame, d_val)
+        d_frame = ((pt.x() - self._drag_origin_widget.x())
+                   / r.width() * (self._x_max - self._x_min))
+        dy_px = pt.y() - self._drag_origin_widget.y()
+        self._ensure_drag_undo()
+        new_sel: List[Tuple[str, int]] = []
+        touched_tracks = []
+        for axis, track, k, sf0, v0 in self._drag_keys:
+            value_per_px = self._drag_value_per_px.get(axis, 1.0)
+            k.source_frame = max(0, int(round(sf0 + d_frame)))
+            k.value = v0 - dy_px * value_per_px  # Y is flipped
+            new_sel.append((axis, k.source_frame))
+            if track not in touched_tracks:
+                touched_tracks.append(track)
+        # Keep each track sorted so sample()/curve rendering stay valid.
+        for track in touched_tracks:
+            track.keys.sort(key=lambda kf: kf.source_frame)
+        self._selection = new_sel
         self.update()
+        self.live_edit_changed.emit()
 
-    def _commit_handle_drag(self):
-        if (self._drag_handle_target is None
-                or self._drag_handle_live is None):
+    def _commit_key_drag(self):
+        if not self._drag_keys or not self._drag_pushed_undo:
             return
-        axis, sf, side, _start = self._drag_handle_target
+        # Resolve any frame collisions left by the drag: one key per
+        # frame, the dragged key winning. Identity by id() because
+        # Keyframe is an unhashable dataclass.
+        per_track = {}
+        for _axis, track, k, _sf0, _v0 in self._drag_keys:
+            per_track.setdefault(id(track), [track, set()])[1].add(id(k))
+        for track, dragged_ids in per_track.values():
+            seen = {}
+            for kf in track.keys:           # non-dragged first
+                if id(kf) not in dragged_ids:
+                    seen[kf.source_frame] = kf
+            for kf in track.keys:           # dragged win on collision
+                if id(kf) in dragged_ids:
+                    seen[kf.source_frame] = kf
+            track.keys = sorted(seen.values(),
+                                key=lambda kf: kf.source_frame)
+        self._selection = [(axis, k.source_frame)
+                           for axis, _t, k, _s, _v in self._drag_keys]
+        self._timeline.clips_changed.emit()
+
+    def _do_handle_drag(self, pt: QPoint):
+        if self._drag_handle is None:
+            return
         cr = self._current_crop()
         if cr is None:
             return
-        k = self._track_for(cr, axis).find_key(sf)
-        if k is None:
-            return
-        in_handle = k.in_handle
-        out_handle = k.out_handle
+        axis, _track, k, side, start_in, start_out = self._drag_handle
+        # Work in pixel space so the two handles read as one straight
+        # line on screen (frames vs value have different pixel scales).
+        kx = self._frame_to_px(k.source_frame)
+        ky = self._value_to_px(cr, axis, k.value)
+        dpx = pt.x() - kx
+        dpy = pt.y() - ky
+        # Clamp the dragged handle to its side (in points back in time,
+        # out points forward) so the curve's x stays monotonic.
+        if side == "in" and dpx > 0:
+            dpx = 0.0
+        if side == "out" and dpx < 0:
+            dpx = 0.0
+
+        def _px_to_handle(px: float, py: float):
+            return (self._px_to_frame(kx + px) - k.source_frame,
+                    self._px_to_value(cr, axis, ky + py) - k.value)
+
+        self._ensure_drag_undo()
+        dragged = _px_to_handle(dpx, dpy)
+        # Opposite handle: keep its captured start length, rotate to the
+        # exact opposite screen direction (linked "smooth" handle).
+        opp_start = start_in if side == "out" else start_out
+        opp_px0 = self._frame_to_px(k.source_frame + opp_start[0]) - kx
+        opp_py0 = self._value_to_px(cr, axis, k.value + opp_start[1]) - ky
+        opp_len = math.hypot(opp_px0, opp_py0)
+        drag_len = math.hypot(dpx, dpy)
+        opposite = None
+        if opp_len > 1e-6 and drag_len > 1e-6:
+            ux, uy = -dpx / drag_len, -dpy / drag_len
+            opposite = _px_to_handle(ux * opp_len, uy * opp_len)
+
         if side == "in":
-            in_handle = self._drag_handle_live
+            k.in_handle = dragged
+            if opposite is not None:
+                k.out_handle = opposite
         else:
-            out_handle = self._drag_handle_live
-        self._timeline.set_crop_keyframe_interp(
-            self._clip_id, self._crop_id, axis, sf,
-            INTERP_BEZIER, in_handle, out_handle)
+            k.out_handle = dragged
+            if opposite is not None:
+                k.in_handle = opposite
+        k.interp = INTERP_BEZIER
         self.update()
+        self.live_edit_changed.emit()
+
+    def _commit_handle_drag(self):
+        if self._drag_handle is None or not self._drag_pushed_undo:
+            return
+        self._timeline.clips_changed.emit()
+
+    def _ensure_drag_undo(self):
+        """Push exactly one undo snapshot per drag, lazily on the first
+        effective change (so a pure click that starts no real edit
+        doesn't pollute the undo stack)."""
+        if not self._drag_pushed_undo:
+            self._timeline._push_undo()  # noqa: SLF001 — intentional
+            self._drag_pushed_undo = True
 
     def _cancel_drag(self):
         self._drag_kind = ""
-        self._drag_keys_start = []
-        self._drag_live = {}
-        self._drag_handle_target = None
-        self._drag_handle_live = None
+        self._drag_keys = []
+        self._drag_handle = None
+        self._drag_pushed_undo = False
 
     # --- Add / interp / delete -----------------------------------------
 
@@ -868,10 +891,6 @@ class KeyframeGraph(QWidget):
         self.update()
 
 
-def _values_equal(a: float, b: float, eps: float = 1e-6) -> bool:
-    return abs(a - b) <= eps
-
-
 class KeyframeEditorDock(QDockWidget):
     """Top-level dock that wraps ``KeyframeGraph`` plus a small toolbar.
 
@@ -881,6 +900,7 @@ class KeyframeEditorDock(QDockWidget):
     "Edit curves…" signal."""
 
     playhead_scrub_requested = Signal(int)
+    live_edit_changed = Signal()
 
     def __init__(self, timeline: TimelineModel, parent=None):
         super().__init__("Keyframe Editor", parent)
@@ -911,7 +931,7 @@ class KeyframeEditorDock(QDockWidget):
             box.setChecked(True)
             box.setStyleSheet(
                 f"QCheckBox {{ color: {_TRACK_COLORS[axis][0]};"
-                " font-weight: bold; }}")
+                " font-weight: bold; }")
             box.toggled.connect(
                 lambda checked, a=axis:
                 self._graph.set_track_visible(a, checked))
@@ -927,6 +947,7 @@ class KeyframeEditorDock(QDockWidget):
         self._graph = KeyframeGraph(timeline, container)
         self._graph.playhead_scrub_requested.connect(
             self.playhead_scrub_requested)
+        self._graph.live_edit_changed.connect(self.live_edit_changed)
         layout.addWidget(self._graph, 1)
 
         self.setWidget(container)

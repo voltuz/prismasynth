@@ -503,6 +503,11 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.RightDockWidgetArea, self._keyframe_dock)
         self._keyframe_dock.playhead_scrub_requested.connect(
             self._on_keyframe_dock_scrub)
+        # Live keyframe edits → repaint the crop overlay in real time.
+        # The overlay holds the same CropRegion objects the graph mutates
+        # and re-samples at the playhead frame, so a repaint is enough.
+        self._keyframe_dock.live_edit_changed.connect(
+            self._preview.crop_overlay.request_repaint)
 
         # Media Panel signals
         self._media_panel.source_double_clicked.connect(self._on_source_double_clicked)

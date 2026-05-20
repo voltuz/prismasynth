@@ -233,7 +233,13 @@ def _interpolate_pair(a: Keyframe, b: Keyframe, t: float) -> float:
 
     if a.interp == INTERP_STEP:
         return a.value
-    if a.interp == INTERP_BEZIER:
+    # A segment is bezier if EITHER endpoint is bezier: the left key's
+    # out_handle and the right key's in_handle each shape their own side.
+    # (Driving this off the left key alone meant a key's in_handle did
+    # nothing whenever its previous neighbour was linear.) A non-bezier
+    # endpoint has zero handles, so its control point sits on the key —
+    # no pull from that side.
+    if a.interp == INTERP_BEZIER or b.interp == INTERP_BEZIER:
         return _bezier_sample(a, b, t)
     # Linear default.
     return a.value + (b.value - a.value) * u
