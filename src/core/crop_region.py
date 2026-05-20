@@ -168,18 +168,31 @@ class CropRegion:
         """Return interpolated (x, y, w, h) at the given source frame.
 
         Empty tracks fall back to the region's static base value. The
-        result is always int-cast so callers (overlay rendering,
-        exporter expression builder) get pixel-aligned output."""
+        result is always int-cast so callers (overlay rendering, exporter
+        per-frame geometry) get pixel-aligned output.
+
+        When an aspect-ratio lock is active, the lock is **authoritative**:
+        height is derived from width so the sampled rectangle always has
+        the locked ratio, regardless of any drift between the w/h keyframe
+        tracks (e.g. tracks edited while the crop was "free", then locked,
+        or the W/H curves edited independently in the graph editor). This
+        is non-destructive — the stored tracks are untouched, so switching
+        the lock back to "free" restores the original animation. Because
+        every consumer (preview, export, segment_aspect_constant,
+        crop_output_dims) goes through sample(), they all stay consistent.
+        """
         sx = self.x_track.sample(source_frame)
         sy = self.y_track.sample(source_frame)
         sw = self.w_track.sample(source_frame)
         sh = self.h_track.sample(source_frame)
-        return (
-            int(round(self.x if sx is None else sx)),
-            int(round(self.y if sy is None else sy)),
-            int(round(self.w if sw is None else sw)),
-            int(round(self.h if sh is None else sh)),
-        )
+        x = self.x if sx is None else sx
+        y = self.y if sy is None else sy
+        w = self.w if sw is None else sw
+        h = self.h if sh is None else sh
+        ar = resolve_aspect(self)
+        if ar is not None and ar[0] > 0 and ar[1] > 0:
+            h = w * ar[1] / ar[0]  # width drives height; lock wins
+        return (int(round(x)), int(round(y)), int(round(w)), int(round(h)))
 
     # --- Serialization ---------------------------------------------
 

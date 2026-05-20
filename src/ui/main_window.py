@@ -34,7 +34,7 @@ from ui.preview_widget import PreviewWidget
 from ui.timeline_widget import TimelineWidget, EditMode
 from ui.toolbar import MainToolbar
 from ui.clip_info_panel import ClipInfoPanel
-from ui.keyframe_editor import KeyframeEditorDock
+from ui.keyframe_editor import KeyframeEditorWindow
 from ui.people_panel import PeoplePanel
 from ui.media_panel import MediaPanel
 from ui.source_info_dialog import SourceInfoDialog
@@ -492,21 +492,17 @@ class MainWindow(QMainWindow):
         self._clip_info.crop_segment_selected.connect(
             self._on_crop_segment_selected_in_panel)
 
-        # Keyframe editor dock — created hidden+floating so it pops as
-        # a standalone window the first time the user opens it. Kept
-        # around for the session so its size/position persist while
-        # the app is running.
-        self._keyframe_dock = KeyframeEditorDock(self._timeline, self)
-        self._keyframe_dock.setFloating(True)
-        self._keyframe_dock.hide()
-        self.addDockWidget(
-            Qt.DockWidgetArea.RightDockWidgetArea, self._keyframe_dock)
-        self._keyframe_dock.playhead_scrub_requested.connect(
+        # Keyframe editor — a standalone top-level window kept hidden
+        # until the user opens it (via the clip panel's "Edit curves…").
+        # Held for the session; its geometry persists via QSettings.
+        self._keyframe_window = KeyframeEditorWindow(self._timeline)
+        self._keyframe_window.hide()
+        self._keyframe_window.playhead_scrub_requested.connect(
             self._on_keyframe_dock_scrub)
         # Live keyframe edits → repaint the crop overlay in real time.
         # The overlay holds the same CropRegion objects the graph mutates
         # and re-samples at the playhead frame, so a repaint is enough.
-        self._keyframe_dock.live_edit_changed.connect(
+        self._keyframe_window.live_edit_changed.connect(
             self._preview.crop_overlay.request_repaint)
 
         # Media Panel signals
@@ -1005,8 +1001,8 @@ class MainWindow(QMainWindow):
             "Show / hide the crop-region keyframe graph editor")
         keyframe_editor_action.toggled.connect(
             self._on_keyframe_editor_toggled)
-        # Keep the menu check state in sync when the user closes the dock.
-        self._keyframe_dock.visibilityChanged.connect(
+        # Keep the menu check state in sync when the window is shown/hidden.
+        self._keyframe_window.visibility_changed.connect(
             keyframe_editor_action.setChecked)
         view_menu.addAction(keyframe_editor_action)
 
@@ -2397,11 +2393,11 @@ class MainWindow(QMainWindow):
 
     def _on_keyframe_editor_toggled(self, checked: bool):
         if checked:
-            if not self._keyframe_dock.isVisible():
-                self._keyframe_dock.show()
-            self._keyframe_dock.raise_()
+            if not self._keyframe_window.isVisible():
+                self._keyframe_window.show()
+            self._keyframe_window.raise_()
         else:
-            self._keyframe_dock.hide()
+            self._keyframe_window.hide()
 
     def _on_keyframe_dock_scrub(self, source_frame: int):
         """User dragged the playhead inside the keyframe editor. Map
@@ -2410,7 +2406,7 @@ class MainWindow(QMainWindow):
         dock holds its own active-clip reference so this works even
         when the user opened the editor but hasn't entered Edit-crops
         mode."""
-        clip_id = self._keyframe_dock.current_clip_id()
+        clip_id = self._keyframe_window.current_clip_id()
         if not clip_id:
             return
         clip = self._timeline.get_clip_by_id(clip_id)
@@ -2445,14 +2441,14 @@ class MainWindow(QMainWindow):
                 if cr.id == crop_id:
                     crop_label = cr.label or f"Crop {cr.id[:6]}"
                     break
-        self._keyframe_dock.show_for_crop(
+        self._keyframe_window.show_for_crop(
             clip_id, crop_id, crop_label, src_fps)
         # Sync the dock's playhead marker right away.
         playhead_tl = self._timeline_widget.strip.playhead_frame
         result = self._timeline.timeline_frame_to_source_frame(playhead_tl)
         if result is not None:
             _c, sf = result
-            self._keyframe_dock.set_playhead(int(sf))
+            self._keyframe_window.set_playhead(int(sf))
 
     def _on_crop_delete_requested(self, crop_id: str):
         clip_id = self._crop_edit_clip_id
@@ -2522,12 +2518,12 @@ class MainWindow(QMainWindow):
             # stale source frame. The keyframe editor hides its
             # playhead marker via the same sentinel.
             self._preview.crop_overlay.set_current_source_frame(-1)
-            self._keyframe_dock.set_playhead(-1)
+            self._keyframe_window.set_playhead(-1)
             return
         _clip, source_frame = result
         self._clip_info.set_playhead_source_frame(source_frame)
         self._preview.crop_overlay.set_current_source_frame(source_frame)
-        self._keyframe_dock.set_playhead(source_frame)
+        self._keyframe_window.set_playhead(source_frame)
 
     def _current_playhead_source_frame(self, clip) -> int:
         """Map the playhead to a source frame inside ``clip``. Clamps to

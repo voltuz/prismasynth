@@ -639,9 +639,20 @@ class TimelineModel(QObject):
         self._push_undo()
         new_vals = {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
         if cr.is_animated():
+            # Autokey only the group(s) this drag actually changed, vs the
+            # geometry currently sampled at this frame. A pure move writes
+            # x/y keys and leaves the size animation untouched; a pure
+            # resize writes w/h keys and leaves position untouched. Empty
+            # tracks still stay static (single-axis animations stay
+            # expressible).
+            ox, oy, ow, oh = cr.sample(int(source_frame))
+            pos_changed = (new_vals["x"] != ox) or (new_vals["y"] != oy)
+            size_changed = (new_vals["w"] != ow) or (new_vals["h"] != oh)
+            changed = {"x": pos_changed, "y": pos_changed,
+                       "w": size_changed, "h": size_changed}
             for axis, val in new_vals.items():
                 track = cr.track_for(axis)
-                if not track:
+                if not track or not changed[axis]:
                     continue
                 track.set_key(int(source_frame), float(val))
         # Always refresh the static base — when the region is animated

@@ -477,6 +477,34 @@ def section_keyframes() -> SectionResult:
     check(cr_live.x == 50 and cr_live.y == 60,
           "set_crop_keyframes_at also refreshes static base values")
 
+    # set_crop_keyframes_at autokeys ONLY the group the drag changed:
+    # a move writes position keys (size untouched); a resize writes size
+    # keys (position untouched).
+    tlk = TimelineModel()
+    tlk.clear(); tlk.clear_undo()
+    clipk = Clip(source_id="src", source_in=0, source_out=199)
+    tlk.add_clips([clipk], assign_colors=False)
+    crk = CropRegion(x=100, y=100, w=200, h=200)
+    tlk.add_crop_region(clipk.id, crk)
+    for grp in ("position", "size"):
+        tlk.toggle_crop_keyframe(clipk.id, crk.id, grp, 0)
+        tlk.toggle_crop_keyframe(clipk.id, crk.id, grp, 100)
+    # Move at frame 50: change x/y, keep w/h at the sampled value.
+    sx, sy, sw, sh = crk.sample(50)
+    tlk.set_crop_keyframes_at(clipk.id, crk.id, 50, sx + 30, sy + 40, sw, sh)
+    check(crk.x_track.has_key_at(50) and crk.y_track.has_key_at(50)
+          and not crk.w_track.has_key_at(50)
+          and not crk.h_track.has_key_at(50),
+          "move autokeys position only (size untouched)")
+    # Resize at frame 70: change w/h, keep x/y at the sampled value.
+    sx2, sy2, sw2, sh2 = crk.sample(70)
+    tlk.set_crop_keyframes_at(
+        clipk.id, crk.id, 70, sx2, sy2, sw2 + 50, sh2 + 50)
+    check(crk.w_track.has_key_at(70) and crk.h_track.has_key_at(70)
+          and not crk.x_track.has_key_at(70)
+          and not crk.y_track.has_key_at(70),
+          "resize autokeys size only (position untouched)")
+
     # delete / move / interp setters.
     moved = tl.move_crop_keyframe(
         clip.id, cr_live.id, "w", 10, 12, 250.0)
@@ -661,6 +689,37 @@ def section_keyframes() -> SectionResult:
     check(crop_output_dims(CropRegion(x=0, y=0, w=1991, h=1991), 0, 513)
           == (512, 512),
           "crop_output_dims rounds to even dimensions")
+
+    # --- Aspect-ratio lock is authoritative at sample time ---
+    # Divergent w/h tracks (width animates, height static) under a 1:1
+    # lock must still sample to a square and count as constant — the lock
+    # overrides the drifted tracks (non-destructive).
+    locked = CropRegion(x=0, y=0, w=400, h=400, aspect_ratio="1:1")
+    locked.w_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 800}]})
+    locked.h_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 400}]})
+    sw0, sh0 = locked.sample(0)[2:]
+    sw1, sh1 = locked.sample(100)[2:]
+    check(sw0 == sh0 and sw1 == sh1,
+          "locked 1:1 crop samples to a square despite drifted h_track")
+    check(segment_aspect_constant(locked, 0, 24.0) is True,
+          "locked 1:1 crop is exportable despite drifted tracks")
+
+    # Same drift WITHOUT a lock ("free") must still be detected as a
+    # shape change (no regression to the measured-drift path).
+    freecr = CropRegion(x=0, y=0, w=400, h=400, aspect_ratio="free")
+    freecr.w_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 800}]})
+    freecr.h_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 400}]})
+    check(segment_aspect_constant(freecr, 0, 24.0) is False,
+          "free-aspect divergent crop is still blocked (drift detection)")
+
+    # A locked 16:9 crop derives height from width.
+    locked169 = CropRegion(x=0, y=0, w=1920, h=999, aspect_ratio="16:9")
+    check(locked169.sample(0) == (0, 0, 1920, 1080),
+          "locked 16:9 crop derives height from width at sample time")
 
     # --- Export segments ---
     from core.crop_region import Segment

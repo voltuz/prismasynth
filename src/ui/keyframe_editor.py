@@ -1,7 +1,7 @@
-"""Detachable graph editor for animating CropRegion keyframes.
+"""Standalone graph editor for animating CropRegion keyframes.
 
-Hosted as a ``QDockWidget`` on MainWindow but defaults to floating so it
-opens as a standalone window (and can be parked on a second monitor).
+A top-level ``QWidget`` window (``KeyframeEditorWindow``) with the normal
+minimize/maximize/close buttons; its geometry persists across sessions.
 The inner ``KeyframeGraph`` widget is a custom-painted Cartesian graph
 that visualises and edits the four axis tracks (``x``, ``y``, ``w``,
 ``h``) of one CropRegion at a time.
@@ -15,8 +15,10 @@ Interaction model:
 - Bezier handle dots appear next to bezier-interp keys and can be
   dragged to shape the tangent.
 - Wheel zooms the X axis; middle-mouse pans.
-- A vertical playhead line follows the main timeline's playhead in
-  source-frame space.
+- A playhead line follows the main timeline in source-frame space; drag
+  the triangle on the top frame-number strip (or click anywhere on that
+  strip) to scrub. The plot area never grabs the playhead, so editing
+  keyframes can't move it by accident.
 
 All mutations route through ``TimelineModel`` so the global undo stack
 covers every keyframe edit. Drag operations only commit on release so a
@@ -28,12 +30,12 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSettings, Qt, Signal
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QFont, QPainter, QPen, QPolygon,
+    QAction, QBrush, QColor, QPainter, QPen, QPolygon,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QDockWidget, QHBoxLayout, QLabel, QMenu, QPushButton,
+    QCheckBox, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollBar,
     QVBoxLayout, QWidget,
 )
 
@@ -42,14 +44,15 @@ from core.keyframe import (
     INTERP_BEZIER, INTERP_LINEAR, INTERP_STEP, Keyframe, KeyframeTrack,
 )
 from core.timeline import TimelineModel
+from core.ui_scale import ui_scale
 
 
 # Track display config: axis-name → (color, display label).
 _TRACK_COLORS: Dict[str, Tuple[str, str]] = {
-    "x": ("#e8525c", "X"),
-    "y": ("#5fc66a", "Y"),
-    "w": ("#5dc9e0", "W"),
-    "h": ("#e8c247", "H"),
+    "x": ("#e8525c", "Pos X"),
+    "y": ("#5fc66a", "Pos Y"),
+    "w": ("#5dc9e0", "Width"),
+    "h": ("#e8c247", "Height"),
 }
 _AXES = ("x", "y", "w", "h")
 
@@ -59,6 +62,7 @@ _HANDLE_RADIUS = 3
 _HANDLE_REACH_PX = 40.0   # default handle length in pixels at zoom 1
 _MARGIN_X = 40
 _MARGIN_Y = 16
+_RULER_H = 18             # frame-number / playhead-triangle strip at top
 _BG_COLOR = QColor("#1c1c1c")
 _GRID_COLOR = QColor("#2c2c2c")
 _AXIS_COLOR = QColor("#444444")
@@ -81,6 +85,9 @@ class KeyframeGraph(QWidget):
     # Emitted on every live drag mutation so the owner can repaint the
     # crop overlay in real time (without a heavy clips_changed rebuild).
     live_edit_changed = Signal()
+    # Emitted whenever the visible X (frame) range changes — drives the
+    # owner window's bottom scrollbar.
+    view_changed = Signal()
 
     def __init__(self, timeline: TimelineModel, parent=None):
         super().__init__(parent)
@@ -100,8 +107,12 @@ class KeyframeGraph(QWidget):
         # Playhead in source-frame space.
         self._playhead: int = -1
         # Drag state.
-        self._drag_kind: str = ""  # "" | "key" | "handle" | "pan" | "scrub"
+        self._drag_kind: str = ""  # ""|"key"|"handle"|"pan"|"scrub"|"rubber"
         self._drag_origin_widget: QPoint = QPoint()
+        # Rubber-band (box) selection state.
+        self._rubber_origin: Optional[QPoint] = None
+        self._rubber_now: Optional[QPoint] = None
+        self._rubber_additive: bool = False
         # Live drag: we mutate the model keyframes directly so the curve
         # and the preview crop update in real time, holding the actual
         # Keyframe object refs (valid because no clips_changed/snapshot
@@ -136,6 +147,7 @@ class KeyframeGraph(QWidget):
         self._cancel_drag()
         self._fit_x_axis()
         self.update()
+        self.view_changed.emit()
 
     def set_track_visible(self, axis: str, visible: bool):
         if axis not in _AXES:
@@ -152,6 +164,30 @@ class KeyframeGraph(QWidget):
     def fit_x_axis(self):
         self._fit_x_axis()
         self.update()
+        self.view_changed.emit()
+
+    # --- Scrollbar integration -----------------------------------------
+
+    def content_range(self) -> Tuple[float, float]:
+        """Full scrollable X span — the clip's source-frame range (matches
+        the Fit button), falling back to the current view."""
+        if self._clip_id:
+            clip = self._timeline.get_clip_by_id(self._clip_id)
+            if clip is not None and not clip.is_gap:
+                return (float(clip.source_in), float(clip.source_out + 1))
+        return (self._x_min, self._x_max)
+
+    def view_range(self) -> Tuple[float, float]:
+        return (self._x_min, self._x_max)
+
+    def set_view_min(self, x_min: float):
+        """Shift the visible window to start at ``x_min``, keeping its
+        width (called by the owner's scrollbar)."""
+        width = self._x_max - self._x_min
+        self._x_min = float(x_min)
+        self._x_max = self._x_min + width
+        self.update()
+        self.view_changed.emit()
 
     # --- Crop / track lookup --------------------------------------------
 
@@ -215,9 +251,17 @@ class KeyframeGraph(QWidget):
     # --- Coordinate mapping ---------------------------------------------
 
     def _plot_rect(self) -> QRect:
-        return QRect(_MARGIN_X, _MARGIN_Y,
+        top = _RULER_H + 6
+        return QRect(_MARGIN_X, top,
                      max(1, self.width() - _MARGIN_X - 6),
-                     max(1, self.height() - _MARGIN_Y * 2))
+                     max(1, self.height() - top - _MARGIN_Y))
+
+    def _ruler_rect(self) -> QRect:
+        """Frame-number / playhead-triangle strip across the top, sharing
+        the plot's horizontal extent so frame↔pixel mapping is identical.
+        Sits ABOVE the plot so clicks here can't disturb keyframe edits."""
+        return QRect(_MARGIN_X, 2,
+                     max(1, self.width() - _MARGIN_X - 6), _RULER_H)
 
     def _frame_to_px(self, frame: float) -> float:
         r = self._plot_rect()
@@ -251,6 +295,7 @@ class KeyframeGraph(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), _BG_COLOR)
         self._paint_grid(painter)
+        self._paint_ruler(painter)
 
         cr = self._current_crop()
         if cr is None:
@@ -260,13 +305,20 @@ class KeyframeGraph(QWidget):
             painter.end()
             return
 
+        # Clip the plot content (curves / dots / handles / bands / rubber)
+        # to the plot rect so nothing spills into the margins or ruler
+        # when zoomed or scrolled. The ruler + playhead triangle are drawn
+        # outside this clip.
+        painter.save()
+        painter.setClipRect(self._plot_rect())
         self._paint_segment_bands(painter, cr)
-        self._paint_playhead(painter)
         for axis in _AXES:
             if not self._visible[axis]:
                 continue
             self._paint_track(painter, cr, axis)
-        self._paint_axis_labels(painter, cr)
+        self._paint_rubber_band(painter)
+        painter.restore()
+        self._paint_playhead(painter)
         painter.end()
 
     def _paint_segment_bands(self, painter: QPainter, cr: CropRegion):
@@ -294,17 +346,28 @@ class KeyframeGraph(QWidget):
         r = self._plot_rect()
         painter.fillRect(r, QColor("#181818"))
         painter.setPen(QPen(_GRID_COLOR, 1, Qt.PenStyle.DotLine))
-        # Vertical gridlines at every ~80px.
+        # Vertical gridlines at every ~80px (frame numbers live in the
+        # ruler strip — see _paint_ruler).
         n_ticks = max(2, r.width() // 80)
         for i in range(n_ticks + 1):
             x = r.left() + i * r.width() / n_ticks
             painter.drawLine(int(x), r.top(), int(x), r.bottom())
-            frame = self._px_to_frame(x)
-            painter.setPen(QColor("#888"))
-            painter.drawText(int(x) - 20, r.top() - 2, f"{int(frame)}")
-            painter.setPen(QPen(_GRID_COLOR, 1, Qt.PenStyle.DotLine))
         painter.setPen(QPen(_AXIS_COLOR, 1))
         painter.drawRect(r)
+
+    def _paint_ruler(self, painter: QPainter):
+        rr = self._ruler_rect()
+        painter.fillRect(rr, QColor("#222222"))
+        pr = self._plot_rect()
+        # Frame-number labels aligned with the plot's vertical gridlines.
+        n_ticks = max(2, pr.width() // 80)
+        painter.setPen(QColor("#999"))
+        for i in range(n_ticks + 1):
+            x = pr.left() + i * pr.width() / n_ticks
+            frame = self._px_to_frame(x)
+            painter.drawText(int(x) - 20, rr.bottom() - 4, f"{int(frame)}")
+        painter.setPen(QPen(_AXIS_COLOR, 1))
+        painter.drawLine(rr.left(), rr.bottom(), rr.right(), rr.bottom())
 
     def _paint_playhead(self, painter: QPainter):
         if self._playhead < 0:
@@ -313,8 +376,34 @@ class KeyframeGraph(QWidget):
         r = self._plot_rect()
         if not (r.left() - 1 <= x <= r.right() + 1):
             return
+        # Non-interactive reference line through the plot.
         painter.setPen(QPen(_PLAYHEAD_COLOR, 1))
         painter.drawLine(int(x), r.top(), int(x), r.bottom())
+        # Drag handle: downward triangle in the ruler strip (mirrors the
+        # main timeline). This ruler band is the ONLY place the playhead
+        # is grabbable, so editing keyframes in the plot can't move it.
+        rr = self._ruler_rect()
+        tw = 6
+        base_y = rr.bottom() - 8
+        apex_y = rr.bottom()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(_PLAYHEAD_COLOR))
+        painter.drawPolygon(QPolygon([
+            QPoint(int(x) - tw, base_y),
+            QPoint(int(x) + tw, base_y),
+            QPoint(int(x), apex_y),
+        ]))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _paint_rubber_band(self, painter: QPainter):
+        if (self._drag_kind != "rubber" or self._rubber_origin is None
+                or self._rubber_now is None):
+            return
+        rect = QRect(self._rubber_origin, self._rubber_now).normalized()
+        painter.setPen(QPen(QColor("#aaaaaa"), 1, Qt.PenStyle.DashLine))
+        painter.setBrush(QBrush(QColor(170, 170, 170, 40)))
+        painter.drawRect(rect)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _paint_track(self, painter: QPainter, cr: CropRegion, axis: str):
         color = QColor(_TRACK_COLORS[axis][0])
@@ -400,6 +489,12 @@ class KeyframeGraph(QWidget):
         # value here already reflects an in-progress edit.
         x = self._frame_to_px(k.source_frame)
         y = self._value_to_px(cr, axis, k.value)
+        # Cull dots whose center has scrolled past the left/right edge so
+        # they vanish cleanly instead of leaving a clipped sliver at the
+        # boundary (the painter clip would otherwise show the dot's radius).
+        r = self._plot_rect()
+        if x < r.left() or x > r.right():
+            return
         selected = (axis, k.source_frame) in self._selection
         if selected:
             painter.setPen(QPen(QColor("#ffffff"), 2))
@@ -439,22 +534,6 @@ class KeyframeGraph(QWidget):
                             _HANDLE_RADIUS, _HANDLE_RADIUS)
         painter.drawEllipse(QPoint(int(out_x), int(out_y)),
                             _HANDLE_RADIUS, _HANDLE_RADIUS)
-
-    def _paint_axis_labels(self, painter: QPainter, cr: CropRegion):
-        # Color chips for visible tracks along the top-left.
-        x = 6
-        y = 4
-        font = QFont()
-        font.setBold(True)
-        painter.setFont(font)
-        for axis in _AXES:
-            if not self._visible[axis]:
-                continue
-            color = QColor(_TRACK_COLORS[axis][0])
-            painter.fillRect(x, y, 12, 12, color)
-            painter.setPen(_luminance_text_color(_TRACK_COLORS[axis][0]))
-            painter.drawText(x + 2, y + 10, _TRACK_COLORS[axis][1])
-            x += 22
 
     # --- Hit testing ----------------------------------------------------
 
@@ -523,12 +602,6 @@ class KeyframeGraph(QWidget):
                 best_axis = axis
         return best_axis
 
-    def _playhead_hit(self, pt: QPoint) -> bool:
-        if self._playhead < 0:
-            return False
-        x = self._frame_to_px(self._playhead)
-        return abs(pt.x() - x) <= 4 and self._plot_rect().contains(pt)
-
     # --- Mouse ----------------------------------------------------------
 
     def mousePressEvent(self, event):
@@ -541,6 +614,15 @@ class KeyframeGraph(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
+            # Ruler strip → scrub the playhead. This band sits above the
+            # plot, so it's the only place a click moves the playhead —
+            # editing keyframes in the plot can never grab it by mistake.
+            if self._ruler_rect().contains(pt):
+                self._drag_kind = "scrub"
+                frame = max(0, int(round(self._px_to_frame(pt.x()))))
+                self.playhead_scrub_requested.emit(frame)
+                event.accept()
+                return
             # Handle drag (bezier).
             hh = self._hit_test_handle(pt)
             if hh is not None:
@@ -572,21 +654,14 @@ class KeyframeGraph(QWidget):
                 self.update()
                 event.accept()
                 return
-            # Playhead grab.
-            if self._playhead_hit(pt):
-                self._drag_kind = "scrub"
-                event.accept()
-                return
-            # Empty area: add a key to the nearest visible curve.
-            axis = self._hit_test_curve(pt)
-            if axis is not None:
-                self._add_key_at(axis, pt)
-                event.accept()
-                return
-            # Clicked in dead space → clear selection.
-            if self._selection:
-                self._selection.clear()
-                self.update()
+            # Empty area → start a rubber-band (box) selection. Adding a
+            # keyframe is a double-click now (see mouseDoubleClickEvent);
+            # a click that doesn't move just clears the selection.
+            self._drag_kind = "rubber"
+            self._rubber_origin = pt
+            self._rubber_now = pt
+            self._rubber_additive = bool(
+                event.modifiers() & Qt.KeyboardModifier.ControlModifier)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -601,6 +676,12 @@ class KeyframeGraph(QWidget):
                 dx_frame = -dx_px / r.width() * span
                 self._x_min = self._pan_x_min_at_start + dx_frame
                 self._x_max = self._pan_x_max_at_start + dx_frame
+            self.update()
+            self.view_changed.emit()
+            event.accept()
+            return
+        if self._drag_kind == "rubber":
+            self._rubber_now = pt
             self.update()
             event.accept()
             return
@@ -624,22 +705,72 @@ class KeyframeGraph(QWidget):
             self._commit_key_drag()
         elif self._drag_kind == "handle":
             self._commit_handle_drag()
+        elif self._drag_kind == "rubber":
+            self._apply_rubber_selection()
         self._drag_kind = ""
         self._drag_origin_widget = QPoint()
         self._drag_handle = None
         self._drag_keys = []
         self._drag_pushed_undo = False
+        self._rubber_origin = None
+        self._rubber_now = None
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # Double-click on a curve adds a keyframe (single-click now starts
+        # a box-select instead). Ignore the ruler and existing dots.
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        pt = event.position().toPoint()
+        if (self._ruler_rect().contains(pt)
+                or self._hit_test_dot(pt) is not None):
+            event.accept()
+            return
+        axis = self._hit_test_curve(pt)
+        if axis is not None:
+            self._add_key_at(axis, pt)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _apply_rubber_selection(self):
+        if self._rubber_origin is None or self._rubber_now is None:
+            return
+        rect = QRect(self._rubber_origin, self._rubber_now).normalized()
+        cr = self._current_crop()
+        found: List[Tuple[str, int]] = []
+        if cr is not None:
+            for axis in _AXES:
+                if not self._visible[axis]:
+                    continue
+                track = self._track_for(cr, axis)
+                for k in track.keys:
+                    kx = self._frame_to_px(k.source_frame)
+                    ky = self._value_to_px(cr, axis, k.value)
+                    if rect.contains(int(kx), int(ky)):
+                        found.append((axis, k.source_frame))
+        if self._rubber_additive:
+            for item in found:
+                if item not in self._selection:
+                    self._selection.append(item)
+        else:
+            self._selection = found
+        self.update()
 
     def contextMenuEvent(self, event):
         pt = event.pos()
         hit = self._hit_test_dot(pt)
-        if hit is None:
+        if hit is not None:
+            # Right-clicked a dot: select it (unless already in a multi-
+            # selection, which we keep so the menu acts on the whole set).
+            if hit not in self._selection:
+                self._selection = [hit]
+                self.update()
+        elif not self._selection:
             super().contextMenuEvent(event)
             return
-        if hit not in self._selection:
-            self._selection = [hit]
-            self.update()
+        # else: not on a dot but a selection exists → menu acts on it.
         menu = QMenu(self)
         del_act = QAction("Delete", self)
         del_act.triggered.connect(self._delete_selected_keys)
@@ -666,6 +797,7 @@ class KeyframeGraph(QWidget):
             return
         self._x_min, self._x_max = new_min, new_max
         self.update()
+        self.view_changed.emit()
 
     # --- Drag implementations ------------------------------------------
 
@@ -890,31 +1022,42 @@ class KeyframeGraph(QWidget):
                 interp, in_handle, out_handle)
         self.update()
 
+    def apply_interp_to_selection(self, interp: str):
+        """Public entry point for the toolbar interp buttons — applies the
+        interpolation to every currently-selected keyframe."""
+        self._set_selected_interp(interp)
 
-class KeyframeEditorDock(QDockWidget):
-    """Top-level dock that wraps ``KeyframeGraph`` plus a small toolbar.
 
-    Defaults to floating (own top-level window) but can be docked into
-    the MainWindow's right or bottom dock area. MainWindow holds the
-    instance and calls ``show_for_crop()`` from the clip-info panel's
-    "Edit curves…" signal."""
+class KeyframeEditorWindow(QWidget):
+    """Standalone top-level window wrapping ``KeyframeGraph`` plus a small
+    toolbar. Opened from the clip-info panel's "Edit curves…" signal;
+    MainWindow holds the instance for the session. Has the normal
+    minimize/maximize/close window buttons, and its size + position
+    persist across sessions via QSettings."""
 
     playhead_scrub_requested = Signal(int)
     live_edit_changed = Signal()
+    # QWidget has no visibilityChanged signal — emit our own so the
+    # View-menu checkbox can track open/closed state.
+    visibility_changed = Signal(bool)
+
+    _GEOMETRY_KEY = "keyframe_editor/geometry"
 
     def __init__(self, timeline: TimelineModel, parent=None):
-        super().__init__("Keyframe Editor", parent)
-        self.setAllowedAreas(
-            Qt.DockWidgetArea.RightDockWidgetArea
-            | Qt.DockWidgetArea.BottomDockWidgetArea)
-        self.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
-            | QDockWidget.DockWidgetFeature.DockWidgetMovable
-            | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        super().__init__(parent)
+        # Independent top-level window with the standard window frame.
+        # Parentless + WA_QuitOnClose=False so it minimises on its own and
+        # never keeps the app alive after the main window closes.
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setWindowTitle("Keyframe Editor")
 
         self._timeline = timeline
-        container = QWidget(self)
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 6)
 
         # Toolbar
@@ -927,11 +1070,21 @@ class KeyframeEditorDock(QDockWidget):
         toolbar.addStretch(1)
         self._axis_boxes: Dict[str, QCheckBox] = {}
         for axis in _AXES:
+            color = _TRACK_COLORS[axis][0]
             box = QCheckBox(_TRACK_COLORS[axis][1])
             box.setChecked(True)
+            # Explicit indicator styling so ticked vs unticked is obvious
+            # (filled axis color vs dark box). The Fusion default rendered
+            # the indicator the same blue in both states.
             box.setStyleSheet(
-                f"QCheckBox {{ color: {_TRACK_COLORS[axis][0]};"
-                " font-weight: bold; }")
+                f"QCheckBox {{ color: {color}; font-weight: bold;"
+                " spacing: 5px; }"
+                "QCheckBox::indicator { width: 13px; height: 13px;"
+                " border: 1px solid #888; border-radius: 3px;"
+                " background: #2b2b2b; }"
+                f"QCheckBox::indicator:checked {{ background: {color};"
+                f" border: 1px solid {color}; }}"
+                "QCheckBox::indicator:hover { border: 1px solid #bbb; }")
             box.toggled.connect(
                 lambda checked, a=axis:
                 self._graph.set_track_visible(a, checked))
@@ -941,16 +1094,81 @@ class KeyframeEditorDock(QDockWidget):
         fit_btn.setFixedWidth(40)
         fit_btn.clicked.connect(lambda: self._graph.fit_x_axis())
         toolbar.addWidget(fit_btn)
+        # Interp buttons — apply to the current keyframe selection.
+        for label, interp in (("Linear", INTERP_LINEAR),
+                              ("Bezier", INTERP_BEZIER),
+                              ("Step", INTERP_STEP)):
+            b = QPushButton(label)
+            b.setToolTip("Apply to selected keyframes")
+            b.clicked.connect(
+                lambda _checked=False, i=interp:
+                self._graph.apply_interp_to_selection(i))
+            toolbar.addWidget(b)
         layout.addLayout(toolbar)
 
         # Graph
-        self._graph = KeyframeGraph(timeline, container)
+        self._graph = KeyframeGraph(timeline, self)
         self._graph.playhead_scrub_requested.connect(
             self.playhead_scrub_requested)
         self._graph.live_edit_changed.connect(self.live_edit_changed)
         layout.addWidget(self._graph, 1)
 
-        self.setWidget(container)
+        # Bottom scrollbar — spans the clip's source range, pans the view.
+        self._syncing = False
+        self._scrollbar = QScrollBar(Qt.Orientation.Horizontal)
+        self._scrollbar.valueChanged.connect(self._on_scrollbar)
+        layout.addWidget(self._scrollbar)
+        self._graph.view_changed.connect(self._sync_scrollbar)
+        self._sync_scrollbar()
+
+        # Restore saved geometry; else open large the first time.
+        geo = QSettings().value(self._GEOMETRY_KEY)
+        if geo:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(ui_scale().px(1000), ui_scale().px(620))
+
+    # --- Window lifecycle ----------------------------------------------
+
+    def _save_geometry(self):
+        QSettings().setValue(self._GEOMETRY_KEY, self.saveGeometry())
+
+    def _sync_scrollbar(self):
+        """Mirror the graph's view onto the scrollbar (frame units). The
+        scrollable range is the union of the clip's source range and the
+        current view, so panning/zooming past the clip still works."""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            c_lo, c_hi = self._graph.content_range()
+            v_lo, v_hi = self._graph.view_range()
+            page = max(1, int(round(v_hi - v_lo)))
+            lo = int(math.floor(min(c_lo, v_lo)))
+            hi = int(math.ceil(max(c_hi, v_hi)))
+            sb = self._scrollbar
+            sb.setMinimum(lo)
+            sb.setMaximum(max(lo, hi - page))
+            sb.setPageStep(page)
+            sb.setSingleStep(max(1, page // 10))
+            sb.setValue(int(round(v_lo)))
+            sb.setEnabled(hi - lo > page)
+        finally:
+            self._syncing = False
+
+    def _on_scrollbar(self, value: int):
+        if self._syncing:
+            return
+        self._graph.set_view_min(float(value))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, event):
+        self._save_geometry()
+        self.visibility_changed.emit(False)
+        super().hideEvent(event)
 
     def show_for_crop(self, clip_id: str, crop_id: str,
                       crop_label: str = "", src_fps: float = 0.0):
