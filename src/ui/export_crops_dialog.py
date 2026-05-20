@@ -209,9 +209,30 @@ class ExportCropsDialog(QDialog):
         self._timeline.groups_changed.connect(self._rebuild_per_group_rows)
         self._rebuild_per_group_rows()
 
-        # Tabs: Video / Image Sequence. Resolution and FPS are fixed at
-        # the crop rectangle's native pixels @ 16fps, so neither tab
-        # exposes those controls (unlike the normal export dialog).
+        # Output resolution. The user sets the WIDTH; each crop's height
+        # follows its own (constant) aspect ratio, so crops of differing
+        # shapes never get distorted by a single global size. Applies to
+        # both the Video and Image Sequence tabs.
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Output width (px):"))
+        self._out_width_spin = QSpinBox()
+        self._out_width_spin.setRange(16, 8192)
+        self._out_width_spin.setSingleStep(2)
+        self._out_width_spin.setValue(512)
+        self._out_width_spin.setToolTip(
+            "Each crop is resampled to this width; height follows the "
+            "crop's aspect ratio.")
+        self._out_width_spin.valueChanged.connect(self._refresh_summary)
+        res_row.addWidget(self._out_width_spin)
+        res_hint = QLabel("height follows each crop's aspect ratio")
+        res_hint.setStyleSheet("color: #999;")
+        res_row.addWidget(res_hint)
+        res_row.addStretch(1)
+        outer.addLayout(res_row)
+
+        # Tabs: Video / Image Sequence. FPS is fixed at 16fps and output
+        # size comes from the width control above, so neither tab exposes
+        # resolution / FPS controls (unlike the normal export dialog).
         self._tabs = QTabWidget()
 
         # --- Video tab ----------------------------------------------------
@@ -400,25 +421,48 @@ class ExportCropsDialog(QDialog):
 
     def _refresh_summary(self):
         flt = self._group_filter.current_filter()
-        from core.crop_region import crop_matches_filter
-        # One output file per ACTIVE segment of each exportable crop.
-        count = 0
-        for _clip, cr in self._timeline.iter_crops():
+        from core.crop_region import (
+            crop_matches_filter, segment_aspect_constant)
+        # One output file per ACTIVE segment whose aspect ratio stays
+        # constant across its window. Segments that change shape mid-window
+        # can't be represented at a fixed resolution and are skipped.
+        export_count = 0
+        blocked = []  # crop labels with at least one aspect-changing segment
+        for clip, cr in self._timeline.iter_crops():
             if not cr.active:
                 continue
             if not crop_matches_filter(cr, flt):
                 continue
-            count += sum(1 for seg in cr.segments if seg.active)
-        if count == 0:
-            self._summary_label.setText(
-                "No segments match the current filter. Add crops / segments "
-                "in the Clip panel.")
+            src = self._sources.get(clip.source_id)
+            src_fps = src.fps if src else 24.0
+            crop_blocked = False
+            for seg in cr.segments:
+                if not seg.active:
+                    continue
+                if segment_aspect_constant(cr, int(seg.anchor_frame), src_fps):
+                    export_count += 1
+                else:
+                    crop_blocked = True
+            if crop_blocked:
+                label = cr.label.strip() if cr.label else ""
+                blocked.append(label or f"crop {cr.id[:6]}")
+
+        lines = []
+        if export_count == 0:
+            lines.append("No exportable segments match the current filter.")
         else:
-            self._summary_label.setText(
-                f"Will export {count} segment"
-                f"{'s' if count != 1 else ''} — "
-                f"each is 81 frames @ 16 fps "
-                f"(native crop pixels, with audio).")
+            lines.append(
+                f"Will export {export_count} segment"
+                f"{'s' if export_count != 1 else ''} — each 81 frames @ 16 fps, "
+                f"scaled to {self._out_width_spin.value()} px wide "
+                f"(height per crop's aspect ratio), with audio.")
+        if blocked:
+            names = ", ".join(f"'{n}'" for n in blocked)
+            lines.append(
+                f"⚠ {len(blocked)} crop"
+                f"{'s' if len(blocked) != 1 else ''} skipped — aspect ratio "
+                f"changes mid-segment: {names}")
+        self._summary_label.setText("\n".join(lines))
 
     # ------------------------------------------------------------------
 
@@ -452,6 +496,7 @@ class ExportCropsDialog(QDialog):
             "audio_mode": audio_mode,
             "audio_format": audio_format,
             "group_filter": flt,
+            "out_width": self._out_width_spin.value(),
         }
         if is_root_mode:
             root_dir = self._root_edit.text().strip()

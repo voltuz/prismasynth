@@ -28,7 +28,8 @@ from PySide6.QtCore import QObject, Signal
 
 from core.crop_region import (
     CropRegion, OUTPUT_FPS, OUTPUT_FRAMES, crop_matches_filter,
-    exact_audio_samples_81_at_16, required_source_frames,
+    crop_output_dims, exact_audio_samples_81_at_16, required_source_frames,
+    segment_aspect_constant,
 )
 from core.exporter import (
     Exporter, _AUDIO_CODEC_FOR_EXT, _AUDIO_FORMAT_PRESETS,
@@ -72,38 +73,18 @@ def _stem_of(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0] or "source"
 
 
-def _piecewise_n_expr(values) -> str:
-    """Build an ffmpeg expression that returns ``values[k]`` when the
-    frame counter ``n`` equals ``k``, falling through to the last
-    element for any ``n >= len(values)``.
-
-    Output shape:
-      ``if(eq(n,0),v0,if(eq(n,1),v1,...,if(eq(n,K-1),v_{K-1},v_{K-1})))``
-    Run-length collapses consecutive equal values so a static axis on
-    an otherwise-animated region emits a single integer instead of a
-    full ladder. Returns the bare value when the entire span is one
-    constant.
-    """
-    if not values:
-        return "0"
-    # Collapse runs so static axes don't emit a 100-deep ladder.
-    runs = []  # list of (start_idx, end_idx_inclusive, value)
-    run_start = 0
-    for i in range(1, len(values)):
-        if values[i] != values[run_start]:
-            runs.append((run_start, i - 1, values[run_start]))
-            run_start = i
-    runs.append((run_start, len(values) - 1, values[run_start]))
-    if len(runs) == 1:
-        return str(int(runs[0][2]))
-    # Build nested if(): one branch per run. We use ``lte(n,end)`` so
-    # the value applies from the run's start (covered by the previous
-    # branch's failure) through its end. The final run is the fall-
-    # through default.
-    expr = str(int(runs[-1][2]))
-    for start, end, val in reversed(runs[:-1]):
-        expr = f"if(lte(n,{end}),{int(val)},{expr})"
-    return expr
+def _read_exact(stream, n: int) -> Optional[bytes]:
+    """Read exactly ``n`` bytes from a pipe. Returns None on short read /
+    EOF (e.g. when ffmpeg #1 ends before the requested frame count)."""
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 class CropExporter(QObject):
@@ -135,6 +116,10 @@ class CropExporter(QObject):
         # two algorithms produce visibly different tonemapped output.
         self._gpu_tonemap: bool = False
         self._opencl_device: Optional[str] = None
+        # Crop labels skipped at job-build time for changing aspect ratio
+        # mid-segment (can't be represented at a fixed output resolution).
+        # Surfaced in the final status line. Reset at the top of _run.
+        self._skipped_ar: List[str] = []
 
     # --- Subprocess tracking (mirror Exporter) ------------------------
 
@@ -149,6 +134,12 @@ class CropExporter(QObject):
 
     def cancel(self):
         self._cancelled = True
+        self._kill_active_procs()
+
+    def _kill_active_procs(self):
+        """Kill every live subprocess WITHOUT marking the job cancelled.
+        Used by the failure path so a real error isn't mis-reported as a
+        user cancel (which would otherwise leave the dialog stuck)."""
         with self._procs_lock:
             procs = list(self._active_procs)
             self._active_procs.clear()
@@ -185,10 +176,11 @@ class CropExporter(QObject):
         try:
             self._cancelled = False
             self._hdr_cache = {}
+            self._skipped_ar = []
             self._gpu_tonemap, self._opencl_device = _probe_gpu_tonemap()
             jobs = self._build_jobs(settings)
             if not jobs:
-                self.status.emit("No crops to export")
+                self.status.emit("No crops to export" + self._skip_note())
                 self.finished.emit()
                 return
             self.status.emit(f"Exporting {len(jobs)} crop(s)…")
@@ -197,7 +189,7 @@ class CropExporter(QObject):
                 self.cancelled.emit()
             else:
                 self.progress.emit(100)
-                self.status.emit("Crop export complete")
+                self.status.emit("Crop export complete" + self._skip_note())
                 self.finished.emit()
         except Exception as e:
             logger.exception("Crop export failed")
@@ -229,6 +221,10 @@ class CropExporter(QObject):
                 raise ValueError(f"Unknown codec: {codec}")
             out_ext = preset["ext"]
 
+        # User-chosen output width (px). Height follows each crop's aspect
+        # ratio. 0/missing falls back to the crop's own sampled width.
+        out_width = int(settings.get("out_width") or 0)
+
         groups = self._timeline.groups
         jobs: List[dict] = []
         for clip, cr in self._timeline.iter_crops():
@@ -255,8 +251,16 @@ class CropExporter(QObject):
                 if not seg.active:
                     continue
                 anchor = int(seg.anchor_frame)
+                # Crops that change ASPECT RATIO mid-window can't be
+                # represented at a fixed output resolution — skip them and
+                # record the label so the final status can list them.
+                if not segment_aspect_constant(cr, anchor, source.fps):
+                    self._note_skipped(cr)
+                    continue
+                eff_width = out_width if out_width > 0 else cr.sample(anchor)[2]
+                out_w, out_h = crop_output_dims(cr, anchor, eff_width)
                 base_name = (
-                    f"{stem}_f{anchor}_{cr.w}x{cr.h}"
+                    f"{stem}_f{anchor}_{out_w}x{out_h}"
                     f"_{cr.id[:6]}_{seg.id[:4]}")
                 if is_image_sequence:
                     out_path = os.path.join(target_dir, base_name)
@@ -269,6 +273,11 @@ class CropExporter(QObject):
                     "anchor_frame": anchor,
                     "source_path": source.file_path,
                     "source_fps": source.fps,
+                    "source_w": int(source.width),
+                    "source_h": int(source.height),
+                    "out_w": out_w,
+                    "out_h": out_h,
+                    "animated": cr.is_animated(),
                     "has_audio": bool(source.audio_channels > 0),
                     "out_path": out_path,
                     "out_ext": out_ext,
@@ -277,6 +286,21 @@ class CropExporter(QObject):
                     "preset": preset,
                 })
         return jobs
+
+    def _note_skipped(self, cr: CropRegion):
+        label = cr.label.strip() if cr.label else ""
+        if not label:
+            label = f"crop {cr.id[:6]}"
+        if label not in self._skipped_ar:
+            self._skipped_ar.append(label)
+
+    def _skip_note(self) -> str:
+        if not self._skipped_ar:
+            return ""
+        names = ", ".join(f"'{n}'" for n in self._skipped_ar)
+        n = len(self._skipped_ar)
+        return (f" ({n} crop{'s' if n != 1 else ''} skipped — changing "
+                f"aspect ratio: {names})")
 
     def _resolve_output_dir(self, output_mode: str, root_dir: str,
                             per_group_paths: dict,
@@ -332,8 +356,11 @@ class CropExporter(QObject):
                 self.progress.emit(min(99, int(done / max(1, total) * 99)))
                 if not ok and not self._cancelled:
                     failed.set()
-                    # Kill any other in-flight crops so cancel/error is quick.
-                    self.cancel()
+                    # Kill any other in-flight crops so the error surfaces
+                    # quickly. Must NOT set self._cancelled — otherwise _run
+                    # reports a user-cancel instead of the actual error and
+                    # the dialog freezes (was the "stuck at 99%" symptom).
+                    self._kill_active_procs()
                     raise RuntimeError(msg)
 
     # --- Per-crop pipeline -------------------------------------------
@@ -349,39 +376,29 @@ class CropExporter(QObject):
 
         if is_image_sequence:
             ext = job.get("image_ext", ".png")
-            self._run_image_sequence_job(
-                cr, anchor, src_path, src_fps, out_path, ext)
+            self._run_image_sequence_job(job, ext)
             return
 
-        preset: dict = job["preset"]
-        quality = int(settings.get("quality", 18))
-        codec_args = self._apply_quality(preset["args"], quality)
         audio_mode = settings.get("audio_mode", "embedded")
-        is_hdr = self._is_hdr_source(src_path)
-
         os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
                     exist_ok=True)
         base, ext = os.path.splitext(out_path)
 
         if audio_mode == "none":
-            # Single-pass video write — no audio track, no mux.
-            cmd = self._build_video_cmd(
-                cr, anchor, src_path, src_fps, codec_args, out_path, is_hdr)
-            self._run_pipeline([cmd])
+            # No audio track, no mux — write the video straight to out_path.
+            self._produce_video(job, settings, out_path)
             return
 
-        # embedded (default) or both — three-pass video + audio + mux.
+        # embedded (default) or both — video + audio + mux.
         temp_v = base + ".v" + ext
         temp_a = base + ".a.wav"
-        cmds = [
-            self._build_video_cmd(
-                cr, anchor, src_path, src_fps, codec_args, temp_v, is_hdr),
-            self._build_audio_cmd(
-                cr, anchor, src_path, src_fps, has_audio, temp_a),
-            self._build_mux_cmd(temp_v, temp_a, out_path),
-        ]
         try:
-            self._run_pipeline(cmds)
+            self._produce_video(job, settings, temp_v)
+            self._run_pipeline([
+                self._build_audio_cmd(
+                    cr, anchor, src_path, src_fps, has_audio, temp_a),
+                self._build_mux_cmd(temp_v, temp_a, out_path),
+            ])
             if audio_mode == "both":
                 # Sidecar in the user-chosen format, transcoded from the
                 # same sample-precise 243000-sample WAV used for embedding.
@@ -396,18 +413,32 @@ class CropExporter(QObject):
                 except OSError:
                     pass
 
-    def _run_image_sequence_job(self, cr: CropRegion, anchor_frame: int,
-                                src_path: str, src_fps: float, out_dir: str,
-                                ext: str = ".png"):
-        """Write 81 numbered image files (PNG/JPG/EXR) to ``out_dir``.
+    def _run_image_sequence_job(self, job: dict, ext: str = ".png"):
+        """Write 81 numbered image files (PNG/JPG/EXR) to the job's output
+        folder, scaled to the job's output dimensions.
 
-        Uses the same HDR/color filter chain + two-stage seek as the
-        video path so brightness and color match the video output. JPEG
-        gets a fixed high-quality ``-q:v 2`` (1=best, 31=worst in ffmpeg).
-        PNG and OpenEXR are lossless; no quality knob applies."""
-        os.makedirs(out_dir, exist_ok=True)
+        Animated crops go through the per-frame crop+resize pipe; static
+        crops use a single ffmpeg pass. Both share the same HDR/color
+        chain so brightness and color match the video output. JPEG gets a
+        fixed high-quality ``-q:v 2``; PNG / OpenEXR are lossless."""
+        cr: CropRegion = job["crop"]
+        anchor = int(job["anchor_frame"])
+        src_path: str = job["source_path"]
+        src_fps: float = job["source_fps"]
+        out_dir: str = job["out_path"]
+        out_w: int = job["out_w"]
+        out_h: int = job["out_h"]
         is_hdr = self._is_hdr_source(src_path)
-        pre_ss, post_ss = self._two_stage_seek(anchor_frame, src_fps)
+        os.makedirs(out_dir, exist_ok=True)
+
+        if job["animated"]:
+            cmd2 = self._encode_cmd2_images(out_w, out_h, src_fps, out_dir, ext)
+            self._render_animated(
+                cr, anchor, src_path, src_fps, job["source_w"],
+                job["source_h"], out_w, out_h, is_hdr, cmd2)
+            return
+
+        pre_ss, post_ss = self._two_stage_seek(anchor, src_fps)
         cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
         if is_hdr:
             cmd += self._gpu_hw_args()
@@ -419,108 +450,219 @@ class CropExporter(QObject):
         cmd += [
             "-an",
             "-vf", self._video_filter(
-                cr, anchor_frame, is_hdr=is_hdr, include_setpts=False,
-                src_fps=src_fps),
+                cr, out_w, out_h, is_hdr=is_hdr, include_setpts=False),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
             "-map_chapters", "-1", "-dn", "-sn",
         ]
-        # Per-format quality args. PNG / EXR are lossless; JPEG needs a
-        # quality value to avoid the default of 31 (worst).
         if ext.lower() in (".jpg", ".jpeg"):
             cmd += ["-q:v", "2"]
         cmd += [os.path.join(out_dir, f"frame_%03d{ext}")]
         self._run_pipeline([cmd])
 
+    # --- Video production (static pass vs animated per-frame pipe) -----
+
+    def _produce_video(self, job: dict, settings: dict, out_file: str):
+        """Write the (audio-less) cropped video to ``out_file``. Animated
+        crops render via the per-frame pipe; static crops via one ffmpeg
+        pass. Caller handles audio + mux."""
+        cr: CropRegion = job["crop"]
+        anchor = int(job["anchor_frame"])
+        src_path: str = job["source_path"]
+        src_fps: float = job["source_fps"]
+        out_w: int = job["out_w"]
+        out_h: int = job["out_h"]
+        is_hdr = self._is_hdr_source(src_path)
+        quality = int(settings.get("quality", 18))
+        codec_args = self._apply_quality(job["preset"]["args"], quality)
+        if job["animated"]:
+            cmd2 = self._encode_cmd2_video(
+                out_w, out_h, src_fps, codec_args, out_file)
+            self._render_animated(
+                cr, anchor, src_path, src_fps, job["source_w"],
+                job["source_h"], out_w, out_h, is_hdr, cmd2)
+        else:
+            self._run_pipeline([self._build_video_cmd(
+                cr, anchor, src_path, src_fps, codec_args, out_file,
+                out_w, out_h, is_hdr)])
+
+    def _render_animated(self, cr: CropRegion, anchor: int, src_path: str,
+                         src_fps: float, src_w: int, src_h: int,
+                         out_w: int, out_h: int, is_hdr: bool, cmd2: list):
+        """ffmpeg #1 (decode + HDR tonemap → bgr24 rawvideo) → Python
+        per-frame crop+resize → ffmpeg #2 (``cmd2``: fps=16 + encode, or
+        image-sequence write).
+
+        This sidesteps ffmpeg's ``crop`` filter entirely — that filter
+        can't animate w/h (no ``eval`` option in this build) and per-frame
+        x/y/w/h expressions blow past its evaluator's nesting limit. Doing
+        the geometry in Python is exact for arbitrary keyframes. Only 81
+        output frames, so the full-res pipe is cheap.
+        """
+        import numpy as np
+        import cv2
+
+        cmd1 = self._decode_cmd1(src_path, src_fps, anchor, is_hdr)
+        n_src = required_source_frames(src_fps) + 2
+        frame_bytes = src_w * src_h * 3
+
+        p1 = subprocess.Popen(
+            cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._register_proc(p1)
+        p2 = subprocess.Popen(
+            cmd2, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._register_proc(p2)
+        err1: List[bytes] = []
+        err2: List[bytes] = []
+        threading.Thread(
+            target=lambda: err1.append(p1.stderr.read()), daemon=True).start()
+        threading.Thread(
+            target=lambda: err2.append(p2.stderr.read()), daemon=True).start()
+        try:
+            for n in range(n_src):
+                if self._cancelled:
+                    break
+                buf = _read_exact(p1.stdout, frame_bytes)
+                if buf is None:
+                    break  # ffmpeg #1 hit EOF or errored
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape(
+                    src_h, src_w, 3)
+                x, y, w, h = cr.sample(anchor + n)
+                x = max(0, min(int(x), src_w - 2))
+                y = max(0, min(int(y), src_h - 2))
+                w = max(2, min(int(w), src_w - x))
+                h = max(2, min(int(h), src_h - y))
+                sub = frame[y:y + h, x:x + w]
+                interp = (cv2.INTER_AREA if (w >= out_w and h >= out_h)
+                          else cv2.INTER_CUBIC)
+                out = cv2.resize(sub, (out_w, out_h), interpolation=interp)
+                try:
+                    p2.stdin.write(np.ascontiguousarray(out).tobytes())
+                except (BrokenPipeError, OSError):
+                    break  # ffmpeg #2 reached its -frames:v cap
+        finally:
+            try:
+                p1.stdout.close()
+            except OSError:
+                pass
+            try:
+                p2.stdin.close()
+            except OSError:
+                pass
+        p1.wait()
+        p2.wait()
+        self._unregister_proc(p1)
+        self._unregister_proc(p2)
+        if self._cancelled:
+            raise RuntimeError("cancelled")
+        # ffmpeg #1 returns non-zero when we close its stdout early (EPIPE)
+        # after ffmpeg #2 is satisfied — expected, not a failure. Only the
+        # encoder's result determines success.
+        if p2.returncode != 0:
+            t2 = (err2[0] if err2 else b"").decode(errors="replace")[-400:]
+            t1 = (err1[0] if err1 else b"").decode(errors="replace")[-400:]
+            raise RuntimeError(
+                f"crop render failed (rc={p2.returncode}): {t2} | "
+                f"decode: {t1}")
+
+    def _decode_cmd1(self, src_path: str, src_fps: float, anchor_frame: int,
+                     is_hdr: bool) -> list:
+        """ffmpeg #1: two-stage seek + (HDR tonemap) → bgr24 rawvideo on
+        stdout, one full source frame per window position. No crop/fps —
+        Python crops each frame and ffmpeg #2 drops to 16fps."""
+        pre_ss, post_ss = self._two_stage_seek(anchor_frame, src_fps)
+        n_src = required_source_frames(src_fps) + 2
+        vf = ",".join(self._hdr_prefix_parts(is_hdr) + ["format=bgr24"])
+        cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+        if is_hdr:
+            cmd += self._gpu_hw_args()
+        if pre_ss > 0:
+            cmd += ["-ss", f"{pre_ss:.6f}"]
+        cmd += ["-i", src_path]
+        if post_ss > 0:
+            cmd += ["-ss", f"{post_ss:.6f}"]
+        cmd += ["-an", "-vf", vf, "-frames:v", str(n_src),
+                "-fps_mode", "passthrough", "-f", "rawvideo", "-"]
+        return cmd
+
+    def _encode_cmd2_video(self, out_w: int, out_h: int, src_fps: float,
+                           codec_args: list, out_file: str) -> list:
+        """ffmpeg #2 for video: bgr24 rawvideo on stdin → fps=16 → encode.
+        No ``-nostdin`` — this process reads frames from stdin."""
+        return [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{out_w}x{out_h}", "-r", f"{src_fps:.6f}", "-i", "-",
+            "-vf", f"fps={OUTPUT_FPS},setpts=PTS-STARTPTS",
+            "-frames:v", str(OUTPUT_FRAMES), "-fps_mode", "passthrough",
+            "-video_track_timescale", "24000000",
+            "-map_chapters", "-1", "-dn", "-sn",
+            "-colorspace", "bt709", "-color_trc", "bt709",
+            "-color_primaries", "bt709",
+            *codec_args, out_file,
+        ]
+
+    def _encode_cmd2_images(self, out_w: int, out_h: int, src_fps: float,
+                            out_dir: str, ext: str) -> list:
+        """ffmpeg #2 for image sequences: bgr24 rawvideo on stdin → fps=16
+        → numbered image files. No ``-nostdin`` (reads stdin)."""
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{out_w}x{out_h}", "-r", f"{src_fps:.6f}", "-i", "-",
+            "-vf", f"fps={OUTPUT_FPS}",
+            "-frames:v", str(OUTPUT_FRAMES), "-fps_mode", "passthrough",
+            "-map_chapters", "-1", "-dn", "-sn",
+        ]
+        if ext.lower() in (".jpg", ".jpeg"):
+            cmd += ["-q:v", "2"]
+        cmd += [os.path.join(out_dir, f"frame_%03d{ext}")]
+        return cmd
+
     # --- Command builders --------------------------------------------
 
-    @staticmethod
-    def _animated_crop_filter(cr: CropRegion, anchor_frame: int,
-                              src_fps: float) -> str:
-        """Build a frame-dependent ``crop=`` filter element when any of
-        the region's axis tracks has keyframes. Returns the static
-        positional form when the region is fully un-animated.
+    def _hdr_prefix_parts(self, is_hdr: bool) -> List[str]:
+        """The HDR→Rec.709 tonemap filter elements (GPU ``tonemap_opencl``
+        when OpenCL is available, CPU ``zscale``/``tonemap`` fallback
+        otherwise), bracketed by ``setparams``. Empty for SDR sources.
 
-        The animated form uses ffmpeg's expression evaluator with the
-        ``n`` variable (frame index into the crop filter, counting
-        source frames after the -ss seek): each axis becomes a 1-deep
-        nested ``if(eq(n,k), vk, ...)`` ladder sampled at every source
-        frame inside the export window. Per-frame values come from
-        ``CropRegion.sample(anchor_frame + k)`` so the expression is a
-        snapshot of the keyframe state at export time — once emitted
-        the chain runs as plain numeric eval, no per-frame Python.
-        """
-        if not cr.is_animated():
-            return f"crop={cr.w}:{cr.h}:{cr.x}:{cr.y}"
-        # Source-frame count to cover the 81-output-frame window. +2
-        # frame slack so fps=16 has lookahead room on the last sample.
-        n_src = required_source_frames(src_fps) + 2
-        anchor = int(anchor_frame)
-        xs, ys, ws, hs = [], [], [], []
-        for k in range(n_src):
-            x, y, w, h = cr.sample(anchor + k)
-            xs.append(int(x))
-            ys.append(int(y))
-            # Width / height must be at least 2 px for the encoder
-            # chroma stride. The overlay already enforces MIN_CROP_SIZE
-            # but interpolation can land below it briefly.
-            ws.append(max(2, int(w)))
-            hs.append(max(2, int(h)))
-        return (
-            "crop="
-            f"w='{_piecewise_n_expr(ws)}'"
-            f":h='{_piecewise_n_expr(hs)}'"
-            f":x='{_piecewise_n_expr(xs)}'"
-            f":y='{_piecewise_n_expr(ys)}'"
-        )
+        The leading ``setparams=bt2020/PQ`` forces consistent HDR
+        signalling so a mid-GOP seek can't desync the tonemap filter; the
+        trailing ``setparams=bt709`` stamps the result Rec.709 so a
+        downstream encoder doesn't carry bt2020 primaries forward."""
+        if not is_hdr:
+            return []
+        parts = ["setparams=color_primaries=bt2020:"
+                 "color_trc=smpte2084:colorspace=bt2020nc"]
+        if self._gpu_tonemap:
+            parts += [
+                "format=p010le", "hwupload",
+                "tonemap_opencl=tonemap=hable:desat=0:peak=1000:format=nv12",
+                "hwdownload", "format=nv12",
+            ]
+        else:
+            parts += [
+                "zscale=t=linear:npl=100", "format=gbrpf32le",
+                "zscale=p=bt709", "tonemap=hable:desat=0:peak=10",
+                "zscale=t=bt709:m=bt709:r=tv", "format=yuv420p",
+            ]
+        parts.append("setparams=color_primaries=bt709:"
+                     "color_trc=bt709:colorspace=bt709")
+        return parts
 
-    def _video_filter(self, cr: CropRegion, anchor_frame: int,
+    def _video_filter(self, cr: CropRegion, out_w: int, out_h: int,
                       is_hdr: bool = False,
-                      include_setpts: bool = True,
-                      src_fps: float = 0.0) -> str:
-        """Filter chain for the cropped 81-frame@16fps window.
+                      include_setpts: bool = True) -> str:
+        """Filter chain for a STATIC (non-animated) crop:
+        ``[hdr tonemap] → crop=W:H:X:Y → scale=out_w:out_h → fps=16
+        [→ setpts]``.
 
-        SDR path: ``crop=W:H:X:Y → fps=16 → setpts=PTS-STARTPTS``.
-
-        HDR path: prepended with the same tonemap chain the normal
-        exporter uses — GPU `tonemap_opencl=hable` when OpenCL is
-        available, CPU `zscale + tonemap=hable + zscale` fallback. The
-        leading ``setparams=bt2020/PQ`` forces consistent HDR signalling
-        so a mid-GOP seek can't desync the tonemap filter, and the
-        trailing ``setparams=bt709`` stamps the output as Rec.709 so
-        encoders don't carry forward bt2020 primaries metadata into the
-        muxed stream (was visible in pre-fix normal exports as
-        `color_primaries=bt2020` despite Rec.709 pixels).
-
-        ``setpts`` rebases to PTS=0 so the muxer writes a clean stream
-        starting at t=0; the PNG-sequence path skips it because there's
-        no muxer to confuse.
-        """
-        parts: List[str] = []
-        if is_hdr:
-            parts.append(
-                "setparams=color_primaries=bt2020:"
-                "color_trc=smpte2084:colorspace=bt2020nc")
-            if self._gpu_tonemap:
-                parts.extend([
-                    "format=p010le", "hwupload",
-                    "tonemap_opencl=tonemap=hable:desat=0:peak=1000:"
-                    "format=nv12",
-                    "hwdownload", "format=nv12",
-                ])
-            else:
-                parts.extend([
-                    "zscale=t=linear:npl=100",
-                    "format=gbrpf32le",
-                    "zscale=p=bt709",
-                    "tonemap=hable:desat=0:peak=10",
-                    "zscale=t=bt709:m=bt709:r=tv",
-                    "format=yuv420p",
-                ])
-            parts.append(
-                "setparams=color_primaries=bt709:"
-                "color_trc=bt709:colorspace=bt709")
-        parts.append(self._animated_crop_filter(cr, anchor_frame, src_fps))
+        Animated crops never reach here — they go through the per-frame
+        Python pipe (``_render_animated``). ``setpts`` rebases to PTS=0
+        for clean muxing; the image-sequence path skips it (no muxer)."""
+        parts = self._hdr_prefix_parts(is_hdr)
+        parts.append(f"crop={int(cr.w)}:{int(cr.h)}:{int(cr.x)}:{int(cr.y)}")
+        parts.append(f"scale={out_w}:{out_h}")
         parts.append(f"fps={OUTPUT_FPS}")
         if include_setpts:
             parts.append("setpts=PTS-STARTPTS")
@@ -548,7 +690,8 @@ class CropExporter(QObject):
 
     def _build_video_cmd(self, cr: CropRegion, anchor_frame: int,
                          src_path: str, src_fps: float, codec_args: list,
-                         out_file: str, is_hdr: bool = False) -> list:
+                         out_file: str, out_w: int, out_h: int,
+                         is_hdr: bool = False) -> list:
         pre_ss, post_ss = self._two_stage_seek(anchor_frame, src_fps)
         cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
         if is_hdr:
@@ -560,8 +703,7 @@ class CropExporter(QObject):
             cmd += ["-ss", f"{post_ss:.6f}"]
         cmd += [
             "-an",
-            "-vf", self._video_filter(
-                cr, anchor_frame, is_hdr=is_hdr, src_fps=src_fps),
+            "-vf", self._video_filter(cr, out_w, out_h, is_hdr=is_hdr),
             "-frames:v", str(OUTPUT_FRAMES),
             "-fps_mode", "passthrough",
             "-video_track_timescale", "24000000",

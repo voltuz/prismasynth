@@ -366,7 +366,6 @@ def section_keyframes() -> SectionResult:
         INTERP_BEZIER, INTERP_LINEAR, INTERP_STEP, Keyframe, KeyframeTrack,
     )
     from core.timeline import TimelineModel
-    from core.crop_exporter import _piecewise_n_expr
 
     failures = 0
 
@@ -628,16 +627,40 @@ def section_keyframes() -> SectionResult:
     else:
         ok(f"keyframe fuzz: {ops_done} random ops, invariants held")
 
-    # --- Exporter expression builder ---
-    expr_const = _piecewise_n_expr([42] * 81)
-    check(expr_const == "42",
-          "piecewise expression collapses constant span to bare value")
-    expr_step = _piecewise_n_expr([10, 10, 10, 20, 20])
-    check("if(lte(n,2),10," in expr_step,
-          f"piecewise expression run-length encodes (got {expr_step})")
-    expr_uniq = _piecewise_n_expr([0, 1, 2])
-    check(expr_uniq.count("if(") == 2,
-          "piecewise expression nests one if() per distinct run")
+    # --- Aspect-constancy gate + output-dim math ---
+    # Animated crops are rendered per-frame in Python now (no ffmpeg crop
+    # expression). Export is allowed only when the aspect ratio stays
+    # constant across the window; the output is scaled to a fixed size.
+    from core.crop_region import segment_aspect_constant, crop_output_dims
+
+    pan_cr = CropRegion(x=0, y=0, w=400, h=400)
+    pan_cr.x_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 0}, {"frame": 200, "value": 200}]})
+    check(segment_aspect_constant(pan_cr, 0, 24.0) is True,
+          "pan-only animation keeps a constant aspect ratio (exportable)")
+
+    zoom_cr = CropRegion(x=0, y=0, w=400, h=400)
+    zoom_cr.w_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 800}]})
+    zoom_cr.h_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 800}]})
+    check(segment_aspect_constant(zoom_cr, 0, 24.0) is True,
+          "locked-AR zoom keeps a constant aspect ratio (exportable)")
+
+    shape_cr = CropRegion(x=0, y=0, w=400, h=400)
+    shape_cr.w_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 400}, {"frame": 200, "value": 800}]})
+    check(segment_aspect_constant(shape_cr, 0, 24.0) is False,
+          "width-only animation changes aspect ratio (blocked)")
+
+    check(crop_output_dims(zoom_cr, 0, 512) == (512, 512),
+          "crop_output_dims preserves 1:1 at requested width")
+    check(crop_output_dims(CropRegion(x=0, y=0, w=1920, h=1080), 0, 512)
+          == (512, 288),
+          "crop_output_dims preserves 16:9 at requested width")
+    check(crop_output_dims(CropRegion(x=0, y=0, w=1991, h=1991), 0, 513)
+          == (512, 512),
+          "crop_output_dims rounds to even dimensions")
 
     # --- Export segments ---
     from core.crop_region import Segment
@@ -733,6 +756,23 @@ def section_keyframes() -> SectionResult:
             check(len(jobs) == 2,
                   f"_build_jobs emits one job per active segment "
                   f"(got {len(jobs)}, expected 2)")
+
+            # An aspect-changing crop is skipped (can't be a fixed-res
+            # export) and recorded for the warning.
+            cr_ar = CropRegion(x=0, y=0, w=100, h=100,
+                               segments=[Segment(anchor_frame=0)])
+            cr_ar.w_track = KeyframeTrack.from_dict({"keys": [
+                {"frame": 0, "value": 100}, {"frame": 300, "value": 400}]})
+            tl3.add_crop_region(clip4.id, cr_ar)
+            exporter._skipped_ar = []
+            jobs2 = exporter._build_jobs({
+                "codec": "h264", "quality": 18, "out_width": 512,
+                "output_mode": "root_subfolders",
+                "root_dir": str(td_seg), "group_filter": None,
+            })
+            check(len(jobs2) == 2 and len(exporter._skipped_ar) == 1,
+                  f"_build_jobs skips aspect-changing crops "
+                  f"(jobs={len(jobs2)}, skipped={len(exporter._skipped_ar)})")
         finally:
             shutil.rmtree(td_seg, ignore_errors=True)
     except Exception as e:

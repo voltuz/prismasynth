@@ -294,3 +294,60 @@ def crop_matches_filter(crop: "CropRegion", group_filter) -> bool:
         return bool(group_filter.get("include_untagged", False))
     selected = set(group_filter.get("group_ids", []))
     return crop.group_id in selected
+
+
+# --- Animated-export geometry --------------------------------------------
+
+# Max relative drift in the sampled w/h ratio across an export window for the
+# segment to still count as "constant aspect ratio" (and therefore
+# exportable). Genuine aspect keyframes change the ratio by tens of percent;
+# int-rounding of the per-frame w/h only wobbles it by a fraction of a
+# percent, so a 3% gate cleanly separates the two.
+ASPECT_DRIFT_TOL = 0.03
+
+
+def _to_even(value: float) -> int:
+    """Round to the nearest positive even integer (encoder chroma-stride
+    requirement for yuv420). Never returns below 2."""
+    return max(2, int(round(value / 2.0)) * 2)
+
+
+def segment_aspect_constant(cr: "CropRegion", anchor_frame: int,
+                            src_fps: float,
+                            tol: float = ASPECT_DRIFT_TOL) -> bool:
+    """True iff the crop's width/height ratio stays within ``tol`` across the
+    81-frame@16fps window anchored at ``anchor_frame``.
+
+    Non-animated crops are trivially constant. Animated crops that change
+    *size* with a fixed aspect ratio (pan, or aspect-locked zoom) pass;
+    crops that change *shape* (aspect ratio) mid-window fail and must be
+    skipped on export — the fixed-resolution output can't represent a
+    changing aspect ratio without distortion.
+    """
+    if not cr.is_animated():
+        return True
+    n_src = required_source_frames(src_fps) + 2
+    ratios = []
+    for k in range(n_src):
+        _, _, w, h = cr.sample(anchor_frame + k)
+        if w <= 0 or h <= 0:
+            return False
+        ratios.append(w / h)
+    lo, hi = min(ratios), max(ratios)
+    if lo <= 0:
+        return False
+    return (hi - lo) / lo <= tol
+
+
+def crop_output_dims(cr: "CropRegion", anchor_frame: int,
+                     out_width: int) -> Tuple[int, int]:
+    """Even ``(out_w, out_h)`` for a crop exported at ``out_width`` pixels
+    wide, preserving the crop's aspect ratio (sampled at the anchor — which
+    is constant for any exportable crop). Height follows the ratio so crops
+    of differing shapes never get distorted by a single global width."""
+    _, _, w, h = cr.sample(anchor_frame)
+    if w <= 0 or h <= 0:
+        w, h = cr.w or 1, cr.h or 1
+    out_w = _to_even(out_width)
+    out_h = _to_even(out_width * h / w)
+    return out_w, out_h
