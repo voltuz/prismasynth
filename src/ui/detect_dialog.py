@@ -110,16 +110,17 @@ class DetectDialog(QDialog):
         self._detail_label.setVisible(False)
         layout.addWidget(self._detail_label)
 
-        # Buttons
+        # Buttons. Primary action (Detect) sits immediately left of Cancel;
+        # the conditional "Set up OmniShotCut" stays left as a utility.
         btn_layout = QHBoxLayout()
-        self._start_btn = QPushButton("Detect")
-        self._start_btn.clicked.connect(self._start_detection)
-        btn_layout.addWidget(self._start_btn)
         self._setup_btn = QPushButton("Set up OmniShotCut")
         self._setup_btn.clicked.connect(self._run_setup)
         self._setup_btn.setVisible(False)
         btn_layout.addWidget(self._setup_btn)
         btn_layout.addStretch()
+        self._start_btn = QPushButton("Detect")
+        self._start_btn.clicked.connect(self._start_detection)
+        btn_layout.addWidget(self._start_btn)
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.clicked.connect(self._cancel)
         btn_layout.addWidget(self._cancel_btn)

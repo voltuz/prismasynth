@@ -28,7 +28,8 @@ from PySide6.QtCore import QObject, Signal
 
 from core.crop_region import (
     CropRegion, OUTPUT_FPS, OUTPUT_FRAMES, crop_matches_filter,
-    crop_output_dims, exact_audio_samples_81_at_16, required_source_frames,
+    crop_native_dims, crop_output_dims, exact_audio_samples_81_at_16,
+    required_source_frames,
     segment_aspect_constant,
 )
 from core.exporter import (
@@ -221,8 +222,10 @@ class CropExporter(QObject):
                 raise ValueError(f"Unknown codec: {codec}")
             out_ext = preset["ext"]
 
-        # User-chosen output width (px). Height follows each crop's aspect
-        # ratio. 0/missing falls back to the crop's own sampled width.
+        # Output-resolution mode. "master": a global width (height follows
+        # each crop's aspect ratio). "native": each crop sized to its own
+        # biggest frame (1:1, no downscaling).
+        out_mode = settings.get("out_res_mode", "master")
         out_width = int(settings.get("out_width") or 0)
 
         groups = self._timeline.groups
@@ -257,8 +260,12 @@ class CropExporter(QObject):
                 if not segment_aspect_constant(cr, anchor, source.fps):
                     self._note_skipped(cr)
                     continue
-                eff_width = out_width if out_width > 0 else cr.sample(anchor)[2]
-                out_w, out_h = crop_output_dims(cr, anchor, eff_width)
+                if out_mode == "native":
+                    out_w, out_h = crop_native_dims(cr, anchor, source.fps)
+                else:
+                    eff_width = (out_width if out_width > 0
+                                 else cr.sample(anchor)[2])
+                    out_w, out_h = crop_output_dims(cr, anchor, eff_width)
                 base_name = (
                     f"{stem}_f{anchor}_{out_w}x{out_h}"
                     f"_{cr.id[:6]}_{seg.id[:4]}")
@@ -533,9 +540,12 @@ class CropExporter(QObject):
                 w = max(2, min(int(w), src_w - x))
                 h = max(2, min(int(h), src_h - y))
                 sub = frame[y:y + h, x:x + w]
-                interp = (cv2.INTER_AREA if (w >= out_w and h >= out_h)
-                          else cv2.INTER_CUBIC)
-                out = cv2.resize(sub, (out_w, out_h), interpolation=interp)
+                if w == out_w and h == out_h:
+                    out = sub  # exact match → true 1:1, no resampling
+                else:
+                    interp = (cv2.INTER_AREA if (w >= out_w and h >= out_h)
+                              else cv2.INTER_CUBIC)
+                    out = cv2.resize(sub, (out_w, out_h), interpolation=interp)
                 try:
                     p2.stdin.write(np.ascontiguousarray(out).tobytes())
                 except (BrokenPipeError, OSError):
@@ -662,7 +672,10 @@ class CropExporter(QObject):
         for clean muxing; the image-sequence path skips it (no muxer)."""
         parts = self._hdr_prefix_parts(is_hdr)
         parts.append(f"crop={int(cr.w)}:{int(cr.h)}:{int(cr.x)}:{int(cr.y)}")
-        parts.append(f"scale={out_w}:{out_h}")
+        # Skip the scale when the output already equals the crop box (e.g.
+        # native mode on an even-sized static crop) — true 1:1, no resample.
+        if (out_w, out_h) != (int(cr.w), int(cr.h)):
+            parts.append(f"scale={out_w}:{out_h}")
         parts.append(f"fps={OUTPUT_FPS}")
         if include_setpts:
             parts.append("setpts=PTS-STARTPTS")

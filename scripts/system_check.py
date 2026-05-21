@@ -659,7 +659,8 @@ def section_keyframes() -> SectionResult:
     # Animated crops are rendered per-frame in Python now (no ffmpeg crop
     # expression). Export is allowed only when the aspect ratio stays
     # constant across the window; the output is scaled to a fixed size.
-    from core.crop_region import segment_aspect_constant, crop_output_dims
+    from core.crop_region import (
+        segment_aspect_constant, crop_output_dims, crop_native_dims)
 
     pan_cr = CropRegion(x=0, y=0, w=400, h=400)
     pan_cr.x_track = KeyframeTrack.from_dict({"keys": [
@@ -689,6 +690,19 @@ def section_keyframes() -> SectionResult:
     check(crop_output_dims(CropRegion(x=0, y=0, w=1991, h=1991), 0, 513)
           == (512, 512),
           "crop_output_dims rounds to even dimensions")
+
+    # Native output dims = the largest crop frame over the window (even).
+    static_native = CropRegion(x=0, y=0, w=300, h=300)
+    check(crop_native_dims(static_native, 0, 24.0) == (300, 300),
+          "crop_native_dims = box size for a static crop")
+    nat = CropRegion(x=0, y=0, w=200, h=200)
+    nat.w_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 200}, {"frame": 300, "value": 401}]})
+    nat.h_track = KeyframeTrack.from_dict({"keys": [
+        {"frame": 0, "value": 200}, {"frame": 300, "value": 401}]})
+    nw, nh = crop_native_dims(nat, 0, 24.0)
+    check(nw == nh and nw >= 200 and nw % 2 == 0,
+          f"crop_native_dims tracks the biggest animated frame (got {nw}x{nh})")
 
     # --- Aspect-ratio lock is authoritative at sample time ---
     # Divergent w/h tracks (width animates, height static) under a 1:1

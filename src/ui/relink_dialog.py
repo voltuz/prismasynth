@@ -120,13 +120,14 @@ class RelinkDialog(QDialog):
         self._rebase_btn.clicked.connect(self._browse_for_all)
         bottom.addWidget(self._rebase_btn)
         bottom.addStretch()
-        self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.clicked.connect(self.reject)
-        bottom.addWidget(self._cancel_btn)
+        # Primary action left, Cancel right.
         self._ok_btn = QPushButton("OK")
         self._ok_btn.setDefault(True)
         self._ok_btn.clicked.connect(self.accept)
         bottom.addWidget(self._ok_btn)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self.reject)
+        bottom.addWidget(self._cancel_btn)
         layout.addLayout(bottom)
         # OK is enabled when every source is either explicitly handled
         # (relinked or skipped) OR already linked to an existing file.

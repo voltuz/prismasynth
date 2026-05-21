@@ -364,3 +364,23 @@ def crop_output_dims(cr: "CropRegion", anchor_frame: int,
     out_w = _to_even(out_width)
     out_h = _to_even(out_width * h / w)
     return out_w, out_h
+
+
+def crop_native_dims(cr: "CropRegion", anchor_frame: int,
+                     src_fps: float) -> Tuple[int, int]:
+    """Even ``(w, h)`` = the LARGEST crop size across the segment's window
+    (the most zoomed-out / biggest-box frame).
+
+    For 'native' output mode: sizing each file to its biggest frame means
+    that frame is ~1:1 and nothing is ever downscaled (smaller frames scale
+    up to match). Aspect ratio is constant for any exportable crop, so the
+    max width and its paired height occur on the same frame."""
+    n_src = required_source_frames(src_fps) + 2
+    best_w, best_h = 0, 0
+    for k in range(n_src):
+        _, _, w, h = cr.sample(int(anchor_frame) + k)
+        if w > best_w:
+            best_w, best_h = w, h
+    if best_w <= 0:
+        best_w, best_h = cr.w or 2, cr.h or 2
+    return _to_even(best_w), _to_even(best_h)

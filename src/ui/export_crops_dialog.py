@@ -209,12 +209,21 @@ class ExportCropsDialog(QDialog):
         self._timeline.groups_changed.connect(self._rebuild_per_group_rows)
         self._rebuild_per_group_rows()
 
-        # Output resolution. The user sets the WIDTH; each crop's height
-        # follows its own (constant) aspect ratio, so crops of differing
-        # shapes never get distorted by a single global size. Applies to
-        # both the Video and Image Sequence tabs.
-        res_row = QHBoxLayout()
-        res_row.addWidget(QLabel("Output width (px):"))
+        # Output resolution. Two modes (apply to both Video and Image
+        # Sequence tabs):
+        #  • Master width — one width for every crop, height per aspect ratio.
+        #  • Native — each crop sized to its biggest frame (1:1, no downscale).
+        res_box = QGroupBox("Output resolution")
+        res_v = QVBoxLayout(res_box)
+        res_v.setSpacing(s.px(2))
+        self._res_mode_group = QButtonGroup(self)
+
+        master_row = QHBoxLayout()
+        master_row.setContentsMargins(0, 0, 0, 0)
+        self._rb_master = QRadioButton("Master width:")
+        self._rb_master.setChecked(True)
+        self._res_mode_group.addButton(self._rb_master)
+        master_row.addWidget(self._rb_master)
         self._out_width_spin = QSpinBox()
         self._out_width_spin.setRange(16, 8192)
         self._out_width_spin.setSingleStep(2)
@@ -223,12 +232,20 @@ class ExportCropsDialog(QDialog):
             "Each crop is resampled to this width; height follows the "
             "crop's aspect ratio.")
         self._out_width_spin.valueChanged.connect(self._refresh_summary)
-        res_row.addWidget(self._out_width_spin)
-        res_hint = QLabel("height follows each crop's aspect ratio")
-        res_hint.setStyleSheet("color: #999;")
-        res_row.addWidget(res_hint)
-        res_row.addStretch(1)
-        outer.addLayout(res_row)
+        master_row.addWidget(self._out_width_spin)
+        master_hint = QLabel("px — height follows each crop's aspect ratio")
+        master_hint.setStyleSheet("color: #999;")
+        master_row.addWidget(master_hint)
+        master_row.addStretch(1)
+        res_v.addLayout(master_row)
+
+        self._rb_native = QRadioButton(
+            "Native — each crop at its largest frame's pixel size "
+            "(1:1, no downscaling)")
+        self._res_mode_group.addButton(self._rb_native)
+        res_v.addWidget(self._rb_native)
+        self._rb_master.toggled.connect(self._on_res_mode_changed)
+        outer.addWidget(res_box)
 
         # Tabs: Video / Image Sequence. FPS is fixed at 16fps and output
         # size comes from the width control above, so neither tab exposes
@@ -332,8 +349,9 @@ class ExportCropsDialog(QDialog):
         self._run_btn = QPushButton("Export")
         self._run_btn.setDefault(True)
         self._run_btn.clicked.connect(self._on_run)
-        btn_row.addWidget(self._cancel_btn)
+        # Primary action left, Cancel right (matches ExportDialog).
         btn_row.addWidget(self._run_btn)
+        btn_row.addWidget(self._cancel_btn)
         outer.addLayout(btn_row)
 
         self._on_mode_changed()
@@ -419,6 +437,11 @@ class ExportCropsDialog(QDialog):
         # Sync enabled state.
         self._on_mode_changed()
 
+    def _on_res_mode_changed(self):
+        # Width spin only applies in master mode.
+        self._out_width_spin.setEnabled(self._rb_master.isChecked())
+        self._refresh_summary()
+
     def _refresh_summary(self):
         flt = self._group_filter.current_filter()
         from core.crop_region import (
@@ -450,6 +473,12 @@ class ExportCropsDialog(QDialog):
         lines = []
         if export_count == 0:
             lines.append("No exportable segments match the current filter.")
+        elif self._rb_native.isChecked():
+            lines.append(
+                f"Will export {export_count} segment"
+                f"{'s' if export_count != 1 else ''} — each 81 frames @ 16 fps, "
+                f"at each crop's native largest-frame resolution (1:1), "
+                f"with audio.")
         else:
             lines.append(
                 f"Will export {export_count} segment"
@@ -497,6 +526,8 @@ class ExportCropsDialog(QDialog):
             "audio_format": audio_format,
             "group_filter": flt,
             "out_width": self._out_width_spin.value(),
+            "out_res_mode": ("native" if self._rb_native.isChecked()
+                             else "master"),
         }
         if is_root_mode:
             root_dir = self._root_edit.text().strip()
