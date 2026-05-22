@@ -729,30 +729,51 @@ class CropOverlay(QWidget):
                     nw = want_w
                 else:
                     nh = want_h
-            nw = max(MIN_CROP_SIZE, min(self._source_w, nw))
-            nh = max(MIN_CROP_SIZE, min(self._source_h, nh))
-            # Re-anchor based on which corner is pinned.
-            if h in (HIT_NW, HIT_W, HIT_SW):
-                x1 = x2 - nw
-            else:
-                x2 = x1 + nw
-            if h in (HIT_NW, HIT_N, HIT_NE):
-                y1 = y2 - nh
-            else:
+            # Cap the SIZE (ratio-preserving) to the largest box that fits
+            # the source from this handle's anchor, then position from that
+            # anchor. Do NOT clamp w/h independently (that stretches a
+            # locked crop) or translate afterwards (that drifts the box in
+            # a wrong direction once a handle passes the source edge).
+            # Corner handles pin the opposite corner (diagonal growth); SIDE
+            # handles pin the opposite edge on the dragged axis and grow the
+            # perpendicular (aspect-derived) axis symmetrically about the
+            # box center.
+            cx = x0 + w0 / 2.0
+            cy = y0 + h0 / 2.0
+            if h in (HIT_E, HIT_W):
+                max_w = (self._source_w - x1) if h == HIT_E else x2
+                max_h = 2.0 * min(cy, self._source_h - cy)
+            elif h in (HIT_N, HIT_S):
+                max_h = y2 if h == HIT_N else (self._source_h - y1)
+                max_w = 2.0 * min(cx, self._source_w - cx)
+            else:  # corner — distance from the pinned opposite corner
+                max_w = (self._source_w - x1) if h in (HIT_NE, HIT_SE) else x2
+                max_h = (self._source_h - y1) if h in (HIT_SW, HIT_SE) else y2
+            nw = int(min(nw, max_w, max_h * ar))  # floor → never exceeds frame
+            nh = int(nw / ar)
+            if h in (HIT_E, HIT_W):
+                if h == HIT_W:
+                    x1 = x2 - nw
+                else:
+                    x2 = x1 + nw
+                y1 = int(cy - nh / 2.0)
                 y2 = y1 + nh
-            # Clamp to source bounds.
-            if x1 < 0:
-                x2 -= x1
-                x1 = 0
-            if y1 < 0:
-                y2 -= y1
-                y1 = 0
-            if x2 > self._source_w:
-                x1 -= (x2 - self._source_w)
-                x2 = self._source_w
-            if y2 > self._source_h:
-                y1 -= (y2 - self._source_h)
-                y2 = self._source_h
+            elif h in (HIT_N, HIT_S):
+                if h == HIT_N:
+                    y1 = y2 - nh
+                else:
+                    y2 = y1 + nh
+                x1 = int(cx - nw / 2.0)
+                x2 = x1 + nw
+            else:
+                if h in (HIT_NW, HIT_W, HIT_SW):
+                    x1 = x2 - nw
+                else:
+                    x2 = x1 + nw
+                if h in (HIT_NW, HIT_N, HIT_NE):
+                    y1 = y2 - nh
+                else:
+                    y2 = y1 + nh
             nw, nh = x2 - x1, y2 - y1
         if nw < MIN_CROP_SIZE or nh < MIN_CROP_SIZE:
             return
