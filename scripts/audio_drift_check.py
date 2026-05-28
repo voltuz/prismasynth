@@ -30,7 +30,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -124,6 +123,44 @@ def _expected_samples_for_segments(segments, sample_rate: int = 48000) -> int:
     return total
 
 
+# ProRes size estimate: "MB per megapixel per frame" per profile, derived
+# from the nominal ProRes target data rates (rates are framerate-independent
+# per frame, so no fps term is needed). Ballpark only — ProRes is intra-frame
+# and content-dependent, so actual size varies with picture complexity.
+_PRORES_MB_PER_MP_FRAME = {
+    "prores_proxy": 0.09,
+    "prores_lt": 0.21,
+    "prores_standard": 0.30,
+    "prores_hq": 0.44,
+}
+
+
+def _fmt_bytes(n: float) -> str:
+    """Human-readable size, e.g. '37.9 GB'."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
+
+
+def _estimate_artifact_bytes(codec_key: str, frames: int, width: int,
+                             height: int, expected_samples: int) -> dict:
+    """Estimate the on-disk size of the artifacts the harness will create.
+    Returns a dict of {name: bytes} plus a 'total' key. ProRes video is an
+    approximation; the raw audio extract is exact."""
+    megapixels = (width * height) / 1_000_000.0
+    factor = _PRORES_MB_PER_MP_FRAME.get(codec_key, 0.30)
+    # 4 bytes per stereo 16-bit sample (2 ch x 2 bytes).
+    audio_bytes = expected_samples * 4
+    video_bytes = frames * megapixels * factor * 1_048_576 + audio_bytes
+    return {
+        "export.mov": video_bytes,
+        "raw_audio.s16le": audio_bytes,
+        "total": video_bytes + audio_bytes,
+    }
+
+
 def _resolve_group_filter(timeline, name: Optional[str]) -> Optional[dict]:
     """Look up a People group by display name; build the filter dict the
     Exporter expects. ``name=None`` returns no filter."""
@@ -209,7 +246,7 @@ def main(argv=None) -> int:
     p.add_argument("--codec", default="prores_proxy", choices=list(_PRESETS),
                    help="Codec preset (default: prores_proxy)")
     p.add_argument("--out", type=Path, default=None,
-                   help="Output dir (default: %%TEMP%%/audio_drift_check_<ts>)")
+                   help="Output dir (default: <project>/.audio_drift_check/<ts>)")
     p.add_argument("--prefix-frames", type=int, default=0,
                    help="Cap output to first N timeline frames (default: full)")
     p.add_argument("--include-gaps", action="store_true",
@@ -231,7 +268,7 @@ def main(argv=None) -> int:
     out_dir = args.out
     if out_dir is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = Path(tempfile.gettempdir()) / f"audio_drift_check_{ts}"
+        out_dir = ROOT / ".audio_drift_check" / ts
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[harness] Artefacts: {out_dir}")
 
@@ -320,6 +357,15 @@ def main(argv=None) -> int:
     }
     print(f"[harness] Output: {output_path}")
     print(f"[harness] Codec: {args.codec} ({' '.join(preset['args'])})")
+
+    # ---- Estimate disk usage before the (potentially huge) export --------
+    est = _estimate_artifact_bytes(
+        args.codec, total_video_frames, width, height, expected_samples)
+    print(f"[harness] Artifacts will be written to: {out_dir}")
+    print("[harness] Estimated disk usage (approximate):")
+    print(f"[harness]   export.mov        ~ {_fmt_bytes(est['export.mov'])}")
+    print(f"[harness]   raw_audio.s16le   ~ {_fmt_bytes(est['raw_audio.s16le'])}")
+    print(f"[harness]   total             ~ {_fmt_bytes(est['total'])}")
 
     # ---- Run export ------------------------------------------------------
     t0 = time.time()

@@ -21,6 +21,7 @@ build/
 src/libmpv-2.dll
 
 # Cache & temp
+.audio_drift_check/
 *.proxy
 *.jproxy
 *.jproxy.tmp
