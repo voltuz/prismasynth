@@ -128,11 +128,14 @@ class KeyframeGraph(QWidget):
         self._drag_handle: Optional[tuple] = None
         self._drag_pushed_undo: bool = False
         self.setMouseTracking(True)
-        self.setMinimumHeight(180)
-        self.setMinimumWidth(360)
+        self.setMinimumHeight(ui_scale().px(180))
+        self.setMinimumWidth(ui_scale().px(360))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # React to timeline mutations so the graph reflects undo / autokey.
         self._timeline.clips_changed.connect(self.update)
+        # Repaint when the UI scale changes — all the geometry below reads
+        # ui_scale() live, so a repaint is all that's needed to rescale.
+        ui_scale().changed.connect(self.update)
 
     # --- Public API -----------------------------------------------------
 
@@ -250,18 +253,48 @@ class KeyframeGraph(QWidget):
 
     # --- Coordinate mapping ---------------------------------------------
 
+    # Scaled geometry helpers. Each reads ui_scale() live so paint and
+    # hit-test consume the IDENTICAL value at the same instant (no cached
+    # drift), and the whole coordinate system tracks View -> UI Scale.
+    def _margin_x(self) -> int:
+        return ui_scale().px(_MARGIN_X)
+
+    def _margin_y(self) -> int:
+        return ui_scale().px(_MARGIN_Y)
+
+    def _ruler_h(self) -> int:
+        return ui_scale().px(_RULER_H)
+
+    def _plot_inset(self) -> int:
+        return ui_scale().px(6)
+
+    def _dot_r(self) -> int:
+        return ui_scale().px(_DOT_RADIUS)
+
+    def _handle_r(self) -> int:
+        return ui_scale().px(_HANDLE_RADIUS)
+
+    def _hit_tol(self) -> float:
+        return float(ui_scale().px(_HIT_TOL_PX))
+
     def _plot_rect(self) -> QRect:
-        top = _RULER_H + 6
-        return QRect(_MARGIN_X, top,
-                     max(1, self.width() - _MARGIN_X - 6),
-                     max(1, self.height() - top - _MARGIN_Y))
+        mx = self._margin_x()
+        inset = self._plot_inset()
+        top = self._ruler_h() + inset
+        return QRect(mx, top,
+                     max(1, self.width() - mx - inset),
+                     max(1, self.height() - top - self._margin_y()))
 
     def _ruler_rect(self) -> QRect:
         """Frame-number / playhead-triangle strip across the top, sharing
         the plot's horizontal extent so frame↔pixel mapping is identical.
-        Sits ABOVE the plot so clicks here can't disturb keyframe edits."""
-        return QRect(_MARGIN_X, 2,
-                     max(1, self.width() - _MARGIN_X - 6), _RULER_H)
+        Sits ABOVE the plot so clicks here can't disturb keyframe edits.
+        Uses the SAME _margin_x()/inset as _plot_rect() so the two rects
+        share an exact horizontal extent at every scale."""
+        mx = self._margin_x()
+        inset = self._plot_inset()
+        return QRect(mx, ui_scale().px(2),
+                     max(1, self.width() - mx - inset), self._ruler_h())
 
     def _frame_to_px(self, frame: float) -> float:
         r = self._plot_rect()
@@ -348,7 +381,7 @@ class KeyframeGraph(QWidget):
         painter.setPen(QPen(_GRID_COLOR, 1, Qt.PenStyle.DotLine))
         # Vertical gridlines at every ~80px (frame numbers live in the
         # ruler strip — see _paint_ruler).
-        n_ticks = max(2, r.width() // 80)
+        n_ticks = max(2, r.width() // ui_scale().px(80))
         for i in range(n_ticks + 1):
             x = r.left() + i * r.width() / n_ticks
             painter.drawLine(int(x), r.top(), int(x), r.bottom())
@@ -360,12 +393,15 @@ class KeyframeGraph(QWidget):
         painter.fillRect(rr, QColor("#222222"))
         pr = self._plot_rect()
         # Frame-number labels aligned with the plot's vertical gridlines.
-        n_ticks = max(2, pr.width() // 80)
+        # Use the SAME tick count as _paint_grid (identical scale + rect)
+        # so labels stay registered to the gridlines.
+        n_ticks = max(2, pr.width() // ui_scale().px(80))
         painter.setPen(QColor("#999"))
         for i in range(n_ticks + 1):
             x = pr.left() + i * pr.width() / n_ticks
             frame = self._px_to_frame(x)
-            painter.drawText(int(x) - 20, rr.bottom() - 4, f"{int(frame)}")
+            painter.drawText(int(x) - ui_scale().px(20),
+                             rr.bottom() - ui_scale().px(4), f"{int(frame)}")
         painter.setPen(QPen(_AXIS_COLOR, 1))
         painter.drawLine(rr.left(), rr.bottom(), rr.right(), rr.bottom())
 
@@ -383,8 +419,8 @@ class KeyframeGraph(QWidget):
         # main timeline). This ruler band is the ONLY place the playhead
         # is grabbable, so editing keyframes in the plot can't move it.
         rr = self._ruler_rect()
-        tw = 6
-        base_y = rr.bottom() - 8
+        tw = ui_scale().px(6)
+        base_y = rr.bottom() - ui_scale().px(8)
         apex_y = rr.bottom()
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(_PLAYHEAD_COLOR))
@@ -413,7 +449,7 @@ class KeyframeGraph(QWidget):
         # every visible pixel column.
         r = self._plot_rect()
         if track:
-            painter.setPen(QPen(color, 2))
+            painter.setPen(QPen(color, ui_scale().px(2)))
             # Walk per-segment so we honour the actual interpolation
             # type instead of approximating bezier with line segments
             # of unknown density.
@@ -501,8 +537,8 @@ class KeyframeGraph(QWidget):
         else:
             painter.setPen(QPen(QColor("#202020"), 1))
         painter.setBrush(QBrush(color))
-        painter.drawEllipse(QPoint(int(x), int(y)),
-                            _DOT_RADIUS, _DOT_RADIUS)
+        dr = self._dot_r()
+        painter.drawEllipse(QPoint(int(x), int(y)), dr, dr)
 
         # Bezier handles only render for selected bezier keys.
         if selected and k.interp == INTERP_BEZIER:
@@ -530,10 +566,9 @@ class KeyframeGraph(QWidget):
         painter.drawLine(int(x), int(y), int(out_x), int(out_y))
         painter.setPen(QPen(QColor("#202020"), 1))
         painter.setBrush(QBrush(QColor("#ffffff")))
-        painter.drawEllipse(QPoint(int(in_x), int(in_y)),
-                            _HANDLE_RADIUS, _HANDLE_RADIUS)
-        painter.drawEllipse(QPoint(int(out_x), int(out_y)),
-                            _HANDLE_RADIUS, _HANDLE_RADIUS)
+        hr = self._handle_r()
+        painter.drawEllipse(QPoint(int(in_x), int(in_y)), hr, hr)
+        painter.drawEllipse(QPoint(int(out_x), int(out_y)), hr, hr)
 
     # --- Hit testing ----------------------------------------------------
 
@@ -542,7 +577,8 @@ class KeyframeGraph(QWidget):
         if cr is None:
             return None
         best = None
-        best_d2 = _HIT_TOL_PX * _HIT_TOL_PX
+        tol = self._hit_tol()
+        best_d2 = tol * tol
         for axis in _AXES:
             if not self._visible[axis]:
                 continue
@@ -573,8 +609,9 @@ class KeyframeGraph(QWidget):
                     ("in", k.in_handle), ("out", k.out_handle)):
                 hx = self._frame_to_px(sf + dx_off)
                 hy = self._value_to_px(cr, axis, k.value + dy_off)
-                if (abs(pt.x() - hx) <= _HANDLE_RADIUS + 3
-                        and abs(pt.y() - hy) <= _HANDLE_RADIUS + 3):
+                slack = self._handle_r() + ui_scale().px(3)
+                if (abs(pt.x() - hx) <= slack
+                        and abs(pt.y() - hy) <= slack):
                     return (axis, sf, side)
         return None
 
@@ -586,7 +623,7 @@ class KeyframeGraph(QWidget):
         if cr is None:
             return None
         best_axis = None
-        best_d = 10  # tight pixel tolerance
+        best_d = ui_scale().px(10)  # tight pixel tolerance (scaled)
         frame = self._px_to_frame(pt.x())
         for axis in _AXES:
             if not self._visible[axis]:
@@ -1057,8 +1094,9 @@ class KeyframeEditorWindow(QWidget):
         self.setWindowTitle("Keyframe Editor")
 
         self._timeline = timeline
+        s = ui_scale()
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 6)
+        layout.setContentsMargins(s.px(6), s.px(4), s.px(6), s.px(6))
 
         # Toolbar
         toolbar = QHBoxLayout()
@@ -1078,9 +1116,10 @@ class KeyframeEditorWindow(QWidget):
             # the indicator the same blue in both states.
             box.setStyleSheet(
                 f"QCheckBox {{ color: {color}; font-weight: bold;"
-                " spacing: 5px; }"
-                "QCheckBox::indicator { width: 13px; height: 13px;"
-                " border: 1px solid #888; border-radius: 3px;"
+                f" spacing: {s.px(5)}px; }}"
+                f"QCheckBox::indicator {{ width: {s.px(13)}px;"
+                f" height: {s.px(13)}px;"
+                f" border: 1px solid #888; border-radius: {s.px(3)}px;"
                 " background: #2b2b2b; }"
                 f"QCheckBox::indicator:checked {{ background: {color};"
                 f" border: 1px solid {color}; }}"
@@ -1091,7 +1130,7 @@ class KeyframeEditorWindow(QWidget):
             toolbar.addWidget(box)
             self._axis_boxes[axis] = box
         fit_btn = QPushButton("Fit")
-        fit_btn.setFixedWidth(40)
+        fit_btn.setFixedWidth(s.px(40))
         fit_btn.clicked.connect(lambda: self._graph.fit_x_axis())
         toolbar.addWidget(fit_btn)
         # Interp buttons — apply to the current keyframe selection.

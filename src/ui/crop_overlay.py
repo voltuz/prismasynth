@@ -24,6 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from core.crop_region import CropRegion, resolve_aspect
+from core.ui_scale import ui_scale
 
 
 # Handle hit-test size in widget pixels (each side of the square handle).
@@ -103,6 +104,9 @@ class CropOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,
                           True)
         self.setVisible(False)
+        # Repaint on UI-scale change so the (live-read) scaled resize handles
+        # update without waiting for the next mouse move.
+        ui_scale().changed.connect(self.update)
         # We want keyboard input for Delete / Escape only when edit mode is
         # on; we set this dynamically.
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -465,7 +469,7 @@ class CropOverlay(QWidget):
     def _paint_handles(self, painter: QPainter, sel_rect: QRectF):
         painter.setPen(QPen(QColor("#5577aa"), 1))
         painter.setBrush(QBrush(QColor("#ffffff")))
-        size = HANDLE_PX
+        size = ui_scale().px(HANDLE_PX)
         half = size / 2.0
         for hx, hy in self._handle_centers(sel_rect):
             painter.drawRect(QRectF(hx - half, hy - half, size, size))
@@ -599,7 +603,7 @@ class CropOverlay(QWidget):
         return None
 
     def _handle_hit(self, pt: QPoint, sel_rect: QRectF) -> str:
-        size = HANDLE_PX
+        size = ui_scale().px(HANDLE_PX)
         half = size / 2.0
         for h, (hx, hy) in zip(_HANDLES, self._handle_centers(sel_rect)):
             if (abs(pt.x() - hx) <= half + 1

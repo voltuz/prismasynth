@@ -66,162 +66,177 @@ class _SourceThumbWorker(QRunnable):
 
 logger = logging.getLogger(__name__)
 
-DARK_STYLE = """
-QMainWindow, QWidget {
-    background-color: #2b2b2b;
-    color: #ddd;
-}
-QToolBar {
-    background-color: #333;
-    border: none;
-    spacing: 4px;
-    padding: 2px;
-}
-QToolBar QToolButton {
-    background-color: #444;
-    color: #ddd;
-    border: 1px solid #555;
-    border-radius: 3px;
-    padding: 4px 10px;
-    margin: 1px;
-}
-QToolBar QToolButton:hover {
-    background-color: #555;
-}
-QToolBar QToolButton:pressed {
-    background-color: #666;
-}
-QToolBar QToolButton:checked {
-    background-color: #5577aa;
-    border-color: #6688bb;
-}
-QStatusBar {
-    background-color: #333;
-    color: #aaa;
-}
-QMenuBar {
-    background-color: #333;
-    color: #ddd;
-}
-QMenuBar::item {
-    background-color: transparent;
-    padding: 4px 10px;
-}
-QMenuBar::item:selected {
-    background-color: #555;
-}
-QMenuBar::item:pressed {
-    background-color: #5577aa;
-}
-QMenu {
-    background-color: #333;
-    color: #ddd;
-    border: 1px solid #555;
-    padding: 4px 0;
-}
-QMenu::item {
-    padding: 5px 28px 5px 32px;
-}
-QMenu::icon {
-    padding-left: 10px;
-}
-QMenu::item:selected {
-    background-color: #5577aa;
-    color: #fff;
-}
-QMenu::separator {
-    height: 1px;
-    background: #555;
-    margin: 4px 8px;
-}
-QGroupBox {
-    border: 1px solid #555;
-    border-radius: 4px;
-    margin-top: 8px;
-    padding-top: 12px;
-    color: #ccc;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    padding: 0 4px;
-}
-QScrollBar:horizontal {
-    background: #333;
-    height: 14px;
-    border: none;
-}
-QScrollBar::handle:horizontal {
-    background: #666;
-    min-width: 30px;
-    border-radius: 3px;
-}
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-    width: 0;
-}
-QScrollBar:vertical {
-    background: #333;
-    width: 14px;
-    border: none;
-}
-QScrollBar::handle:vertical {
-    background: #666;
-    min-height: 30px;
-    border-radius: 3px;
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0;
-}
-QSplitter::handle {
-    background-color: #444;
-    height: 4px;
-}
-QProgressBar {
-    border: 1px solid #555;
-    border-radius: 3px;
-    text-align: center;
-    background-color: #333;
-    color: #ddd;
-}
-QProgressBar::chunk {
-    background-color: #5577aa;
-}
-QDialog {
-    background-color: #2b2b2b;
-    color: #ddd;
-}
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-    background-color: #3a3a3a;
-    color: #ddd;
-    border: 1px solid #555;
-    border-radius: 3px;
-    padding: 3px;
-}
-QPushButton {
-    background-color: #444;
-    color: #ddd;
-    border: 1px solid #555;
-    border-radius: 3px;
-    padding: 5px 15px;
-}
-QPushButton:hover {
-    background-color: #555;
-}
-QTabWidget::pane {
-    border: 1px solid #555;
-    background-color: #2b2b2b;
-}
-QTabBar::tab {
-    background-color: #3a3a3a;
-    color: #ccc;
-    border: 1px solid #555;
-    padding: 6px 16px;
-}
-QTabBar::tab:selected {
-    background-color: #4a4a4a;
-    color: #fff;
-}
-"""
+def _dark_style() -> str:
+    """Build the dark Fusion stylesheet at the current UI scale.
+
+    Every px chrome dimension routes through ``ui_scale().px()`` so menus,
+    toolbar buttons, scrollbars, tabs, inputs and group boxes scale with the
+    View -> UI Scale setting. Colors and 1px hairlines / separators stay
+    literal for crispness.
+
+    Built by string concatenation (not one big f-string) so the literal Qt
+    ``{ }`` braces live in plain string fragments and never need ``{{ }}``
+    escaping; only value fragments are f-strings. Re-applied on
+    ``UIScale.changed`` (a deliberate, rare user action), so the one-time
+    re-polish of the widget tree is irrelevant to runtime perf.
+    """
+    s = ui_scale()
+    return (
+        "QMainWindow, QWidget {\n"
+        "    background-color: #2b2b2b;\n"
+        "    color: #ddd;\n"
+        "}\n"
+        "QToolBar {\n"
+        "    background-color: #333;\n"
+        "    border: none;\n"
+        f"    spacing: {s.px(4)}px;\n"
+        f"    padding: {s.px(2)}px;\n"
+        "}\n"
+        "QToolBar QToolButton {\n"
+        "    background-color: #444;\n"
+        "    color: #ddd;\n"
+        "    border: 1px solid #555;\n"
+        f"    border-radius: {s.px(3)}px;\n"
+        f"    padding: {s.px(4)}px {s.px(10)}px;\n"
+        f"    margin: {s.px(1)}px;\n"
+        "}\n"
+        "QToolBar QToolButton:hover {\n"
+        "    background-color: #555;\n"
+        "}\n"
+        "QToolBar QToolButton:pressed {\n"
+        "    background-color: #666;\n"
+        "}\n"
+        "QToolBar QToolButton:checked {\n"
+        "    background-color: #5577aa;\n"
+        "    border-color: #6688bb;\n"
+        "}\n"
+        "QStatusBar {\n"
+        "    background-color: #333;\n"
+        "    color: #aaa;\n"
+        "}\n"
+        "QMenuBar {\n"
+        "    background-color: #333;\n"
+        "    color: #ddd;\n"
+        "}\n"
+        "QMenuBar::item {\n"
+        "    background-color: transparent;\n"
+        f"    padding: {s.px(4)}px {s.px(10)}px;\n"
+        "}\n"
+        "QMenuBar::item:selected {\n"
+        "    background-color: #555;\n"
+        "}\n"
+        "QMenuBar::item:pressed {\n"
+        "    background-color: #5577aa;\n"
+        "}\n"
+        "QMenu {\n"
+        "    background-color: #333;\n"
+        "    color: #ddd;\n"
+        "    border: 1px solid #555;\n"
+        f"    padding: {s.px(4)}px 0;\n"
+        "}\n"
+        "QMenu::item {\n"
+        f"    padding: {s.px(5)}px {s.px(28)}px {s.px(5)}px {s.px(32)}px;\n"
+        "}\n"
+        "QMenu::icon {\n"
+        f"    padding-left: {s.px(10)}px;\n"
+        "}\n"
+        "QMenu::item:selected {\n"
+        "    background-color: #5577aa;\n"
+        "    color: #fff;\n"
+        "}\n"
+        "QMenu::separator {\n"
+        "    height: 1px;\n"
+        "    background: #555;\n"
+        f"    margin: {s.px(4)}px {s.px(8)}px;\n"
+        "}\n"
+        "QGroupBox {\n"
+        "    border: 1px solid #555;\n"
+        f"    border-radius: {s.px(4)}px;\n"
+        f"    margin-top: {s.px(8)}px;\n"
+        f"    padding-top: {s.px(12)}px;\n"
+        "    color: #ccc;\n"
+        "}\n"
+        "QGroupBox::title {\n"
+        "    subcontrol-origin: margin;\n"
+        "    subcontrol-position: top left;\n"
+        f"    padding: 0 {s.px(4)}px;\n"
+        "}\n"
+        "QScrollBar:horizontal {\n"
+        "    background: #333;\n"
+        f"    height: {s.px(14)}px;\n"
+        "    border: none;\n"
+        "}\n"
+        "QScrollBar::handle:horizontal {\n"
+        "    background: #666;\n"
+        f"    min-width: {s.px(30)}px;\n"
+        f"    border-radius: {s.px(3)}px;\n"
+        "}\n"
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {\n"
+        "    width: 0;\n"
+        "}\n"
+        "QScrollBar:vertical {\n"
+        "    background: #333;\n"
+        f"    width: {s.px(14)}px;\n"
+        "    border: none;\n"
+        "}\n"
+        "QScrollBar::handle:vertical {\n"
+        "    background: #666;\n"
+        f"    min-height: {s.px(30)}px;\n"
+        f"    border-radius: {s.px(3)}px;\n"
+        "}\n"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {\n"
+        "    height: 0;\n"
+        "}\n"
+        "QSplitter::handle {\n"
+        "    background-color: #444;\n"
+        f"    height: {s.px(4)}px;\n"
+        "}\n"
+        "QProgressBar {\n"
+        "    border: 1px solid #555;\n"
+        f"    border-radius: {s.px(3)}px;\n"
+        "    text-align: center;\n"
+        "    background-color: #333;\n"
+        "    color: #ddd;\n"
+        "}\n"
+        "QProgressBar::chunk {\n"
+        "    background-color: #5577aa;\n"
+        "}\n"
+        "QDialog {\n"
+        "    background-color: #2b2b2b;\n"
+        "    color: #ddd;\n"
+        "}\n"
+        "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {\n"
+        "    background-color: #3a3a3a;\n"
+        "    color: #ddd;\n"
+        "    border: 1px solid #555;\n"
+        f"    border-radius: {s.px(3)}px;\n"
+        f"    padding: {s.px(3)}px;\n"
+        "}\n"
+        "QPushButton {\n"
+        "    background-color: #444;\n"
+        "    color: #ddd;\n"
+        "    border: 1px solid #555;\n"
+        f"    border-radius: {s.px(3)}px;\n"
+        f"    padding: {s.px(5)}px {s.px(15)}px;\n"
+        "}\n"
+        "QPushButton:hover {\n"
+        "    background-color: #555;\n"
+        "}\n"
+        "QTabWidget::pane {\n"
+        "    border: 1px solid #555;\n"
+        "    background-color: #2b2b2b;\n"
+        "}\n"
+        "QTabBar::tab {\n"
+        "    background-color: #3a3a3a;\n"
+        "    color: #ccc;\n"
+        "    border: 1px solid #555;\n"
+        f"    padding: {s.px(6)}px {s.px(16)}px;\n"
+        "}\n"
+        "QTabBar::tab:selected {\n"
+        "    background-color: #4a4a4a;\n"
+        "    color: #fff;\n"
+        "}\n"
+    )
 
 
 class MainWindow(QMainWindow):
@@ -287,8 +302,8 @@ class MainWindow(QMainWindow):
         self._gap_start_time = 0.0      # monotonic time when gap playback started
         self._gap_start_frame = 0       # timeline frame at gap start
 
-        # Apply dark theme
-        self.setStyleSheet(DARK_STYLE)
+        # Apply dark theme (scale-aware — re-applied on UIScale.changed).
+        self.setStyleSheet(_dark_style())
 
         # Customizable-shortcut registry. Created before menus so QActions
         # built in _setup_menus pick up any user overrides.
@@ -995,7 +1010,7 @@ class MainWindow(QMainWindow):
         }
 
         view_menu.addSeparator()
-        keyframe_editor_action = QAction("Keyframe Editor", self)
+        keyframe_editor_action = QAction(icon("keyframe"), "Keyframe Editor", self)
         keyframe_editor_action.setCheckable(True)
         keyframe_editor_action.setToolTip(
             "Show / hide the crop-region keyframe graph editor")
@@ -1008,7 +1023,7 @@ class MainWindow(QMainWindow):
 
         view_menu.addSeparator()
         from ui import sound_loader
-        completion_sound_action = QAction("Completion Sound", self)
+        completion_sound_action = QAction(icon("bell"), "Completion Sound", self)
         completion_sound_action.setCheckable(True)
         completion_sound_action.setChecked(sound_loader.is_enabled())
         completion_sound_action.setToolTip(
@@ -1569,6 +1584,11 @@ class MainWindow(QMainWindow):
         left absolute (they reflect deliberate user gestures). Persistent
         panels manage their own re-apply via their own UIScale.changed slots."""
         s = ui_scale()
+        # Rebuild the global chrome stylesheet at the new scale. This cascades
+        # to every child widget and to dialogs parented to this window, so it
+        # rescales menus / toolbar buttons / scrollbars / tabs / inputs in one
+        # shot. Fires only on the deliberate View -> UI Scale action.
+        self.setStyleSheet(_dark_style())
         # Top separator + splitter handle (visual chrome only).
         try:
             self._top_separator.setFixedHeight(s.px(4))
@@ -1613,6 +1633,10 @@ class MainWindow(QMainWindow):
         self._start_thumbnail_cache()
         self._dirty = True
         self._update_status()
+        # Un-blank the preview so a freshly dropped clip shows its first frame
+        # without the user having to scrub. Playhead stays put; set_playhead
+        # is a no-op at the same frame, so refresh explicitly. Stays paused.
+        self._refresh_preview_at(self._timeline_widget.strip.playhead_frame)
 
     def _on_timeline_files_dropped(self, paths: list, frame: int):
         """Files dropped directly on the timeline: import to pool AND insert
@@ -1818,6 +1842,22 @@ class MainWindow(QMainWindow):
 
     # --- Playhead ---
 
+    def _refresh_preview_at(self, frame: int):
+        """Load + seek the preview to the clip under ``frame`` (black for a
+        gap or empty timeline). Shared by playhead scrub, cut-mode hover, and
+        the drop handler so a freshly added clip shows its first frame
+        immediately without the user having to scrub."""
+        result = self._timeline.get_clip_at_position(frame)
+        if result is None or result[0].is_gap:
+            self._preview.show_black()
+            return
+        clip, offset = result
+        source = self._sources.get(clip.source_id)
+        if source:
+            source_frame = clip.source_in + offset
+            self._preview.load_source(source.file_path)
+            self._preview.seek_to_frame(source_frame, source.fps)
+
     def _on_playhead_changed(self, frame: int):
         # Playback-driven update — just sync UI, don't touch mpv
         if self._playback_updating:
@@ -1851,15 +1891,7 @@ class MainWindow(QMainWindow):
         # playhead drag feels laggy.
 
         # Seek mpv to the correct source frame (GPU-accelerated)
-        if result is None or result[0].is_gap:
-            self._preview.show_black()
-            return
-        clip, offset = result
-        source = self._sources.get(clip.source_id)
-        if source:
-            source_frame = clip.source_in + offset
-            self._preview.load_source(source.file_path)
-            self._preview.seek_to_frame(source_frame, source.fps)
+        self._refresh_preview_at(frame)
 
     def _resume_thumbnails(self):
         if self._thumbnail_cache:
@@ -2024,17 +2056,7 @@ class MainWindow(QMainWindow):
         """Preview a frame without moving the playhead (cut mode hover scrub)."""
         # EXPERIMENT v0.9.x: same as _on_playhead_changed — coordinator
         # stays running during cut-mode hover. Revert if hover feels laggy.
-
-        result = self._timeline.get_clip_at_position(frame)
-        if result is None or result[0].is_gap:
-            self._preview.show_black()
-            return
-        clip, offset = result
-        source = self._sources.get(clip.source_id)
-        if source:
-            source_frame = clip.source_in + offset
-            self._preview.load_source(source.file_path)
-            self._preview.seek_to_frame(source_frame, source.fps)
+        self._refresh_preview_at(frame)
 
     def _on_cut_at_frame(self, frame: int):
         """Handle a cut-mode click: split the clip at this frame, select left half."""

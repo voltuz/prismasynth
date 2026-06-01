@@ -40,7 +40,8 @@ class SourceInfoDialog(QDialog):
         layout.addWidget(self._thumb, 0, Qt.AlignmentFlag.AlignCenter)
 
         self._title = QLabel("")
-        self._title.setStyleSheet("font-weight: bold; font-size: 13px; color: #ddd;")
+        self._title.setStyleSheet(
+            f"font-weight: bold; font-size: {s.px(13)}px; color: #ddd;")
         self._title.setWordWrap(True)
         layout.addWidget(self._title)
 

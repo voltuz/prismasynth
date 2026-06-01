@@ -87,14 +87,14 @@ class _PerGroupRow(QWidget):
         layout.setSpacing(s.px(6))
         if color is not None:
             swatch = QLabel()
-            swatch.setFixedSize(12, 12)
+            swatch.setFixedSize(s.px(12), s.px(12))
             swatch.setStyleSheet(
                 f"background-color: {color}; border: 1px solid #555;"
-                f" border-radius: 2px;")
+                f" border-radius: {s.px(2)}px;")
             layout.addWidget(swatch)
         else:
             spacer = QLabel()
-            spacer.setFixedSize(12, 12)
+            spacer.setFixedSize(s.px(12), s.px(12))
             layout.addWidget(spacer)
         name = QLabel(label)
         name.setMinimumWidth(s.px(120))

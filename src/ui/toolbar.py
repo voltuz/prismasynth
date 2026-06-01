@@ -1,8 +1,9 @@
 from PySide6.QtWidgets import QToolBar, QWidget
 from PySide6.QtGui import QAction, QActionGroup
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QSize
 
 from ui.icon_loader import icon
+from core.ui_scale import ui_scale
 
 
 class MainToolbar(QToolBar):
@@ -79,13 +80,29 @@ class MainToolbar(QToolBar):
         self._export_action.triggered.connect(self.export_clicked.emit)
         self.addAction(self._export_action)
 
+        # Apply the current UI scale (icon size + play/pause width reservation)
+        # and keep it live as the user changes View -> UI Scale. The toolbar
+        # self-wires, matching how the other persistent widgets connect.
+        self._apply_scale()
+        ui_scale().changed.connect(self._apply_scale)
+
+    def _apply_scale(self):
+        n = ui_scale().px(20)
+        self.setIconSize(QSize(n, n))
+        self._reserve_play_width()
+
+    def _reserve_play_width(self):
         # Reserve width for the longest play/pause label so toggling doesn't
-        # shift the buttons to the right of it.
+        # shift the buttons to the right of it. Capture and restore the CURRENT
+        # text (it may be "Pause" mid-playback when a live rescale fires) rather
+        # than a hardcoded literal.
         play_btn = self.widgetForAction(self._play_action)
-        if play_btn is not None:
-            self._play_action.setText("Pause")
-            play_btn.setMinimumWidth(play_btn.sizeHint().width())
-            self._play_action.setText("Play")
+        if play_btn is None:
+            return
+        current = self._play_action.text()
+        self._play_action.setText("Pause")
+        play_btn.setMinimumWidth(play_btn.sizeHint().width())
+        self._play_action.setText(current)
 
     def _on_mode_action_triggered(self, action):
         if action == self._selection_mode_action:

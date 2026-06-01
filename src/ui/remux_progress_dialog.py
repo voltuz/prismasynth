@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.timebase_remuxer import RemuxJob, RemuxJobSpec
+from core.ui_scale import ui_scale
 
 
 # Sub-percent precision avoids the visual "stair-step" of integer-percent
@@ -42,7 +43,7 @@ class RemuxProgressDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Remuxing source files")
         self.setModal(True)
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(ui_scale().px(540))
 
         self._total = max(1, len(jobs))
         self._current_idx = 0
@@ -62,7 +63,8 @@ class RemuxProgressDialog(QDialog):
         layout.addWidget(self._bar)
 
         self._detail = QLabel("")
-        self._detail.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._detail.setStyleSheet(
+            f"color: #aaa; font-size: {ui_scale().px(11)}px;")
         self._detail.setWordWrap(True)
         layout.addWidget(self._detail)
 

@@ -457,8 +457,6 @@ class ClipInfoPanel(QWidget):
         ui_scale().changed.connect(self._on_ui_scale_changed)
 
         self._title = QLabel("No clip selected")
-        self._title.setStyleSheet(
-            "font-weight: bold; font-size: 13px; color: #ddd;")
         layout.addWidget(self._title)
 
         # ---- Clip Details ------------------------------------------------
@@ -505,7 +503,6 @@ class ClipInfoPanel(QWidget):
         # Inline status hint (clip too short / no clip / gap selected)
         self._hint_label = QLabel()
         self._hint_label.setWordWrap(True)
-        self._hint_label.setStyleSheet("color: #888; font-size: 11px;")
         crops_layout.addWidget(self._hint_label)
 
         # Scrollable rows area
@@ -547,6 +544,7 @@ class ClipInfoPanel(QWidget):
         self._update_crop_section_enabled()
         self._refresh_keyframe_section()
         self._refresh_segments_section()
+        self._apply_label_styles()
 
     def eventFilter(self, obj, event):
         # Click on blank Clip-panel space → clear crop selection.
@@ -580,7 +578,6 @@ class ClipInfoPanel(QWidget):
         outer.addWidget(self._kf_header)
 
         self._kf_frame_label = QLabel("frame —")
-        self._kf_frame_label.setStyleSheet("color: #888; font-size: 11px;")
         outer.addWidget(self._kf_frame_label)
 
         # Per-group grid. Columns: name (flex) | nav cluster | count | interp.
@@ -626,7 +623,6 @@ class ClipInfoPanel(QWidget):
             grid.addLayout(nav, row, 1)
 
             count = QLabel("0 keys")
-            count.setStyleSheet("color: #888; font-size: 11px;")
             count.setMinimumWidth(s.px(48))
             grid.addWidget(count, row, 2)
 
@@ -672,7 +668,6 @@ class ClipInfoPanel(QWidget):
 
         self._seg_hint = QLabel("Select a crop to manage export segments.")
         self._seg_hint.setWordWrap(True)
-        self._seg_hint.setStyleSheet("color: #888; font-size: 11px;")
         v.addWidget(self._seg_hint)
 
         self._seg_scroll = QScrollArea()
@@ -791,12 +786,28 @@ class ClipInfoPanel(QWidget):
 
     # ------------------------------------------------------------------
 
+    def _apply_label_styles(self):
+        """(Re)apply the scaled inline label styles. Called at construction and
+        on every UI-scale change so the hint/title font sizes track the scale —
+        a plain ``font-size: 11px`` stylesheet would otherwise stay frozen and
+        not respond to View -> UI Scale."""
+        s = ui_scale()
+        hint = f"color: #888; font-size: {s.px(11)}px;"
+        self._title.setStyleSheet(
+            f"font-weight: bold; font-size: {s.px(13)}px; color: #ddd;")
+        self._hint_label.setStyleSheet(hint)
+        self._kf_frame_label.setStyleSheet(hint)
+        self._seg_hint.setStyleSheet(hint)
+        for w in self._kf_widgets.values():
+            w["count"].setStyleSheet(hint)
+
     def _on_ui_scale_changed(self):
         s = ui_scale()
         self.setMinimumWidth(s.px(220))
         self._outer_layout.setContentsMargins(
             s.px(8), s.px(8), s.px(8), s.px(8))
         self._rows_layout.setSpacing(s.px(4))
+        self._apply_label_styles()
 
     # ------------------------------------------------------------------
     # Plumbing from MainWindow

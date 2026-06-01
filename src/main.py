@@ -1,6 +1,7 @@
 import sys
 import os
 import logging
+import platform
 import traceback
 
 # Add src to path so imports work as packages
@@ -54,6 +55,24 @@ def main():
             pass
 
     from version import __version__
+
+    # Startup banner — shows what's running in the console (run.bat keeps the
+    # cmd window open). Headline is name + version; the rest is environment
+    # context for bug reports. Version lookups are defensive so a packaging
+    # quirk can never block launch.
+    _log = logging.getLogger("prismasynth")
+    _log.info("=" * 56)
+    _log.info("PrismaSynth v%s", __version__)
+    try:
+        from PySide6 import __version__ as _pyside_version
+        from PySide6.QtCore import qVersion
+        _log.info("Python %s  |  PySide6 %s (Qt %s)",
+                  platform.python_version(), _pyside_version, qVersion())
+    except Exception:
+        _log.info("Python %s", platform.python_version())
+    _log.info("Platform: %s", platform.platform())
+    _log.info("=" * 56)
+
     app = QApplication(sys.argv)
     app.setApplicationName("PrismaSynth")
     app.setApplicationVersion(__version__)

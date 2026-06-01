@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from core.group import Group
 from core.timeline import TimelineModel
+from core.ui_scale import ui_scale
 
 
 _UNTAGGED_KEY = "__untagged__"
@@ -34,10 +35,11 @@ class _Swatch(QLabel):
     """Small filled colour square used as the per-group row marker."""
     def __init__(self, color: str, parent=None):
         super().__init__(parent)
-        self.setFixedSize(12, 12)
+        s = ui_scale()
+        self.setFixedSize(s.px(12), s.px(12))
         self.setStyleSheet(
             f"background-color: {color};"
-            f" border: 1px solid #555; border-radius: 2px;")
+            f" border: 1px solid #555; border-radius: {s.px(2)}px;")
 
 
 class GroupFilterWidget(QWidget):
@@ -56,9 +58,10 @@ class GroupFilterWidget(QWidget):
         # the special "(Untagged)" row.
         self._checks: Dict[str, QCheckBox] = {}
 
+        s = ui_scale()
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(4)
+        outer.setSpacing(s.px(4))
 
         header = QLabel(
             "Groups to export — uncheck = no filter, "
@@ -71,11 +74,11 @@ class GroupFilterWidget(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setMaximumHeight(140)
+        scroll.setMaximumHeight(s.px(140))
         host = QWidget()
         self._rows_layout = QVBoxLayout(host)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._rows_layout.setSpacing(2)
+        self._rows_layout.setSpacing(s.px(2))
         self._rows_layout.addStretch(1)
         scroll.setWidget(host)
         outer.addWidget(scroll)
@@ -134,10 +137,11 @@ class GroupFilterWidget(QWidget):
 
     def _add_row(self, key: str, name: str, color: Optional[str],
                  digit: Optional[int], italic: bool):
+        s = ui_scale()
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(6)
+        row_layout.setSpacing(s.px(6))
 
         cb = QCheckBox()
         cb.toggled.connect(self.selection_changed)
@@ -149,7 +153,7 @@ class GroupFilterWidget(QWidget):
             # Reserve the same horizontal space the swatch would take so
             # the (Untagged) row's text starts at the same x as group rows.
             spacer = QLabel("")
-            spacer.setFixedSize(12, 12)
+            spacer.setFixedSize(s.px(12), s.px(12))
             row_layout.addWidget(spacer)
 
         label = QLabel(name)

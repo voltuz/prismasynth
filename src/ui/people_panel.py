@@ -178,9 +178,8 @@ class PeoplePanel(QWidget):
 
         # Header
         hdr = QHBoxLayout()
-        title = QLabel("People")
-        title.setStyleSheet("font-weight: bold; font-size: 13px; color: #ddd;")
-        hdr.addWidget(title)
+        self._title_label = QLabel("People")
+        hdr.addWidget(self._title_label)
         hdr.addStretch()
         add_btn = QPushButton("+ Add Group")
         add_btn.clicked.connect(self._on_add_group)
@@ -204,7 +203,6 @@ class PeoplePanel(QWidget):
             "No groups yet. Click \"+ Add Group\" or press a digit (0-9) "
             "with one or more clips selected to create one.")
         self._empty_label.setWordWrap(True)
-        self._empty_label.setStyleSheet("color: #888; font-size: 11px;")
         outer.addWidget(self._empty_label)
 
         # Refresh hooks
@@ -213,6 +211,16 @@ class PeoplePanel(QWidget):
         ui_scale().changed.connect(self._on_ui_scale_changed)
 
         self._refresh()
+        self._apply_label_styles()
+
+    def _apply_label_styles(self):
+        """(Re)apply scaled inline label styles so title/empty-state font sizes
+        track View -> UI Scale instead of staying frozen at 13/11px."""
+        s = ui_scale()
+        self._title_label.setStyleSheet(
+            f"font-weight: bold; font-size: {s.px(13)}px; color: #ddd;")
+        self._empty_label.setStyleSheet(
+            f"color: #888; font-size: {s.px(11)}px;")
 
     def _on_ui_scale_changed(self):
         s = ui_scale()
@@ -222,6 +230,7 @@ class PeoplePanel(QWidget):
         self._rows_layout.setSpacing(s.px(4))
         for row in self._rows.values():
             row.refresh_scale()
+        self._apply_label_styles()
 
     # ------------------------------------------------------------------
 

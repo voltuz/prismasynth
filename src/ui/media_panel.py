@@ -296,9 +296,8 @@ class MediaPanel(QWidget):
         # --- Header (title + view-mode toggles) ---
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("Media")
-        title.setStyleSheet("font-weight: bold; font-size: 13px; color: #ddd;")
-        header.addWidget(title)
+        self._title_label = QLabel("Media")
+        header.addWidget(self._title_label)
         header.addStretch()
 
         # Grid / List toggles — distinct SVG icons (4-square grid vs.
@@ -334,7 +333,6 @@ class MediaPanel(QWidget):
             "No sources yet.\n\nDrag video files here\nor use File → Import."
         )
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_label.setStyleSheet("color: #777; font-size: 11px;")
         layout.addWidget(self._empty_label)
 
         # Wire view signals
@@ -349,6 +347,16 @@ class MediaPanel(QWidget):
         self._set_view_mode(mode if mode in ("grid", "list") else "grid")
 
         ui_scale().changed.connect(self._on_ui_scale_changed)
+        self._apply_label_styles()
+
+    def _apply_label_styles(self):
+        """(Re)apply scaled inline label styles so the title/empty-state font
+        sizes track View -> UI Scale instead of staying frozen at 13/11px."""
+        s = ui_scale()
+        self._title_label.setStyleSheet(
+            f"font-weight: bold; font-size: {s.px(13)}px; color: #ddd;")
+        self._empty_label.setStyleSheet(
+            f"color: #777; font-size: {s.px(11)}px;")
 
     def _on_ui_scale_changed(self):
         s = ui_scale()
@@ -361,6 +369,7 @@ class MediaPanel(QWidget):
         # Re-apply view-mode sizing (icon + grid sizes scale with the rest).
         current = "grid" if self._grid_btn.isChecked() else "list"
         self._set_view_mode(current)
+        self._apply_label_styles()
 
     # --- Public API ---
 

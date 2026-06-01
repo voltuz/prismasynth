@@ -90,7 +90,8 @@ class CacheThumbnailsDialog(QDialog):
         layout.addWidget(self._progress)
 
         self._detail_label = QLabel("")
-        self._detail_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._detail_label.setStyleSheet(
+            f"color: #aaa; font-size: {ui_scale().px(11)}px;")
         self._detail_label.setVisible(False)
         layout.addWidget(self._detail_label)
 

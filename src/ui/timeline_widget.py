@@ -71,6 +71,8 @@ _DH_CROP_GAP = 1
 MIN_CROP_STRIP_PX = 6
 CROP_WARNING_COLOR = QColor("#cc5500")  # clip too short to host the window
 _DH_LABEL_FONT_PT = 8
+_DH_THUMB_PAD = 6    # thumbnail inset inside a clip rect
+_DH_LABEL_GAP = 40   # min clip px beyond the thumbnails before the label shows
 PLAYHEAD_COLOR = QColor(255, 50, 50)
 SELECTION_BORDER = QColor(255, 255, 100)
 GAP_COLOR = QColor(30, 30, 30)
@@ -187,6 +189,8 @@ class TimelineStrip(QWidget):
         self.CROP_STRIP_HEIGHT = s.px(_DH_CROP_STRIP)
         self.CROP_STRIP_GAP = s.px(_DH_CROP_GAP)
         self._label_font_pt = s.font_pt(_DH_LABEL_FONT_PT)
+        self.THUMB_PAD = s.px(_DH_THUMB_PAD)
+        self.LABEL_GAP = s.px(_DH_LABEL_GAP)
 
     def _on_ui_scale_changed(self):
         self._refresh_scale_metrics()
@@ -507,7 +511,7 @@ class TimelineStrip(QWidget):
                 # segment, mirroring the regular clip's first-frame thumbnail.
                 if (self._drop_source_ids
                         and len(self._drop_source_ids) == len(self._drop_durations)):
-                    pad = 6
+                    pad = self.THUMB_PAD
                     th = self._clip_height - pad * 2
                     tw = int(th * 16 / 9)
                     cumulative = self._drop_insert_frame
@@ -668,7 +672,7 @@ class TimelineStrip(QWidget):
             painter.drawRect(rect)
 
             # Thumbnail size: fill track height with color border, maintain 16:9 aspect
-            pad = 6
+            pad = self.THUMB_PAD
             th = self._clip_height - pad * 2
             tw = int(th * 16 / 9)
 
@@ -688,7 +692,7 @@ class TimelineStrip(QWidget):
                     painter.drawPixmap(screen_x + clip_w - tw - pad, y + pad, tw, th, thumb_last)
 
             # Duration label in center
-            if clip_w > tw * 2 + 40:
+            if clip_w > tw * 2 + self.LABEL_GAP:
                 painter.setPen(QPen(QColor(240, 240, 240)))
                 font = QFont("Segoe UI", self._label_font_pt)
                 painter.setFont(font)

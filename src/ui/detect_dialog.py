@@ -59,7 +59,7 @@ class DetectDialog(QDialog):
 
         if in_out_limited:
             warn = QLabel("Detection limited to in/out render range.")
-            warn.setStyleSheet("color: #e8a735; font-size: 11px;")
+            warn.setStyleSheet(f"color: #e8a735; font-size: {ui_scale().px(11)}px;")
             layout.addWidget(warn)
 
         # Detector + threshold form
@@ -87,7 +87,7 @@ class DetectDialog(QDialog):
         layout.addLayout(form)
 
         self._omnishotcut_status = QLabel("")
-        self._omnishotcut_status.setStyleSheet("color: #e8a735; font-size: 11px;")
+        self._omnishotcut_status.setStyleSheet(f"color: #e8a735; font-size: {ui_scale().px(11)}px;")
         self._omnishotcut_status.setVisible(False)
         layout.addWidget(self._omnishotcut_status)
 
@@ -106,7 +106,8 @@ class DetectDialog(QDialog):
 
         # Detail label: frame counter + ETA
         self._detail_label = QLabel("")
-        self._detail_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._detail_label.setStyleSheet(
+            f"color: #aaa; font-size: {ui_scale().px(11)}px;")
         self._detail_label.setVisible(False)
         layout.addWidget(self._detail_label)
 
@@ -155,7 +156,8 @@ class DetectDialog(QDialog):
                     "OmniShotCut ready. Detection runs in a sidecar process — first segment "
                     "may take 5-15 s while the model loads."
                 )
-                self._omnishotcut_status.setStyleSheet("color: #6cba7e; font-size: 11px;")
+                self._omnishotcut_status.setStyleSheet(
+                    f"color: #6cba7e; font-size: {ui_scale().px(11)}px;")
                 self._omnishotcut_status.setVisible(True)
                 self._setup_btn.setVisible(False)
                 self._start_btn.setVisible(True)
@@ -165,7 +167,7 @@ class DetectDialog(QDialog):
                     "OmniShotCut is not installed. Setting up downloads ~3 GB and may take "
                     "5-15 minutes."
                 )
-                self._omnishotcut_status.setStyleSheet("color: #e8a735; font-size: 11px;")
+                self._omnishotcut_status.setStyleSheet(f"color: #e8a735; font-size: {ui_scale().px(11)}px;")
                 self._omnishotcut_status.setVisible(True)
                 self._setup_btn.setVisible(True)
                 self._start_btn.setVisible(False)

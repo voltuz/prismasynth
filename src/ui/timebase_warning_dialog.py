@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from core.timebase_remuxer import RemuxJob
 from core.video_source import VideoSource, _frame_duration_for_fps
+from core.ui_scale import ui_scale
 
 
 # Plan tuple: (source_id, input_path, output_path, target_timescale,
@@ -129,7 +130,8 @@ class TimebaseWarningDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Source timebase warning")
         self.setModal(True)
-        self.setMinimumWidth(620)
+        s = ui_scale()
+        self.setMinimumWidth(s.px(620))
 
         self._plans = build_plan(unsafe_sources)
 
@@ -161,7 +163,7 @@ class TimebaseWarningDialog(QDialog):
         host = QWidget()
         rows_layout = QVBoxLayout(host)
         rows_layout.setContentsMargins(0, 0, 0, 0)
-        rows_layout.setSpacing(8)
+        rows_layout.setSpacing(s.px(8))
 
         for plan in self._plans:
             rows_layout.addWidget(self._build_row(plan))
@@ -187,14 +189,15 @@ class TimebaseWarningDialog(QDialog):
         """Single global audio-mode dropdown that applies to every source
         in the run. Selection is persisted via QSettings so a user who
         consistently picks 'Force stereo' doesn't have to re-select."""
+        s = ui_scale()
         host = QFrame()
         host.setStyleSheet(
-            "QFrame { background-color: #232323; border-radius: 4px; }"
+            f"QFrame {{ background-color: #232323; border-radius: {s.px(4)}px; }}"
             "QLabel { background: transparent; }"
         )
         form = QFormLayout(host)
-        form.setContentsMargins(10, 8, 10, 8)
-        form.setSpacing(4)
+        form.setContentsMargins(s.px(10), s.px(8), s.px(10), s.px(8))
+        form.setSpacing(s.px(4))
 
         self._audio_combo = QComboBox()
         for mode, label, tooltip in _AUDIO_MODE_CHOICES:
@@ -210,7 +213,7 @@ class TimebaseWarningDialog(QDialog):
         self._audio_combo.currentIndexChanged.connect(self._on_audio_changed)
 
         self._audio_help = QLabel("")
-        self._audio_help.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._audio_help.setStyleSheet(f"color: #aaa; font-size: {s.px(11)}px;")
         self._audio_help.setWordWrap(True)
         self._refresh_audio_help()
 
@@ -233,15 +236,16 @@ class TimebaseWarningDialog(QDialog):
         return self._audio_combo.currentData() or RemuxJob.AUDIO_KEEP
 
     def _build_row(self, plan: _RowPlan) -> QWidget:
+        s = ui_scale()
         row = QFrame()
         row.setFrameShape(QFrame.Shape.StyledPanel)
         row.setStyleSheet(
-            "QFrame { background-color: #2a2a2a; border-radius: 4px; }"
+            f"QFrame {{ background-color: #2a2a2a; border-radius: {s.px(4)}px; }}"
             "QLabel { background: transparent; }"
         )
         v = QVBoxLayout(row)
-        v.setContentsMargins(10, 8, 10, 8)
-        v.setSpacing(2)
+        v.setContentsMargins(s.px(10), s.px(8), s.px(10), s.px(8))
+        v.setSpacing(s.px(2))
 
         s = plan.source
         name = QLabel(_truncate_middle(os.path.basename(s.file_path)))
@@ -252,7 +256,7 @@ class TimebaseWarningDialog(QDialog):
         meta = QLabel(
             f"timebase {s.time_base_str}, {s.fps:.3f} fps  →  "
             f"target -video_track_timescale {plan.target_timescale}")
-        meta.setStyleSheet("color: #aaa; font-size: 11px;")
+        meta.setStyleSheet(f"color: #aaa; font-size: {s.px(11)}px;")
         v.addWidget(meta)
 
         in_text = f"Input:  {_truncate_middle(plan.input_path, 70)}"
@@ -261,14 +265,14 @@ class TimebaseWarningDialog(QDialog):
         in_lbl = QLabel(in_text)
         in_lbl.setToolTip(plan.input_path)
         in_lbl.setStyleSheet(
-            "color: #8fbf6f; font-size: 11px;" if plan.used_mkv_sibling
-            else "color: #bbb; font-size: 11px;"
+            f"color: #8fbf6f; font-size: {s.px(11)}px;" if plan.used_mkv_sibling
+            else f"color: #bbb; font-size: {s.px(11)}px;"
         )
         v.addWidget(in_lbl)
 
         out_lbl = QLabel(f"Output: {_truncate_middle(plan.output_path, 70)}")
         out_lbl.setToolTip(plan.output_path)
-        out_lbl.setStyleSheet("color: #bbb; font-size: 11px;")
+        out_lbl.setStyleSheet(f"color: #bbb; font-size: {s.px(11)}px;")
         v.addWidget(out_lbl)
 
         return row
