@@ -130,6 +130,9 @@ class DetectDialog(QDialog):
         self._worker: Optional[SceneDetector] = None
         self._start_time: float = 0
         self._phase_start_time: float = 0
+        # frames_done at the first detail_progress tick of the current phase;
+        # lets us measure fps/ETA per phase rather than averaging decode+analyze.
+        self._phase_start_frames: Optional[int] = None
 
         # Initialise UI state for the default detector
         self._on_detector_changed()
@@ -196,6 +199,7 @@ class DetectDialog(QDialog):
         self._detail_label.setText("Starting...")
         self._start_time = time.monotonic()
         self._phase_start_time = self._start_time
+        self._phase_start_frames = None
 
         threshold = self._threshold_spin.value()
         checkpoint = str(default_checkpoint_path()) if det == Detector.OMNISHOTCUT else None
@@ -218,6 +222,7 @@ class DetectDialog(QDialog):
     def _on_phase_changed(self, phase: str):
         """Reset the phase timer when switching stages (e.g. decode → inference)."""
         self._phase_start_time = time.monotonic()
+        self._phase_start_frames = None  # re-baseline fps for the new phase
         self._detail_label.setText(f"{phase}...")
         step = self._PHASE_STEPS.get(phase)
         if step:
@@ -227,18 +232,29 @@ class DetectDialog(QDialog):
             self._step_label.setText(phase)
 
     def _on_detail_progress(self, frames_done: int, total_frames: int, phase: str):
-        elapsed = time.monotonic() - self._start_time
+        now = time.monotonic()
+        # Baseline on the first tick of each phase: frames_done is cumulative
+        # across segments, so it does NOT start at 0 for the 2nd+ segment.
+        if self._phase_start_frames is None:
+            self._phase_start_frames = frames_done
+            self._phase_start_time = now
+
+        phase_frames = frames_done - self._phase_start_frames
+        phase_elapsed = now - self._phase_start_time
+
+        fps_str = ""
         eta_str = ""
-        if frames_done > 0 and elapsed > 1.0:
-            rate = frames_done / elapsed
-            remaining = (total_frames - frames_done) / rate
+        if phase_frames > 0 and phase_elapsed > 0.3:
+            fps = phase_frames / phase_elapsed
+            fps_str = f"  ({fps:,.0f} fps)"
+            remaining = (total_frames - frames_done) / fps
             if remaining >= 60:
                 eta_str = f"  ~{int(remaining) // 60}m {int(remaining) % 60:02d}s left"
             else:
                 eta_str = f"  ~{int(remaining)}s left"
 
         self._detail_label.setText(
-            f"{phase}: {frames_done:,} / {total_frames:,} frames{eta_str}"
+            f"{phase}: {frames_done:,} / {total_frames:,} frames{fps_str}{eta_str}"
         )
 
     def _on_finished(self, results: dict):

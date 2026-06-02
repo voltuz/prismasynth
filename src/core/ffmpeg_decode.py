@@ -46,7 +46,9 @@ def _build_ffmpeg_cmd(file_path: str, width: int, height: int,
     cmd += ["-i", file_path]
     if duration is not None:
         cmd += ["-t", f"{duration:.4f}"]
-    cmd += ["-vf", f"scale={width}:{height}:flags=fast_bilinear",
+    # nearest-neighbour scale: stays closest to the scale_cuda interp_algo=nearest
+    # reference output (fewest borderline-cut differences across decode paths).
+    cmd += ["-vf", f"scale={width}:{height}:flags=neighbor",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
     return cmd
 
@@ -56,7 +58,7 @@ def _build_ffmpeg_cmd_cpu(file_path: str, width: int, height: int) -> List[str]:
     return [
         "ffmpeg", "-nostdin", "-v", "quiet", "-threads", "0",
         "-i", file_path,
-        "-vf", f"scale={width}:{height}:flags=fast_bilinear",
+        "-vf", f"scale={width}:{height}:flags=neighbor",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "pipe:1",
     ]
@@ -209,6 +211,62 @@ def _decode_single(padded: np.ndarray, total: int, range_start: int,
     return count
 
 
+def _decode_cpu_fast(padded: np.ndarray, total: int, range_start: int,
+                     pad_before: int, source: VideoSource,
+                     width: int, height: int,
+                     procs: list, is_cancelled: IsCancelled,
+                     progress_cb: ProgressCb) -> int:
+    """Single-process, all-cores CPU decode + nearest-neighbour scale.
+
+    A consumer GPU has a single fixed-function NVDEC engine, which caps hwaccel
+    decode throughput; multi-core CPU decode of <=1080p sources runs ~4x faster
+    because it parallelises across CPU cores. Output is tiny (48x27), so the
+    pipe/transfer cost is negligible. Reads the pipe in bulk (one np.frombuffer
+    per ~512-frame chunk) rather than per frame, avoiding the O(n) bytearray
+    shuffle of the parallel path. Uses flags=neighbor to stay closest to the
+    scale_cuda interp_algo=nearest reference pixels."""
+    frame_size = width * height * 3
+    fps = source.fps if source.fps > 0 else 24.0
+    cmd = ["ffmpeg", "-nostdin", "-v", "quiet", "-threads", "0"]
+    if range_start > 0:
+        cmd += ["-ss", f"{range_start / fps:.4f}"]
+    cmd += ["-i", source.file_path]
+    if range_start > 0:
+        cmd += ["-t", f"{(total + 5) / fps:.4f}"]
+    cmd += ["-vf", f"scale={width}:{height}:flags=neighbor",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    procs.append(proc)
+
+    buf = bytearray()
+    count = 0
+    try:
+        while count < total and not is_cancelled():
+            raw = proc.stdout.read(frame_size * 512)
+            if not raw:
+                break
+            buf.extend(raw)
+            navail = len(buf) // frame_size
+            take = min(navail, total - count)
+            if take > 0:
+                chunk = (np.frombuffer(bytes(buf[:take * frame_size]), np.uint8)
+                         .reshape(take, height, width, 3))
+                padded[pad_before + count:pad_before + count + take] = chunk
+                del buf[:take * frame_size]
+                count += take
+                if progress_cb is not None:
+                    progress_cb(count, total)
+    finally:
+        try:
+            proc.stdout.close()
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+
+    return count
+
+
 def decode_to_array(
     source: VideoSource,
     range_start: int,
@@ -237,6 +295,26 @@ def decode_to_array(
 
     n_frames = 0
     method = ""
+
+    # A single GA10x-class NVDEC engine is the throughput wall for hwaccel
+    # decode. For <=1080p sources, multi-core CPU decode is ~4x faster (measured
+    # on an RTX 3090: 1080p H.264 ~3100fps CPU vs ~700fps NVDEC), and the 48x27
+    # output makes the CPU->numpy cost negligible. Above 1080p, heavy HEVC/AV1
+    # favours NVDEC, so keep scale_cuda first there. CPU falls through to the
+    # GPU/NVDEC paths below if it produces nothing.
+    pixels = (source.width or 0) * (source.height or 0)
+    if 0 < pixels <= 1920 * 1080:
+        if is_cancelled():
+            return padded, 0, "", 0.0
+        t0 = time.monotonic()
+        n = _decode_cpu_fast(padded, total, range_start, pad_before, source,
+                             width, height, procs=procs, is_cancelled=is_cancelled,
+                             progress_cb=progress_cb)
+        if n:
+            elapsed = time.monotonic() - t0
+            logger.info("Decode [ffmpeg-cpu-multicore]: %d frames in %.1fs (%.0f fps) at %dx%d",
+                        n, elapsed, n / max(elapsed, 0.001), width, height)
+            return padded, n, "ffmpeg-cpu-multicore", elapsed
 
     # Try paths in order. _decode_parallel itself probes the pipeline first.
     for label, gpu in (("ffmpeg-parallel-scale_cuda", True),

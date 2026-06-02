@@ -247,14 +247,14 @@ class TimebaseWarningDialog(QDialog):
         v.setContentsMargins(s.px(10), s.px(8), s.px(10), s.px(8))
         v.setSpacing(s.px(2))
 
-        s = plan.source
-        name = QLabel(_truncate_middle(os.path.basename(s.file_path)))
+        src = plan.source
+        name = QLabel(_truncate_middle(os.path.basename(src.file_path)))
         name.setStyleSheet("color: #ddd; font-weight: bold;")
-        name.setToolTip(s.file_path)
+        name.setToolTip(src.file_path)
         v.addWidget(name)
 
         meta = QLabel(
-            f"timebase {s.time_base_str}, {s.fps:.3f} fps  →  "
+            f"timebase {src.time_base_str}, {src.fps:.3f} fps  →  "
             f"target -video_track_timescale {plan.target_timescale}")
         meta.setStyleSheet(f"color: #aaa; font-size: {s.px(11)}px;")
         v.addWidget(meta)
