@@ -7,6 +7,38 @@ from core.group import Group, GROUP_COLOR_PALETTE
 MAX_UNDO = 50
 
 
+def _partition_crops(crop_regions, split_frame):
+    """Split a clip's crop_regions across a source-frame split into
+    (left_crops, right_crops).
+
+    Crops are anchored in source-frame space, so each export Segment follows
+    the half whose source range contains its ``anchor_frame``: segments with
+    ``anchor_frame < split_frame`` go left, the rest go right. A crop appears
+    on a half only if it has at least one segment there. Everything is
+    deep-copied so the two halves never share CropRegion / Segment objects,
+    and ids on every produced copy are regenerated so the halves stay unique.
+    """
+    import uuid as _uuid
+    left, right = [], []
+    for cr in crop_regions:
+        left_segs = [s for s in cr.segments if s.anchor_frame < split_frame]
+        right_segs = [s for s in cr.segments if s.anchor_frame >= split_frame]
+        if not left_segs and not right_segs:
+            # Degenerate crop with no segments — keep the rectangle on the
+            # left half rather than dropping it entirely.
+            left_segs = list(cr.segments)
+        for bucket, segs in ((left, left_segs), (right, right_segs)):
+            if not segs:
+                continue
+            c = copy.deepcopy(cr)
+            c.id = _uuid.uuid4().hex[:12]
+            c.segments = [copy.deepcopy(s) for s in segs]
+            for s in c.segments:
+                s.id = _uuid.uuid4().hex[:12]
+            bucket.append(c)
+    return left, right
+
+
 class TimelineModel(QObject):
     clips_changed = Signal()
     selection_changed = Signal()
@@ -210,6 +242,14 @@ class TimelineModel(QObject):
                         right.id = _uuid.uuid4().hex[:12]  # fresh id for the right half
                         left.source_out = c.source_in + offset - 1
                         right.source_in = c.source_in + offset
+                        # copy(c) is shallow — break the aliasing so the two
+                        # halves don't share the same group_ids list or the
+                        # same CropRegion objects. Crops partition by anchor.
+                        l_crops, r_crops = _partition_crops(
+                            c.crop_regions, c.source_in + offset)
+                        left.crop_regions, right.crop_regions = l_crops, r_crops
+                        left.group_ids = list(c.group_ids)
+                        right.group_ids = list(c.group_ids)
                     self._clips[i:i + 1] = [left, right]
                     insert_idx = i + 1
                 break
@@ -288,12 +328,18 @@ class TimelineModel(QObject):
             return False
 
         self._push_undo()
+        # Carry People tags (clip-level → both halves keep them all) and
+        # partition crop regions (frame-anchored → each follows its half).
+        left_crops, right_crops = _partition_crops(
+            clip.crop_regions, clip.source_in + offset)
         clip_a = Clip(
             source_id=clip.source_id,
             source_in=clip.source_in,
             source_out=clip.source_in + offset - 1,
             label=clip.label,
             color_index=clip.color_index,
+            group_ids=list(clip.group_ids),
+            crop_regions=left_crops,
         )
         clip_b = Clip(
             source_id=clip.source_id,
@@ -301,6 +347,8 @@ class TimelineModel(QObject):
             source_out=clip.source_out,
             label=clip.label,
             color_index=clip.color_index,
+            group_ids=list(clip.group_ids),
+            crop_regions=right_crops,
         )
 
         self._clips[idx:idx + 1] = [clip_a, clip_b]

@@ -1469,6 +1469,12 @@ class MainWindow(QMainWindow):
             self._proxy_manager.load_or_open(src, force_reopen=True)
             extract_thumbnail(src, force=True)
             self._media_panel.refresh_source(src)
+            # Timeline thumbnails are keyed by source_id, which relink keeps —
+            # so stale frames from the OLD file would keep showing. Drop the
+            # cached disk + in-memory thumbnails for this source so the strip
+            # regenerates from the new file on the next repaint.
+            if self._thumbnail_cache is not None:
+                self._thumbnail_cache.clear_disk_thumbnails([source_id])
             touched_sources.append(src)
         if clamp_total:
             QMessageBox.warning(

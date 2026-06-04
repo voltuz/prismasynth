@@ -53,15 +53,19 @@ def _build_ffmpeg_cmd(file_path: str, width: int, height: int,
     return cmd
 
 
-def _build_ffmpeg_cmd_cpu(file_path: str, width: int, height: int) -> List[str]:
-    """CPU-only fallback."""
-    return [
-        "ffmpeg", "-nostdin", "-v", "quiet", "-threads", "0",
-        "-i", file_path,
-        "-vf", f"scale={width}:{height}:flags=neighbor",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "pipe:1",
-    ]
+def _build_ffmpeg_cmd_cpu(file_path: str, width: int, height: int,
+                          ss: float = None, duration: float = None) -> List[str]:
+    """CPU-only fallback. Pre-input -ss / post-input -t mirror the GPU
+    siblings above so a seeked decode produces a well-formed command."""
+    cmd = ["ffmpeg", "-nostdin", "-v", "quiet", "-threads", "0"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.4f}"]
+    cmd += ["-i", file_path]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.4f}"]
+    cmd += ["-vf", f"scale={width}:{height}:flags=neighbor",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    return cmd
 
 
 def _probe_ffmpeg_cmd(cmd: List[str], frame_size: int) -> bool:
@@ -174,12 +178,9 @@ def _decode_single(padded: np.ndarray, total: int, range_start: int,
     fps = source.fps if source.fps > 0 else 24.0
     ss = range_start / fps if range_start > 0 else None
     dur = total / fps if range_start > 0 else None
-    cmd = _build_ffmpeg_cmd_cpu(source.file_path, width, height)
-    if ss is not None:
-        cmd = cmd[:3] + ["-ss", f"{ss:.4f}"] + cmd[3:]
-        if dur is not None:
-            idx = cmd.index("-i") + 2
-            cmd = cmd[:idx] + ["-t", f"{dur + 5:.4f}"] + cmd[idx:]
+    cmd = _build_ffmpeg_cmd_cpu(
+        source.file_path, width, height,
+        ss=ss, duration=(dur + 5) if dur is not None else None)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     procs.append(proc)
 

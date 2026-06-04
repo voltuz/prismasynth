@@ -130,6 +130,12 @@ class ThumbnailCache(QObject):
         self._proxy_manager = proxy_manager
         self._mem_cache: Dict[str, QImage] = {}
         self._lq_emitted: Set[str] = set()
+        # Guards _mem_cache + _lq_emitted: touched by the coordinator thread,
+        # the bulk worker pools, AND the UI thread (invalidate_source / clear /
+        # clear_disk_thumbnails). Without it, a UI-thread iterate over
+        # _mem_cache while a worker writes raises "dictionary changed size
+        # during iteration". Only wraps dict/set ops — never I/O or emit.
+        self._cache_lock = threading.Lock()
         self._stopped = False
         self._coord_thread: Optional[threading.Thread] = None
         self._pool: Optional[ThreadPoolExecutor] = None
@@ -264,7 +270,8 @@ class ThumbnailCache(QObject):
                         for source_id, fn, clip_id, position in entries:
                             if fn == frame_num:
                                 cache_key = f"{source_id}_{frame_num}"
-                                self._mem_cache[cache_key] = qimage
+                                with self._cache_lock:
+                                    self._mem_cache[cache_key] = qimage
                                 self.thumbnail_ready.emit(clip_id, position, qimage)
                                 # Persist once per (source, frame), not once
                                 # per emission (multiple clips may reference
@@ -322,20 +329,23 @@ class ThumbnailCache(QObject):
                 if (source_id, frame_num) in in_flight_keys:
                     continue
                 cache_key = f"{source_id}_{frame_num}"
-                if cache_key in self._mem_cache:
-                    self.thumbnail_ready.emit(
-                        clip_id, position, self._mem_cache[cache_key])
+                with self._cache_lock:
+                    cached = self._mem_cache.get(cache_key)
+                if cached is not None:
+                    self.thumbnail_ready.emit(clip_id, position, cached)
                     continue
                 # Disk hit: load JPEG, populate mem cache, emit. Skips both
                 # LQ placeholder and HQ generation entirely.
                 disk_qimg = self._load_disk_thumbnail(source_id, frame_num)
                 if disk_qimg is not None:
-                    self._mem_cache[cache_key] = disk_qimg
+                    with self._cache_lock:
+                        self._mem_cache[cache_key] = disk_qimg
                     self.thumbnail_ready.emit(clip_id, position, disk_qimg)
                     continue
                 # Emit LQ placeholder
-                if (cache_key not in self._lq_emitted
-                        and self._proxy_manager is not None):
+                with self._cache_lock:
+                    lq_already = cache_key in self._lq_emitted
+                if (not lq_already and self._proxy_manager is not None):
                     proxy = self._proxy_manager.get_proxy(source_id)
                     if proxy:
                         lq_frame = proxy.get_frame(frame_num)
@@ -347,7 +357,8 @@ class ThumbnailCache(QObject):
                             qimg = QImage(bytes(thumb.data), w, h, ch * w,
                                           QImage.Format.Format_RGB888).copy()
                             self.thumbnail_ready.emit(clip_id, position, qimg)
-                            self._lq_emitted.add(cache_key)
+                            with self._cache_lock:
+                                self._lq_emitted.add(cache_key)
                 by_source.setdefault(source_id, []).append(
                     (frame_num, clip_id, position))
 
@@ -477,7 +488,8 @@ class ThumbnailCache(QObject):
         if results:
             for frame_num, qimage in results:
                 cache_key = f"{source_id}_{frame_num}"
-                self._mem_cache[cache_key] = qimage
+                with self._cache_lock:
+                    self._mem_cache[cache_key] = qimage
                 ThumbnailCache._save_disk_thumbnail(
                     source_id, frame_num, qimage)
                 self.emit_for_frame(source_id, frame_num, qimage)
@@ -491,7 +503,8 @@ class ThumbnailCache(QObject):
         if results:
             for fn, qimage in results:
                 cache_key = f"{source_id}_{fn}"
-                self._mem_cache[cache_key] = qimage
+                with self._cache_lock:
+                    self._mem_cache[cache_key] = qimage
                 ThumbnailCache._save_disk_thumbnail(source_id, fn, qimage)
                 self.emit_for_frame(source_id, fn, qimage)
         return 1
@@ -686,17 +699,21 @@ class ThumbnailCache(QObject):
 
     def invalidate_source(self, source_id: str):
         """Remove all cached thumbnails for a source so they regenerate."""
-        keys = [k for k in self._mem_cache if k.startswith(f"{source_id}_")]
-        for k in keys:
-            del self._mem_cache[k]
-        lq_keys = [k for k in self._lq_emitted if k.startswith(f"{source_id}_")]
-        for k in lq_keys:
-            self._lq_emitted.discard(k)
+        with self._cache_lock:
+            keys = [k for k in self._mem_cache
+                    if k.startswith(f"{source_id}_")]
+            for k in keys:
+                del self._mem_cache[k]
+            lq_keys = [k for k in self._lq_emitted
+                       if k.startswith(f"{source_id}_")]
+            for k in lq_keys:
+                self._lq_emitted.discard(k)
         self._wake_event.set()
 
     def clear(self):
-        self._mem_cache.clear()
-        self._lq_emitted.clear()
+        with self._cache_lock:
+            self._mem_cache.clear()
+            self._lq_emitted.clear()
 
     def emit_for_frame(self, source_id: str, frame_num: int,
                        qimage: QImage):
@@ -743,7 +760,9 @@ class ThumbnailCache(QObject):
                 seen.add(key)
                 if not force_overwrite:
                     cache_key = f"{clip.source_id}_{frame_num}"
-                    if cache_key in self._mem_cache:
+                    with self._cache_lock:
+                        in_mem = cache_key in self._mem_cache
+                    if in_mem:
                         continue
                     if self._disk_thumb_path(clip.source_id,
                                              frame_num).exists():

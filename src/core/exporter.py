@@ -400,7 +400,7 @@ class Exporter(QObject):
         # Pre-compute per-source render params (HDR / vf / hw args / etc.)
         # so the timeline-walk below can look them up without re-probing.
         source_params: dict = {}
-        for path, src_in, count, fps, sid in raw_segments:
+        for path, src_in, count, seg_fps, sid in raw_segments:
             if sid is None or sid in source_params:
                 continue
             source = self._sources.get(sid)
@@ -422,7 +422,7 @@ class Exporter(QObject):
                     source_width=src_w, source_height=src_h,
                 )
             source_params[sid] = {
-                "path": path, "fps": fps, "vf": vf, "hw": hw,
+                "path": path, "fps": seg_fps, "vf": vf, "hw": hw,
                 "is_hdr": is_hdr, "src_w": src_w, "src_h": src_h,
                 "has_audio": has_audio,
             }
@@ -431,12 +431,12 @@ class Exporter(QObject):
         # correctly-ordered output and gap segments slot into their place
         # between real clips).
         flat_segments = []  # [(source_path|None, src_in, count, fps, vf, hw, is_hdr, src_w, src_h, has_audio)]
-        for path, src_in, count, fps, sid in raw_segments:
+        for path, src_in, count, seg_fps, sid in raw_segments:
             if sid is None:
                 # Gap: synthetic params, rendered with lavfi color + anullsrc
                 # downstream in _build_segment_cmd.
                 flat_segments.append(
-                    (None, 0, count, fps, None, [], False, 0, 0, False))
+                    (None, 0, count, seg_fps, None, [], False, 0, 0, False))
             else:
                 p = source_params.get(sid)
                 if p is None:
